@@ -1452,6 +1452,96 @@ test("expanded staff project results show resolved branches and resume scope", (
   assert.match(resumed, /task: Recover the existing project work/);
 });
 
+test("compact successful worktree removal reports the branch and retirement", () => {
+  const output = renderedText(
+    renderCoordinationResult(
+      "staff",
+      "remove",
+      {
+        details: {
+          ok: true,
+          action: "remove",
+          branch: "feat/recovery",
+          checkout_removed: true,
+          assignment_retired: true,
+          forced: false,
+        },
+      },
+      {},
+      presentationTheme,
+      { args: { branch: "feat/recovery" } },
+    ),
+  );
+  assert.match(output, /removed feat\/recovery · assignment retired/);
+  assert.doesNotMatch(output, /sent to lead/);
+});
+
+test("worktree removal calls and expanded results identify the checkout and assignment outcome", () => {
+  assert.equal(
+    renderedText(
+      renderCoordinationCall(
+        "staff",
+        "remove",
+        { branch: "feat/recovery" },
+        presentationTheme,
+      ),
+    ).split("\n")[0],
+    "remove worktree  feat/recovery",
+  );
+  const output = renderedText(
+    renderCoordinationResult(
+      "staff",
+      "remove",
+      {
+        details: {
+          ok: true,
+          branch: "feat/recovery",
+          checkout_path: "/repo/feat-recovery",
+          checkout_removed: true,
+          checkout_state: "removed",
+          assignment_retired: true,
+        },
+      },
+      { expanded: true },
+      presentationTheme,
+      { args: { branch: "feat/recovery" } },
+    ),
+  );
+  assert.match(output, /^remove worktree/m);
+  assert.match(output, /checkout path: \/repo\/feat-recovery/);
+  assert.match(output, /checkout: removed/);
+  assert.match(output, /assignment: retired/);
+});
+
+test("expanded failed worktree removal retains the failure reason", () => {
+  const output = renderedText(
+    renderCoordinationResult(
+      "staff",
+      "remove",
+      {
+        content: [
+          {
+            type: "text",
+            text: "worktree removal was not confirmed: checkout changed after preflight",
+          },
+        ],
+        details: {
+          ok: false,
+          branch: "feat/recovery",
+          checkout_state: "present",
+          assignment_retired: false,
+          removal_error: "checkout changed after preflight",
+        },
+      },
+      { expanded: true },
+      presentationTheme,
+      { args: { branch: "feat/recovery" } },
+    ),
+  );
+  assert.match(output, /checkout changed after preflight/);
+  assert.doesNotMatch(output, /assignment: not retired/);
+});
+
 test("compact coordination calls show available agent definitions", () => {
   for (const [action, expected] of [
     ["steer", "steer agent  release-review · researcher"],
