@@ -157,6 +157,19 @@ test("message writes recover a stale crash-held lock", () => {
   assert.throws(() => statSync(lock), /ENOENT/);
 });
 
+test("Chief message writes accept identical replay and reject conflicting payloads", () => {
+  const runtime = supervisionRuntime(socket());
+  const record = message();
+  const path = writeChiefMessage(record, runtime);
+
+  assert.equal(writeChiefMessage({ ...record }, runtime), path);
+  assert.throws(
+    () => writeChiefMessage({ ...record, text: "different" }, runtime),
+    /already exists with a different payload/,
+  );
+  assert.deepEqual(readChiefMessage(path), record);
+});
+
 test("message locks fail closed for live and malformed owners", () => {
   for (const owner of [`${process.pid}-${id()}`, "not-an-owner"]) {
     const runtime = supervisionRuntime(socket());
@@ -2559,6 +2572,12 @@ test("project messages are durable, assignment-scoped, bounded, and removable", 
   };
   writeProjectAssignment(runtime, assignment);
   writeProjectMessage(record, runtime);
+  writeProjectMessage(record, runtime);
+  assert.throws(
+    () =>
+      writeProjectMessage({ ...record, text: "Conflicting replay" }, runtime),
+    /identity conflicts with durable payload/,
+  );
   assert.deepEqual(
     listProjectMessages(runtime, assignment.repoKey, assignment.branch),
     [record],
@@ -2571,6 +2590,18 @@ test("project messages are durable, assignment-scoped, bounded, and removable", 
   assert.equal(
     projectMessageBytes(record),
     Buffer.byteLength(`${JSON.stringify(record)}\n`, "utf8"),
+  );
+  const failure = {
+    ...record,
+    id: id(),
+    text: "Lead execution failed",
+    createdAt: 11,
+    kind: "execution_failure" as const,
+  };
+  writeProjectMessage(failure, runtime);
+  assert.deepEqual(
+    listProjectMessages(runtime, assignment.repoKey, assignment.branch),
+    [record, failure],
   );
   assert.deepEqual(
     listProjectMessages(runtime, "other-repo", assignment.branch),
@@ -2586,6 +2617,10 @@ test("project messages are durable, assignment-scoped, bounded, and removable", 
   );
   assert.throws(
     () => writeProjectMessage({ ...record, fromSessionId: "" }, runtime),
+    /Invalid project message/,
+  );
+  assert.throws(
+    () => writeProjectMessage({ ...failure, kind: "unknown" as any }, runtime),
     /Invalid project message/,
   );
   assert.throws(
@@ -2651,4 +2686,50 @@ test("project assignment uses durable project transport, not Manager message fra
     leadSessionId: session,
     branch: record.branch,
   });
+});
+
+test("pending project assignment refresh replaces the record delivered from the inbox", async () => {
+  const runtime = supervisionRuntime(socket());
+  const session = id();
+  const stale = message({
+    kind: "project_assignment",
+    fromSessionId: "former-manager",
+    toSessionId: session,
+    leadSessionId: session,
+    branch: "feat/bootstrap",
+    text: "stale instruction",
+  });
+  const refreshed = {
+    ...stale,
+    createdAt: stale.createdAt + 1,
+    text: "refreshed instruction",
+  };
+
+  writeChiefMessage(stale, runtime);
+  const path = writeChiefMessage(refreshed, runtime);
+  assert.deepEqual(readChiefMessage(path), refreshed);
+
+  const delivered: any[] = [];
+  let receipt = false;
+  assert.equal(
+    await drainCoordinationInbox({
+      runtime,
+      sessionId: session,
+      isAuthorized: (candidate) =>
+        candidate.id === refreshed.id &&
+        candidate.createdAt === refreshed.createdAt &&
+        candidate.text === refreshed.text,
+      isDelivered: () => receipt,
+      sendMessage: (payload) => {
+        delivered.push(payload);
+        receipt = true;
+      },
+    }),
+    1,
+  );
+  assert.equal(delivered.length, 1);
+  assert.equal(
+    delivered[0].content,
+    `Project assignment for branch ${refreshed.branch}:\n\n${refreshed.text}`,
+  );
 });
