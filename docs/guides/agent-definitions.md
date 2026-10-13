@@ -53,6 +53,15 @@ agent directory's `agents/` subdirectory.
 A project or global definition whose `name` matches a lower-precedence
 definition overlays it. An unmatched definition is standalone.
 
+Definition configuration and runtime Agent discovery are separate views. The
+Definitions UI and Markdown files expose editable configuration and source
+layers. The session-start `agent_definitions` capability summary and
+`list_agents` result expose only definitions currently available to that
+controller, not source paths or complete frontmatter. They support runtime
+selection and validation, not configuration management. Identify definitions
+by frontmatter `name`, inspect contributing files, and resolve effective
+overlays when changing them; never infer identity from filenames.
+
 `flexible-lead`, `orchestrator-lead`, `managed-lead`, `manager`, and `chief`
 are reserved role definitions. They use the layered definition engine but are
 not Agents available through discovery or delegation. The first two configure
@@ -108,12 +117,13 @@ enabled: false
 ---
 ```
 
-The lead effective roster and `/agents definitions` output keep disabled rows and
-show their disabled status so the source can be re-enabled. A delegating agent
-does not receive disabled definitions in its definition list. A delegating agent
-referencing a disabled definition can remain discoverable, but is rejected during
-assignment or fresh agent startup with an explicit disabled-definition reason
-rather than silently dropping that definition.
+The `/agents definitions` UI keeps disabled rows and shows their disabled
+status so the source can be re-enabled. Disabled definitions are omitted from
+the runtime `agent_definitions` capability summary for Leads and delegating
+agents. A definition that requires a disabled or otherwise unavailable child
+is also omitted from that summary; a delegating agent referencing such a child
+is rejected during assignment or fresh agent startup with an explicit reason
+rather than silently dropping the reference.
 
 `delegate` and `continue` reject disabled definitions with an
 actionable error. An already active agent may finish and remains controllable
@@ -243,11 +253,18 @@ path resolution rules.
 
 References are resolved from the Markdown file that declares them.
 
-The bundled Agent definitions are `generalist`, `implementer`,
-`researcher`, `reviewer`, and `scout`. All five reserved role definitions are
-excluded from this roster. The session-start
-agent-definition roster and the `list_agents` result use the same metadata
-projection.
+Startup discovery and `list_agents` provide runtime Agent capabilities, not a
+complete configuration view. For their exact contract, see the
+[`list_agents` reference](../reference/agent.md#list_agents); use the workflow
+below to inspect and manage definition configuration.
+
+For configuration management, inspect bundled, trusted project, and global
+Markdown layers in precedence order (`bundled < project < global`), identify
+the target by frontmatter `name`, resolve overlays, and edit the smallest
+correct project or global file. Never edit bundled definitions. Use
+`list_agents` after an edit when available to invoke normal discovery and
+validation, but do not treat its reduced summary as the full effective
+configuration or claim runtime validation when the tool is unavailable.
 
 For exact expansion, deduplication, and caller-file precedence, see
 [Handoffs and files](handoffs.md).
@@ -266,7 +283,10 @@ or the model can use:
 {}
 ```
 
-Both resolve the same effective roster.
+Both use effective definition discovery, but the Definitions UI exposes
+configuration (including disabled definitions and reserved role profiles where
+applicable), while `list_agents` returns only currently available capabilities
+within the caller's scope.
 
 For model-assisted definition management, ask Pi directly or explicitly invoke
 `/skill:agent-definitions`. The bundled skill uses the same

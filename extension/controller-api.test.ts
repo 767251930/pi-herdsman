@@ -13,6 +13,7 @@ import type {
   ManagedAgentState,
 } from "./mailbox.ts";
 import { OperationError } from "./errors.ts";
+import type { AgentDefinition } from "./agent-definitions.ts";
 import { resultPath, resultRef } from "./storage.ts";
 import { acquireProcessLock, claimProcessLock } from "./lock.ts";
 import support, {
@@ -70,6 +71,7 @@ import support, {
   writeAgentState,
   testTmpRoot,
 } from "./support.ts";
+const { visibleAgentCapabilities } = await import("./agent-controller.ts");
 const {
   listProjectAssignments,
   listChiefMessagePaths,
@@ -2275,9 +2277,25 @@ for (const scenario of [
         publishAssignment();
         assertSignal();
       }
-      await t.waitFor(() =>
-        assert.equal(listChiefMessagePaths(runtime, sessionId).length, 0),
-      );
+      try {
+        await t.waitFor(
+          () =>
+            assert.equal(listChiefMessagePaths(runtime, sessionId).length, 0),
+          { timeout: 5_000 },
+        );
+      } catch (error) {
+        const remainingPaths = listChiefMessagePaths(runtime, sessionId);
+        const managerDiagnostics = diagnosticOutput.filter((line) =>
+          line.startsWith("[pi-herdsman-manager-diagnostic] "),
+        );
+        const stateErrors = entries.filter(
+          (entry: any) => entry.customType === "pi_herdsman_state_error",
+        );
+        throw new Error(
+          `Timed out waiting for chief messages to clear; remaining count=${remainingPaths.length}, paths=${JSON.stringify(remainingPaths)}, manager diagnostics=${JSON.stringify(managerDiagnostics)}, state errors=${JSON.stringify(stateErrors)}`,
+          { cause: error },
+        );
+      }
       const delivered = pi.sent.filter(
         (message: any) =>
           message.customType === "pi-herdsman-project_assignment",
@@ -5879,18 +5897,62 @@ test("parent list hides disabled allowed definitions", async () => {
   setAgentEnvironment("listing-parent", ["enabled-child", "disabled-child"]);
   const files = [
     ["enabled-child.md", "---\nname: enabled-child\n---\nchild\n"],
-    [
-      "disabled-child.md",
-      "---\nname: disabled-child\nenabled: false\n---\nchild\n",
-    ],
+    ["disabled-child.md", "---\nname: disabled-child\n---\nchild\n"],
   ];
   for (const [name, content] of files)
     realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
+  const state = managedState("listing-parent");
+  const activeRequestId = randomUUID();
+  const child = {
+    ...managedState("disabled-child-agent", activeRequestId, {
+      ...recoveryIdentity("disabled-child-agent"),
+      piSessionId: "11111111-1111-4111-8111-111111111111",
+    }),
+    ownerSessionId: state.piSessionId,
+  };
+  nativeSessions.set(child.piSessionId, {
+    id: child.piSessionId,
+    path: child.piSessionFile,
+    cwd: child.cwd,
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: {
+          sessionId: child.piSessionId,
+          definition: "disabled-child",
+          label: child.agentLabel,
+        },
+      },
+    ],
+  });
+  writeAgentState(agentMailboxPath(WORKSPACE, state.agentLabel), state);
+  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
+  writeAgentState(childMailbox, child);
+  const entries = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-agent-definition",
+      data: {
+        sessionId: state.piSessionId,
+        definition: "agent",
+        label: state.agentLabel,
+      },
+    },
+    {
+      type: "custom",
+      customType: "pi-herdsman-agent-definition",
+      data: {
+        sessionId: child.piSessionId,
+        definition: "disabled-child",
+        label: child.agentLabel,
+      },
+    },
+  ];
   const pi = fakePi({
-    exec: agentControllerExecutor(managedState("listing-parent")),
+    exec: agentControllerExecutor(state, [child]),
   });
   registerExtension!(pi.pi as never);
-  const entries = pi.entries;
   const context = fakeAgentContext(entries);
   try {
     for (const handler of pi.events.get("session_start") ?? [])
@@ -5903,16 +5965,154 @@ test("parent list hides disabled allowed definitions", async () => {
       context,
     );
     assert.deepEqual(
-      (listed.details.agent_definitions as { name: string }[]).map(
-        ({ name }) => name,
-      ),
-      ["enabled-child"],
+      listed.details.agent_definitions,
+      [
+        { name: "disabled-child", tools: "default", skills: "none" },
+        { name: "enabled-child", tools: "default", skills: "none" },
+      ],
+      JSON.stringify(listed.details),
     );
+    const liveChildBefore = listed.details.agents.find(
+      (agent: { agent?: string }) => agent.agent === child.agentLabel,
+    );
+    assert.deepEqual(liveChildBefore, {
+      kind: "pi",
+      state: "working",
+      workspace_id: child.workspaceId,
+      pane_id: child.paneId,
+      tab_id: `${child.agentLabel}-tab`,
+      cwd: child.cwd,
+      pi_session_id: child.piSessionId,
+      pi_session_path: child.piSessionFile,
+      managed: true,
+      owner_session_id: child.ownerSessionId,
+      agent_definition: "disabled-child",
+      active_request_id: activeRequestId,
+      agent: child.agentLabel,
+      available_tools: [
+        "inspect_agent",
+        "steer_agent",
+        "interrupt_agent",
+        "close_agent",
+      ],
+    });
+
+    realFs.writeFileSync(
+      join(PI_AGENTS_DIR, "disabled-child.md"),
+      "---\nname: disabled-child\nenabled: false\n---\nchild\n",
+      "utf8",
+    );
+    const afterDisable = await agentTool(pi, "list").execute(
+      "list",
+      {},
+      undefined,
+      undefined,
+      context,
+    );
+    assert.deepEqual(afterDisable.details.agent_definitions, [
+      { name: "enabled-child", tools: "default", skills: "none" },
+    ]);
+    const liveChild = afterDisable.details.agents.find(
+      (agent: { agent?: string }) => agent.agent === child.agentLabel,
+    );
+    assert.deepEqual(liveChild, liveChildBefore);
   } finally {
     pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, state.agentLabel));
+    resetAgentMailbox(childMailbox);
+    nativeSessions.delete(child.piSessionId);
     for (const [name] of files)
       realFs.rmSync(join(PI_AGENTS_DIR, name), { force: true });
   }
+});
+
+test("visible capabilities omit unlaunchable parents and non-capability metadata", () => {
+  const definition = (
+    name: string,
+    frontmatter: AgentDefinition["frontmatter"],
+  ): AgentDefinition => ({ name, path: `/${name}.md`, frontmatter, body: "" });
+  assert.deepEqual(
+    visibleAgentCapabilities(
+      [
+        definition("parent", {
+          agents: ["disabled-child"],
+          model: "private/model",
+          extensions: ["private/extension.ts"],
+          tools: ["read"],
+        }),
+        definition("disabled-child", { enabled: false }),
+        definition("routable", {
+          agents: ["child"],
+          extensions: ["private.ts"],
+        }),
+        definition("child", {
+          description: "Available",
+          tools: ["read", "grep"],
+          skills: ["review"],
+          extensions: ["private/extension.ts"],
+        }),
+      ],
+      { kind: "lead" },
+    ),
+    [
+      {
+        name: "routable",
+        tools: "default",
+        skills: "none",
+        agents: ["child"],
+      },
+      {
+        name: "child",
+        description: "Available",
+        tools: "read, grep",
+        skills: "review",
+      },
+    ],
+  );
+  assert.deepEqual(
+    visibleAgentCapabilities(
+      [definition("parent", { agents: ["child"] }), definition("child", {})],
+      { kind: "managed-agent", allowedAgentDefinitions: new Set(["parent"]) },
+    ),
+    [{ name: "parent", tools: "default", skills: "none" }],
+  );
+  assert.deepEqual(
+    visibleAgentCapabilities(
+      [
+        definition("parent", { agents: ["child"] }),
+        definition("child", { agents: ["disabled-grandchild"] }),
+        definition("disabled-grandchild", { enabled: false }),
+      ],
+      { kind: "lead" },
+    ),
+    [],
+  );
+});
+
+test("visible capabilities advertise children only when delegation is enabled", () => {
+  const definition = (
+    name: string,
+    frontmatter: AgentDefinition["frontmatter"],
+  ): AgentDefinition => ({ name, path: `/${name}.md`, frontmatter, body: "" });
+  const definitions = [
+    definition("child", {}),
+    definition("allowed", { agents: ["child"] }),
+    definition("no-tools", { agents: ["child"], noTools: true }),
+    definition("empty-tools", { agents: ["child"], tools: [] }),
+    definition("exclude-agent", {
+      agents: ["child"],
+      excludeTools: ["agent"],
+    }),
+  ];
+  const projected = visibleAgentCapabilities(definitions, { kind: "lead" });
+  assert.deepEqual(
+    projected.map(({ name }) => name),
+    ["child", "allowed", "no-tools", "empty-tools", "exclude-agent"],
+  );
+  assert.deepEqual(projected[1]?.agents, ["child"]);
+  assert.equal("agents" in projected[2]!, false);
+  assert.equal("agents" in projected[3]!, false);
+  assert.equal("agents" in projected[4]!, false);
 });
 
 test("parent list omits unrelated unknown mailbox diagnostics", async () => {

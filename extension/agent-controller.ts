@@ -52,6 +52,8 @@ import {
 import {
   collapseDisplayText,
   createStatusWidget,
+  formatSkills,
+  formatTools,
   formatToolModelResult,
   renderCoordinationCall,
   renderCoordinationResult,
@@ -1745,23 +1747,49 @@ export type ControllerScope =
       allowedAgentDefinitions: ReadonlySet<string>;
     };
 
-export function visibleAgentDefinitionMetadata(
+export function visibleAgentCapabilities(
   definitions: AgentDefinition[],
   scope: ControllerScope,
-): Record<string, unknown>[] {
-  const metadata = definitions.map((definition) =>
-    agentDefinitionMetadata(
+) {
+  const availableNames = new Set(
+    definitions.filter(agentDefinitionEnabled).map(({ name }) => name),
+  );
+  let previousSize: number;
+  do {
+    previousSize = availableNames.size;
+    for (const definition of definitions)
+      if (
+        availableNames.has(definition.name) &&
+        definition.frontmatter.agents?.some((name) => !availableNames.has(name))
+      )
+        availableNames.delete(definition.name);
+  } while (availableNames.size !== previousSize);
+
+  const available = definitions.filter(
+    (definition) =>
+      availableNames.has(definition.name) &&
+      (scope.kind === "lead" ||
+        scope.allowedAgentDefinitions.has(definition.name)),
+  );
+  return available.map((definition) => {
+    const metadata: Record<string, unknown> = agentDefinitionMetadata(
       definition,
       scope.kind === "managed-agent" ? "leaf" : "delegating",
-    ),
-  );
-  return scope.kind === "managed-agent"
-    ? metadata.filter(
-        (definition) =>
-          scope.allowedAgentDefinitions.has(definition.name as string) &&
-          definition.enabled !== false,
-      )
-    : metadata;
+    );
+    return {
+      name: definition.name,
+      ...(typeof metadata.description === "string"
+        ? { description: metadata.description }
+        : {}),
+      tools: formatTools(metadata),
+      skills: formatSkills(metadata),
+      ...(scope.kind === "lead" &&
+      agentDefinitionDelegationEnabled(definition) &&
+      definition.frontmatter.agents?.length
+        ? { agents: [...definition.frontmatter.agents] }
+        : {}),
+    };
+  });
 }
 
 export type Params =
@@ -3745,7 +3773,7 @@ export function createAgentController(
       ok: true,
       agents: [...agents, ...unknown],
       agent_definitions: scope
-        ? visibleAgentDefinitionMetadata(
+        ? visibleAgentCapabilities(
             await options.agentDefinitions(context),
             scope,
           )
