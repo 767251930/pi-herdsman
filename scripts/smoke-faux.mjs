@@ -1,9 +1,10 @@
-import { appendFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import {
   fauxAssistantMessage,
   fauxProvider,
   fauxToolCall,
+  getCurrentSystemPrompt,
 } from "@earendil-works/pi-ai";
 
 const modelIds = [
@@ -152,7 +153,8 @@ function rootAgentPrompt(messages, marker) {
   );
 }
 
-function coreDecision(messages) {
+function coreDecision(context) {
+  const messages = context.messages;
   const latest = messages.at(-1);
   const prompt = text(lastUser(messages));
   const rootTask = rootAgentPrompt(
@@ -166,6 +168,11 @@ function coreDecision(messages) {
       "smoke-core-implementer",
     );
     if (result) {
+      const systemPrompt = getCurrentSystemPrompt(context.messages);
+      if (!/<pi_herdsman_role>\s*## Lead role(?:\r?\n|$)/.test(systemPrompt))
+        throw new Error(
+          "Lead role context missing or incorrect after Agent result",
+        );
       const pkg = packageDetails(result);
       return fauxAssistantMessage(
         `PI_HERDSMAN_SMOKE_OK ${pkg.name}@${pkg.version}`,
@@ -338,7 +345,7 @@ export function decide(model, context) {
     if (!marker) throw new Error("Unexpected chief-tree request");
     return fauxAssistantMessage(marker);
   }
-  if (model === "core") return coreDecision(messages);
+  if (model === "core") return coreDecision(context);
   if (model === "continuation") return continuationDecision(messages);
 
   if (model === "terminal-failure") {
@@ -371,6 +378,9 @@ export function decide(model, context) {
 }
 
 export default function install(pi) {
+  let terminalErrorRequests = 0;
+  let sessionId;
+  const recordedSessions = new Set();
   const faux = fauxProvider({
     provider: "smoke-faux",
     api: "smoke-faux-api",
@@ -378,8 +388,50 @@ export default function install(pi) {
   });
   function response(context, _options, _state, model) {
     faux.appendResponses([response]);
-    const answer = decide(model.id, context);
+    const currentSessionId = sessionId;
+    if (typeof currentSessionId !== "string" || !currentSessionId)
+      throw new Error("Faux provider request has no Pi session identity");
+    if (!recordedSessions.has(currentSessionId)) {
+      const packageDir =
+        process.env.PI_PACKAGE_DIR ?? dirname(process.execPath);
+      let piPackage;
+      try {
+        piPackage = JSON.parse(
+          readFileSync(join(packageDir, "package.json"), "utf8"),
+        );
+      } catch {
+        throw new Error("Could not resolve Pi package metadata");
+      }
+      if (
+        piPackage.name !== "@earendil-works/pi-coding-agent" ||
+        typeof piPackage.version !== "string" ||
+        !piPackage.version
+      )
+        throw new Error("Pi package metadata has an unexpected identity");
+      const systemPrompt = getCurrentSystemPrompt(context.messages);
+      const provenance = {
+        pid: process.pid,
+        sessionId: currentSessionId,
+        packageName: piPackage.name,
+        piVersion: piPackage.version,
+        model: model.id,
+        hasAgentDefinitions: systemPrompt.includes("<agent_definitions>"),
+      };
+      const evidenceDir = join(
+        process.env.PI_CODING_AGENT_DIR,
+        "pi-herdsman",
+        "runtime",
+      );
+      appendFileSync(
+        join(evidenceDir, "smoke-faux-provenance.jsonl"),
+        `${JSON.stringify(provenance)}\n`,
+      );
+      recordedSessions.add(currentSessionId);
+    }
     if (model.id === "terminal-error") {
+      const first = terminalErrorRequests++ === 0;
+      const systemPrompt = getCurrentSystemPrompt(context.messages);
+      const hasRoster = systemPrompt.includes("<agent_definitions>");
       const evidenceDir = join(
         process.env.PI_CODING_AGENT_DIR,
         "pi-herdsman",
@@ -387,13 +439,21 @@ export default function install(pi) {
       );
       appendFileSync(
         join(evidenceDir, "smoke-faux-attempts.jsonl"),
-        `${JSON.stringify({ model: model.id })}\n`,
+        `${JSON.stringify({ model: model.id, hasRoster })}\n`,
       );
+      if (first && !hasRoster)
+        throw new Error(
+          "Assigned Lead's initial request omitted session-matched agent definitions",
+        );
     }
+    const answer = decide(model.id, context);
     return answer;
   }
   faux.setResponses([response]);
   pi.registerProvider(faux.provider);
+  pi.on("session_start", (_event, ctx) => {
+    sessionId = ctx.sessionManager.getSessionId();
+  });
   pi.on("agent_settled", (event, ctx) => {
     if (
       ctx.model?.provider !== "smoke-faux" ||

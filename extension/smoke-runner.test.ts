@@ -39,6 +39,8 @@ import {
   isPackageReadPath,
   listedPanes,
   nestedControlEnv,
+  parentControlEnv,
+  rootCandidateCommand,
   nestedHerdrApiSocketPath,
   nestedPaneInput,
   nestedPaneText,
@@ -56,7 +58,13 @@ import {
   projectMessageEntries,
   retainedProjectMessageRecord,
   managerCleanupTarget,
+  collectDiagnostics,
+  captureTerminalFailureAssignment,
+  coreAgentDefinitionsExpectations,
+  captureTerminalFailureWorktree,
+  terminalFailureAssignmentPoll,
   terminalFailureEvidence,
+  matchPiProvenance,
   prepareManagerRepository,
   assertManagerFreshPrimary,
   deleteBranchIfPresent,
@@ -84,6 +92,30 @@ test("package read identity accepts equivalent paths and rejects other files", (
   assert.equal(isPackageReadPath("other.json", cwd), false);
   assert.equal(isPackageReadPath(`${cwd}/other.json`, cwd), false);
   assert.equal(isPackageReadPath("package.json", undefined), false);
+});
+
+test("parent Herdr routing rejects default and stale sockets", () => {
+  const base = {
+    HERDR_ENV: "1",
+    HERDR_SESSION: "smoke-parent",
+    HERDR_WORKSPACE_ID: "w2",
+    HERDR_SOCKET_PATH: "/wrong/server.sock",
+    HERDR_CLIENT_SOCKET_PATH: "/wrong/client.sock",
+    XDG_CONFIG_HOME: "/tmp/smoke-parent",
+  };
+
+  assert.deepEqual(parentControlEnv(base), {
+    HERDR_ENV: "1",
+    HERDR_SESSION: "smoke-parent",
+    HERDR_WORKSPACE_ID: "w2",
+    XDG_CONFIG_HOME: "/tmp/smoke-parent",
+  });
+
+  assert.throws(() => parentControlEnv({ ...base, HERDR_SESSION: "default" }));
+
+  assert.throws(() => parentControlEnv({ ...base, HERDR_SESSION: undefined }));
+
+  assert.equal(base.HERDR_SOCKET_PATH, "/wrong/server.sock");
 });
 
 test("exact core and continuation tool evidence is enforced only in simulated mode", () => {
@@ -458,6 +490,91 @@ test("smoke isolates nested Herdr routing and Pi paths", () => {
   assert.equal(base.HERDR_SESSION, "parent");
 });
 
+test("root pane command removes inherited managed identity before Pi only", async () => {
+  const paths = {
+    herdrConfig: "/smoke/herdr.toml",
+    xdgConfig: "/smoke/xdg-config",
+    xdgState: "/smoke/xdg-state",
+    piAgent: "/smoke/pi-agent",
+    piSessions: "/smoke/pi-sessions",
+  };
+  const identity = {
+    PI_HERDSMAN_MAILBOX: "/synthetic/mailbox",
+    PI_HERDSMAN_RUN_ID: "synthetic-run",
+    PI_HERDSMAN_OWNER_SESSION_ID: "synthetic-owner",
+    PI_HERDSMAN_OWNER_DISPLAY: "synthetic display",
+    PI_HERDSMAN_LABEL: "synthetic-agent",
+    PI_HERDSMAN_WORKSPACE_ID: "synthetic-workspace",
+    PI_HERDSMAN_AGENT_DEFINITION: "implementer",
+    PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS: '["scout"]',
+    PI_SUBAGENT_PARENT_SESSION: "synthetic-parent",
+    PI_SUBAGENT_CHILD: "1",
+  };
+  const args = [
+    "pi",
+    ...candidateArgs({
+      candidateExtension: "/smoke/dist/index.js",
+      herdrStateExtension: "/smoke/herdr-agent-state.ts",
+      model: "provider/model:high",
+    }),
+    "startup prompt",
+  ];
+  const expectedCommand = [
+    "env",
+    ...Object.keys(identity).flatMap((key) => ["-u", key]),
+    ...args,
+  ]
+    .map((arg) => `'${arg.replaceAll("'", "'\\''")}'`)
+    .join(" ");
+  const command = rootCandidateCommand(args);
+  assert.equal(command, expectedCommand);
+  assert.ok(
+    command.indexOf("'-u' 'PI_SUBAGENT_CHILD'") < command.indexOf("'pi'"),
+  );
+  assert.match(
+    command,
+    /'--approve'.*'--extension' '\/smoke\/dist\/index\.js'.*'--model' 'provider\/model:high'.*'startup prompt'/,
+  );
+
+  const ctx = {
+    paths,
+    sessionName: "smoke-root",
+  };
+  let paneArgs;
+  let paneOptions;
+  await submitPaneCommand(
+    ctx,
+    "w1:p1",
+    command,
+    async (_file, callArgs, options) => {
+      paneArgs = callArgs;
+      paneOptions = options;
+      return { stdout: "", stderr: "", pid: 123 };
+    },
+  );
+  assert.deepEqual(paneArgs, ["pane", "run", "w1:p1", expectedCommand]);
+
+  const base = { ...identity, HERDR_ENV: "1", KEEP_ME: "yes" };
+  const descendantEnv = nestedControlEnv(base, paths, "smoke-child");
+  assert.deepEqual(descendantEnv, {
+    ...identity,
+    HERDR_ENV: "1",
+    HERDR_CONFIG_PATH: "/smoke/herdr.toml",
+    XDG_CONFIG_HOME: "/smoke/xdg-config",
+    XDG_STATE_HOME: "/smoke/xdg-state",
+    PI_CODING_AGENT_DIR: "/smoke/pi-agent",
+    PI_CODING_AGENT_SESSION_DIR: "/smoke/pi-sessions",
+    KEEP_ME: "yes",
+    HERDR_SESSION: "smoke-child",
+  });
+  assert.equal(paneOptions.env.HERDR_CONFIG_PATH, paths.herdrConfig);
+  assert.equal(paneOptions.env.PI_CODING_AGENT_DIR, paths.piAgent);
+  assert.equal(paneOptions.env.PI_CODING_AGENT_SESSION_DIR, paths.piSessions);
+  for (const [key, value] of Object.entries(identity))
+    assert.equal(descendantEnv[key], value);
+  assert.deepEqual(base, { ...identity, HERDR_ENV: "1", KEEP_ME: "yes" });
+});
+
 test("nested Herdr hashes the API socket while checking both socket limits", () => {
   const paths = { xdgConfig: "/tmp/xdg" };
   assert.equal(
@@ -628,6 +745,15 @@ test("core and continuation faux decisions wait for correlated delivered Agent r
   const rootPrompt =
     "Do not read package.json yourself. Delegate and return PI_HERDSMAN_SMOKE_OK pi-herdsman@0.25.1.";
   const rootStarted = [
+    {
+      role: "system",
+      content: "You are a helpful assistant.",
+      sections: {
+        pi_herdsman_role:
+          "<pi_herdsman_role>\n## Lead role\n</pi_herdsman_role>",
+      },
+      timestamp: Date.now(),
+    },
     { role: "user", content: rootPrompt },
     call("delegate_agent", {
       definition: "implementer",
@@ -637,6 +763,24 @@ test("core and continuation faux decisions wait for correlated delivered Agent r
   ];
   const pendingRoot = decide("core", { messages: rootStarted });
   assert.doesNotMatch(pendingRoot.content[0].text, /PI_HERDSMAN_SMOKE_OK/);
+  const managerRoleRoot = rootStarted.map((message, index) =>
+    index === 0
+      ? {
+          ...message,
+          sections: {
+            pi_herdsman_role:
+              "<pi_herdsman_role>\n## Manager role\n</pi_herdsman_role>",
+          },
+        }
+      : message,
+  );
+  assert.throws(
+    () =>
+      decide("core", {
+        messages: [...managerRoleRoot, delivered("smoke-core-implementer")],
+      }),
+    /Lead role context missing or incorrect after Agent result/,
+  );
   assert.equal(
     decide("core", {
       messages: [...rootStarted, delivered("smoke-core-implementer")],
@@ -783,9 +927,13 @@ test("core and continuation faux decisions wait for correlated delivered Agent r
 test("installed faux provider requeues decisions and emits its terminal failure through native error events", async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "pi-herdsman-faux-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousPackageDir = process.env.PI_PACKAGE_DIR;
   const evidenceDir = join(agentDir, "pi-herdsman", "runtime");
   await mkdir(evidenceDir, { recursive: true });
   process.env.PI_CODING_AGENT_DIR = agentDir;
+  process.env.PI_PACKAGE_DIR = resolve(
+    "node_modules/@earendil-works/pi-coding-agent",
+  );
   try {
     let provider;
     const handlers = new Map();
@@ -797,10 +945,24 @@ test("installed faux provider requeues decisions and emits its terminal failure 
         handlers.set(event, handler);
       },
     });
+    handlers.get("session_start")?.(
+      {},
+      {
+        sessionManager: { getSessionId: () => "faux-test-session" },
+      },
+    );
     const model = (id: string) =>
       provider.getModels().find((item: any) => item.id === id);
-    const context = (prompt: string) => ({
-      messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+    const context = (prompt: string, sections = {}) => ({
+      messages: [
+        {
+          role: "system",
+          content: "You are a helpful assistant.",
+          sections,
+          timestamp: Date.now(),
+        },
+        { role: "user", content: [{ type: "text", text: prompt }] },
+      ],
     });
     const collect = async (stream: AsyncIterable<any>) => {
       const events = [];
@@ -822,7 +984,13 @@ test("installed faux provider requeues decisions and emits its terminal failure 
     assert.ok(first.some((event: any) => event.type === "text_delta"));
     assert.ok(second.some((event: any) => event.type === "text_delta"));
     const failure = await collect(
-      provider.streamSimple(model("terminal-error"), context("wait")),
+      provider.streamSimple(
+        model("terminal-error"),
+        context("wait", {
+          agent_definitions:
+            "<agent_definitions>[]\n\nThis is the session-start definition snapshot. Use list_agents for live Agent state or to refresh Agent definitions after configuration changes.</agent_definitions>",
+        }),
+      ),
     );
     const error = failure.find((event: any) => event.type === "error");
     assert.equal(
@@ -842,16 +1010,36 @@ test("installed faux provider requeues decisions and emits its terminal failure 
           part.type === "text" && part.text === "CONTROLLED_PARTIAL_RESPONSE",
       ),
     );
-    assert.equal(
-      (await readFile(join(evidenceDir, "smoke-faux-attempts.jsonl"), "utf8"))
-        .trim()
-        .split("\n").length,
-      1,
+    assert.deepEqual(
+      JSON.parse(
+        (
+          await readFile(join(evidenceDir, "smoke-faux-attempts.jsonl"), "utf8")
+        ).trim(),
+      ),
+      { model: "terminal-error", hasRoster: true },
     );
+    const provenance = (
+      await readFile(join(evidenceDir, "smoke-faux-provenance.jsonl"), "utf8")
+    )
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(provenance, [
+      {
+        pid: process.pid,
+        sessionId: "faux-test-session",
+        packageName: "@earendil-works/pi-coding-agent",
+        piVersion: "1.2.0",
+        model: "chief-tree",
+        hasAgentDefinitions: false,
+      },
+    ]);
     assert.equal(handlers.has("agent_settled"), true);
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    if (previousPackageDir === undefined) delete process.env.PI_PACKAGE_DIR;
+    else process.env.PI_PACKAGE_DIR = previousPackageDir;
     await rm(agentDir, { recursive: true, force: true });
   }
 });
@@ -1365,6 +1553,254 @@ test("terminal-failure evidence remains actionable and Manager uses only delegat
     toolCalls: 0,
     toolNames: [],
   });
+});
+
+test("Pi provenance requires exact session, foreground PID, and Pi version", () => {
+  const record = {
+    pid: 42,
+    sessionId: "session",
+    packageName: "@earendil-works/pi-coding-agent",
+    piVersion: "1.2.0",
+    model: "terminal-error",
+    hasAgentDefinitions: true,
+  };
+  const processes = [{ pid: 42 }];
+  assert.deepEqual(
+    matchPiProvenance(
+      [record],
+      "session",
+      "lead-pane",
+      processes,
+      "terminal-error",
+      true,
+    ),
+    {
+      paneId: "lead-pane",
+      pid: 42,
+      sessionId: "session",
+      piVersion: "1.2.0",
+    },
+  );
+  assert.throws(
+    () =>
+      matchPiProvenance(
+        [record],
+        "session",
+        "lead-pane",
+        [{ pid: 43 }],
+        "terminal-error",
+        true,
+      ),
+    /foreground PID match/,
+  );
+  assert.throws(
+    () =>
+      matchPiProvenance(
+        [record],
+        "other-session",
+        "lead-pane",
+        processes,
+        "terminal-error",
+        true,
+      ),
+    /provenance row/,
+  );
+  assert.throws(
+    () =>
+      matchPiProvenance(
+        [{ ...record, piVersion: "1.1.0" }],
+        "session",
+        "lead-pane",
+        processes,
+        "terminal-error",
+        true,
+      ),
+    /1\.2\.0/,
+  );
+  assert.throws(
+    () =>
+      matchPiProvenance(
+        [record, record],
+        "session",
+        "lead-pane",
+        processes,
+        "terminal-error",
+        true,
+      ),
+    /expected one provenance row/,
+  );
+});
+
+test("core Pi provenance matches the core model and role-specific roster", () => {
+  const root = {
+    pid: 41,
+    sessionId: "root",
+    packageName: "@earendil-works/pi-coding-agent",
+    piVersion: "1.2.0",
+    model: "core",
+    hasAgentDefinitions: true,
+  };
+  const child = {
+    ...root,
+    pid: 42,
+    sessionId: "child",
+    hasAgentDefinitions: true,
+  };
+  const leaf = {
+    ...child,
+    pid: 43,
+    sessionId: "leaf",
+    hasAgentDefinitions: false,
+  };
+  const expectations = coreAgentDefinitionsExpectations(
+    [
+      {
+        id: "root",
+        entries: [
+          {
+            type: "message",
+            message: {
+              role: "assistant",
+              content: [{ type: "toolCall", name: "delegate_agent" }],
+            },
+          },
+        ],
+      },
+      {
+        id: "child",
+        entries: [
+          {
+            type: "message",
+            message: {
+              role: "assistant",
+              content: [{ type: "toolCall", name: "delegate_agent" }],
+            },
+          },
+        ],
+      },
+      { id: "leaf", entries: [] },
+    ],
+    "root",
+  );
+  assert.deepEqual(
+    [...expectations],
+    [
+      ["root", true],
+      ["child", true],
+      ["leaf", false],
+    ],
+  );
+  assert.deepEqual(
+    matchPiProvenance(
+      [root],
+      "root",
+      "root-pane",
+      [{ pid: 41 }],
+      "core",
+      expectations.get("root"),
+    ),
+    { paneId: "root-pane", pid: 41, sessionId: "root", piVersion: "1.2.0" },
+  );
+  assert.deepEqual(
+    matchPiProvenance(
+      [child],
+      "child",
+      "agent-pane",
+      [{ pid: 42 }],
+      "core",
+      expectations.get("child"),
+    ),
+    { paneId: "agent-pane", pid: 42, sessionId: "child", piVersion: "1.2.0" },
+  );
+  assert.throws(
+    () =>
+      matchPiProvenance(
+        [root],
+        "root",
+        "root-pane",
+        [{ pid: 41 }],
+        "terminal-error",
+        expectations.get("root"),
+      ),
+    /'core'/,
+  );
+  assert.throws(
+    () =>
+      matchPiProvenance(
+        [leaf],
+        "leaf",
+        "leaf-pane",
+        [{ pid: 43 }],
+        "core",
+        true,
+      ),
+    /false !== true/,
+  );
+});
+
+test("provenance uses retained foreground PID evidence when a pane later disappears", async () => {
+  let observations = 0;
+  const inspection = await inspectPaneProcesses(
+    ["agent-pane"],
+    "root-pane",
+    async () => {
+      observations++;
+      return {
+        process_info: {
+          foreground_processes: [
+            {
+              pid: 52,
+              argv: [
+                "node",
+                "--extension",
+                "/candidate.js",
+                "--extension",
+                "/herdr.js",
+              ],
+            },
+          ],
+        },
+      };
+    },
+    "/candidate.js",
+    "/herdr.js",
+  );
+  const retained = inspection.verified.map(({ paneId, pid }) => ({
+    paneId,
+    processes: [{ pid }],
+  }));
+  const disappeared = await inspectPaneProcesses(
+    ["agent-pane"],
+    "root-pane",
+    async () => {
+      observations++;
+      throw new Error("pane_not_found");
+    },
+    "/candidate.js",
+    "/herdr.js",
+  );
+  assert.equal(observations, 2);
+  assert.equal(disappeared.records[0].error, "pane_not_found");
+  assert.deepEqual(
+    matchPiProvenance(
+      [
+        {
+          pid: 52,
+          sessionId: "child",
+          packageName: "@earendil-works/pi-coding-agent",
+          piVersion: "1.2.0",
+          model: "core",
+          hasAgentDefinitions: false,
+        },
+      ],
+      "child",
+      retained[0].paneId,
+      retained[0].processes,
+      "core",
+      false,
+    ).pid,
+    52,
+  );
 });
 
 test("manager-recovery uses nonblocking messages only when information cannot wait for the automatic result", () => {
@@ -1897,6 +2333,7 @@ test("Manager cleanup selects the recreated workspace only for exact branch and 
       [worktree],
       "feature/current",
       "/smoke/project-worktree",
+      worktree.open_workspace_id,
     ),
     worktree,
   );
@@ -1906,11 +2343,18 @@ test("Manager cleanup selects the recreated workspace only for exact branch and 
         [worktree, worktree],
         worktree.branch,
         worktree.path,
+        worktree.open_workspace_id,
       ),
     /one worktree/,
   );
   assert.throws(
-    () => managerCleanupTarget([worktree], worktree.branch, "/other/path"),
+    () =>
+      managerCleanupTarget(
+        [worktree],
+        worktree.branch,
+        "/other/path",
+        worktree.open_workspace_id,
+      ),
     /path does not match/,
   );
   assert.throws(
@@ -1919,15 +2363,28 @@ test("Manager cleanup selects the recreated workspace only for exact branch and 
         [{ ...worktree, open_workspace_id: "" }],
         worktree.branch,
         worktree.path,
+        worktree.open_workspace_id,
       ),
     /no workspace identity/,
   );
   assert.throws(
-    () => managerCleanupTarget([], worktree.branch, worktree.path),
+    () =>
+      managerCleanupTarget(
+        [],
+        worktree.branch,
+        worktree.path,
+        worktree.open_workspace_id,
+      ),
     /one worktree/,
   );
   assert.equal(
-    managerCleanupTarget([], worktree.branch, worktree.path, true),
+    managerCleanupTarget(
+      [],
+      worktree.branch,
+      worktree.path,
+      worktree.open_workspace_id,
+      true,
+    ),
     null,
   );
   assert.throws(
@@ -1936,9 +2393,249 @@ test("Manager cleanup selects the recreated workspace only for exact branch and 
         [worktree, worktree],
         worktree.branch,
         worktree.path,
+        worktree.open_workspace_id,
         true,
       ),
     /one worktree/,
+  );
+  assert.throws(
+    () =>
+      managerCleanupTarget(
+        [{ ...worktree, open_workspace_id: "replacement-workspace" }],
+        worktree.branch,
+        worktree.path,
+        worktree.open_workspace_id,
+      ),
+    /workspace identity does not match captured identity/,
+  );
+  assert.throws(
+    () =>
+      managerCleanupTarget(
+        [worktree],
+        worktree.branch,
+        worktree.path,
+        undefined,
+      ),
+    /captured workspace identity is unavailable/,
+  );
+});
+
+test("collectDiagnostics reads the host pane through the parent Herdr environment", async () => {
+  const parentEnv = { HERDR_SESSION: "parent-session" };
+  const calls = [];
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    await collectDiagnostics(
+      {
+        parentEnv,
+        paths: {},
+        sessionName: "nested",
+        rootPaneId: "root-pane",
+      },
+      { hostPaneId: "host-pane" },
+      null,
+      {
+        execute: async (...args) => {
+          calls.push(args);
+          return { stdout: "host output" };
+        },
+        observe: async () => ({ ok: true, value: { agents: [], panes: [] } }),
+        snapshot: async () => null,
+      },
+    );
+  } finally {
+    console.error = originalError;
+  }
+  assert.deepEqual(
+    calls.find(([, args]) => args.includes("host-pane")),
+    [
+      "herdr",
+      [
+        "pane",
+        "read",
+        "host-pane",
+        "--source",
+        "recent-unwrapped",
+        "--lines",
+        "80",
+      ],
+      { env: parentEnv, timeout: 5_000 },
+    ],
+  );
+});
+
+test("terminal-failure assignment polling captures topology before assignment succeeds", async () => {
+  const ctx = {
+    rootWorkspaceId: "parent-workspace",
+    owned: { managerBranch: "herdsman/smoke-terminal-failure" },
+  };
+  const worktree = {
+    branch: "herdsman/smoke-terminal-failure",
+    path: "/smoke/terminal-failure",
+    open_workspace_id: "workspace-2",
+  };
+  const calls = [];
+  const result = await terminalFailureAssignmentPoll(
+    ctx,
+    worktree.branch,
+    async () => null,
+    async () => [],
+    async (...args) => {
+      calls.push(args);
+      return { worktrees: [worktree] };
+    },
+  );
+  assert.equal(result.done, false);
+  assert.deepEqual(calls, [
+    [ctx, ["worktree", "list", "--workspace", "parent-workspace"]],
+  ]);
+  // No successful assignment is required to retain identity exposed by topology.
+  assert.equal(ctx.owned.managerWorktreePath, worktree.path);
+  assert.equal(ctx.owned.managerWorkspaceId, worktree.open_workspace_id);
+  assert.equal(ctx.owned.managerWorktreeRetirementRequested, false);
+  assert.equal(
+    managerCleanupTarget(
+      [worktree],
+      worktree.branch,
+      ctx.owned.managerWorktreePath,
+      ctx.owned.managerWorkspaceId,
+    ),
+    worktree,
+  );
+  assert.throws(
+    () =>
+      managerCleanupTarget(
+        [{ ...worktree, open_workspace_id: "replacement-workspace" }],
+        worktree.branch,
+        ctx.owned.managerWorktreePath,
+        ctx.owned.managerWorkspaceId,
+      ),
+    /workspace identity does not match captured identity/,
+  );
+  assert.throws(
+    () =>
+      captureTerminalFailureWorktree(
+        ctx,
+        [worktree, worktree],
+        worktree.branch,
+      ),
+    /one worktree/,
+  );
+});
+
+test("terminal-failure retains the assigned Lead PID while its pane is live", async () => {
+  const branch = "smoke-branch";
+  const contents =
+    JSON.stringify({
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "delegate_project",
+        content: JSON.stringify({
+          ok: true,
+          action: "delegate",
+          branch,
+          session: "lead-session",
+        }),
+      },
+    }) + "\n";
+  assert.deepEqual(staffDelegateResults(contents), [
+    { ok: true, action: "delegate", branch, session: "lead-session" },
+  ]);
+  const calls = [];
+  const ctx = {
+    rootWorkspaceId: "workspace",
+    candidateExtension: "/candidate.js",
+    herdrStateExtension: "/herdr.js",
+  };
+  const result = await terminalFailureAssignmentPoll(
+    ctx,
+    branch,
+    async () => ({ contents }),
+    async () => [
+      {
+        pane_id: "lead-pane",
+        agent_session: { kind: "id", value: "lead-session" },
+      },
+    ],
+    async (_ctx, args) => {
+      calls.push(args);
+      if (args[0] === "worktree") return { worktrees: [] };
+      return {
+        process_info: {
+          foreground_processes: [
+            {
+              pid: 91,
+              argv: [
+                "node",
+                "--extension",
+                "/candidate.js",
+                "--extension",
+                "/herdr.js",
+              ],
+            },
+          ],
+        },
+      };
+    },
+  );
+  assert.equal(result.done, true, JSON.stringify(result));
+  assert.deepEqual(result.value.processObservation, {
+    paneId: "lead-pane",
+    processes: [{ pid: 91 }],
+  });
+  assert.deepEqual(calls, [
+    ["worktree", "list", "--workspace", "workspace"],
+    ["pane", "process-info", "--pane", "lead-pane"],
+  ]);
+});
+
+test("terminal-failure assignment polling preserves the first workspace identity", async () => {
+  const ctx = {
+    rootWorkspaceId: "parent-workspace",
+    owned: { managerBranch: "herdsman/smoke-terminal-failure" },
+  };
+  const worktree = {
+    branch: "herdsman/smoke-terminal-failure",
+    path: "/smoke/terminal-failure",
+    open_workspace_id: "workspace-2",
+  };
+  const poll = () =>
+    terminalFailureAssignmentPoll(
+      ctx,
+      worktree.branch,
+      async () => null,
+      async () => [],
+      async () => ({ worktrees: [{ ...worktree }] }),
+    );
+
+  assert.equal((await poll()).done, false);
+  worktree.open_workspace_id = "replacement-workspace";
+  assert.equal((await poll()).done, false);
+
+  assert.equal(ctx.owned.managerWorktreePath, worktree.path);
+  assert.equal(ctx.owned.managerWorkspaceId, "workspace-2");
+  assert.throws(
+    () =>
+      captureTerminalFailureAssignment(
+        ctx,
+        worktree.path,
+        "replacement-workspace",
+      ),
+    /conflicts with captured identity/,
+  );
+  assert.equal(ctx.owned.managerWorktreePath, worktree.path);
+  assert.equal(ctx.owned.managerWorkspaceId, "workspace-2");
+  assert.throws(
+    () =>
+      managerCleanupTarget(
+        [worktree],
+        worktree.branch,
+        ctx.owned.managerWorktreePath,
+        ctx.owned.managerWorkspaceId,
+      ),
+    /workspace identity does not match captured identity/,
   );
 });
 

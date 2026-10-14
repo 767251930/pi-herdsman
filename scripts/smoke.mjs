@@ -50,6 +50,18 @@ const HERDR_ROUTING_KEYS = [
   "HERDR_TAB_ID",
   "HERDR_PANE_ID",
 ];
+const MANAGED_AGENT_IDENTITY_KEYS = [
+  "PI_HERDSMAN_MAILBOX",
+  "PI_HERDSMAN_RUN_ID",
+  "PI_HERDSMAN_OWNER_SESSION_ID",
+  "PI_HERDSMAN_OWNER_DISPLAY",
+  "PI_HERDSMAN_LABEL",
+  "PI_HERDSMAN_WORKSPACE_ID",
+  "PI_HERDSMAN_AGENT_DEFINITION",
+  "PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS",
+  "PI_SUBAGENT_PARENT_SESSION",
+  "PI_SUBAGENT_CHILD",
+];
 
 export function parseScenario(args) {
   if (args.length > 1) throw new Error(`unexpected smoke argument: ${args[1]}`);
@@ -401,6 +413,30 @@ export function nestedControlEnv(base, paths, sessionName) {
   return { ...isolatedEnv(base, paths), HERDR_SESSION: sessionName };
 }
 
+export function parentControlEnv(base) {
+  if (
+    base.HERDR_ENV !== "1" ||
+    !base.HERDR_WORKSPACE_ID ||
+    !base.HERDR_SESSION ||
+    base.HERDR_SESSION === "default"
+  ) {
+    throw new Error("smoke requires a disposable named parent Herdr session");
+  }
+
+  const env = { ...base };
+  delete env.HERDR_SOCKET_PATH;
+  delete env.HERDR_CLIENT_SOCKET_PATH;
+  return env;
+}
+
+export function rootCandidateCommand(args) {
+  return shellCommand([
+    "env",
+    ...MANAGED_AGENT_IDENTITY_KEYS.flatMap((key) => ["-u", key]),
+    ...args,
+  ]);
+}
+
 export function nestedHerdrApiSocketPath(paths, sessionName) {
   const directory = join(paths.xdgConfig, "herdr", "sessions", sessionName);
   for (const name of ["herdr.sock", "herdr-client.sock"]) {
@@ -717,10 +753,13 @@ export function managerCleanupTarget(
   worktrees,
   branch,
   worktreePath,
+  workspaceId,
   retirementRequested = false,
 ) {
   if (typeof worktreePath !== "string" || !worktreePath)
     throw new Error("captured worktree path is unavailable");
+  if (typeof workspaceId !== "string" || !workspaceId)
+    throw new Error("captured workspace identity is unavailable");
   const matches = worktrees.filter((item) => item.branch === branch);
   if (matches.length === 0 && retirementRequested) return null;
   if (matches.length !== 1)
@@ -730,7 +769,125 @@ export function managerCleanupTarget(
     throw new Error("exact branch worktree path does not match captured path");
   if (typeof target.open_workspace_id !== "string" || !target.open_workspace_id)
     throw new Error("exact branch worktree has no workspace identity");
+  if (target.open_workspace_id !== workspaceId)
+    throw new Error(
+      "exact branch worktree workspace identity does not match captured identity",
+    );
   return target;
+}
+
+export function captureTerminalFailureWorktree(ctx, worktrees, branch) {
+  const matches = worktrees.filter((item) => item.branch === branch);
+  if (matches.length === 0) return null;
+  if (matches.length !== 1)
+    throw new Error("exact branch must identify one worktree");
+  const [worktree] = matches;
+  const path = worktree.path ?? worktree.worktree_path;
+  if (typeof path !== "string" || !path || !worktree.open_workspace_id)
+    throw new Error("exact branch worktree identity is incomplete");
+  captureTerminalFailureAssignment(ctx, path, worktree.open_workspace_id);
+  return worktree;
+}
+
+export function captureTerminalFailureAssignment(ctx, path, workspaceId) {
+  if (typeof path !== "string" || !path || !workspaceId)
+    throw new Error("exact assigned worktree identity is incomplete");
+  if (ctx.owned.managerWorktreePath || ctx.owned.managerWorkspaceId) {
+    if (
+      ctx.owned.managerWorktreePath !== path ||
+      ctx.owned.managerWorkspaceId !== workspaceId
+    )
+      throw new Error(
+        "exact assigned worktree identity conflicts with captured identity",
+      );
+    return;
+  }
+  ctx.owned.managerWorktreePath = path;
+  ctx.owned.managerWorkspaceId = workspaceId;
+  ctx.owned.managerWorktreeRetirementRequested = false;
+}
+
+export function parentHostPaneReadOptions(parentEnv) {
+  return { env: parentEnv, timeout: OBSERVATION_TIMEOUT_MS };
+}
+
+export async function readParentHostPane(ctx, paneId, execute = run) {
+  return execute(
+    "herdr",
+    ["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", "80"],
+    parentHostPaneReadOptions(ctx.parentEnv),
+  );
+}
+
+export async function captureTerminalFailureTopology(
+  ctx,
+  branch,
+  execute = nestedCommand,
+) {
+  const topology = await execute(ctx, [
+    "worktree",
+    "list",
+    "--workspace",
+    ctx.rootWorkspaceId,
+  ]);
+  return captureTerminalFailureWorktree(ctx, topology.worktrees ?? [], branch);
+}
+
+export async function terminalFailureAssignmentPoll(
+  ctx,
+  branch,
+  root,
+  agents,
+  execute = nestedCommand,
+  getAgentSessionId = agentSessionId,
+) {
+  const session = await root();
+  const delegated = session
+    ? staffDelegateResults(session.contents).filter(
+        (item) => item.branch === branch,
+      )
+    : [];
+  try {
+    await captureTerminalFailureTopology(ctx, branch, execute);
+  } catch {
+    // Assignment verification remains authoritative; retain cleanup evidence when observable.
+  }
+  let child;
+  if (delegated.length === 1)
+    for (const agent of await agents())
+      if ((await getAgentSessionId(ctx, agent)) === delegated[0].session) {
+        child = agent;
+        break;
+      }
+  let processObservation;
+  if (child?.pane_id) {
+    try {
+      const info = await execute(ctx, [
+        "pane",
+        "process-info",
+        "--pane",
+        child.pane_id,
+      ]);
+      const matches = candidateProcess(
+        info,
+        ctx.candidateExtension,
+        ctx.herdrStateExtension,
+      );
+      if (matches.length === 1)
+        processObservation = {
+          paneId: child.pane_id,
+          processes: [{ pid: matches[0].pid }],
+        };
+    } catch {
+      // The existing evidence poll retries while the assigned Lead is starting.
+    }
+  }
+  return {
+    done: !!child && !!processObservation,
+    value: { delegated: delegated[0], child, processObservation },
+    progress: { delegationCount: delegated.length },
+    evidence: session ? summarizeSession(session.contents) : null,
+  };
 }
 
 export async function prepareManagerRepository(paths, execute = run) {
@@ -1484,9 +1641,7 @@ export function requireTestedBaseline(name, actualVersion, baselineVersion) {
   }
 }
 
-async function preflight(pkg) {
-  if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_WORKSPACE_ID)
-    throw new Error("smoke must run from a Herdr-managed Pi session");
+async function preflight(pkg, parentEnv) {
   const nodeEngine = pkg?.engines?.node;
   const nodeBaseline =
     typeof nodeEngine === "string"
@@ -1495,10 +1650,22 @@ async function preflight(pkg) {
   const piBaseline = pkg?.piHerdsman?.runtime?.pi;
   const herdrBaseline = pkg?.piHerdsman?.runtime?.herdr?.version;
   requireTestedBaseline("Node", process.versions.node, nodeBaseline);
-  const [{ stdout: piVersion }, status] = await Promise.all([
+  const [{ stdout: piVersion }, status, workspace] = await Promise.all([
     run("pi", ["--version"], { timeout: OBSERVATION_TIMEOUT_MS }),
-    herdr(["status", "--json"], { timeout: OBSERVATION_TIMEOUT_MS }),
+    herdr(["status", "--json"], {
+      env: parentEnv,
+      timeout: OBSERVATION_TIMEOUT_MS,
+    }),
+    herdr(["workspace", "get", parentEnv.HERDR_WORKSPACE_ID], {
+      env: parentEnv,
+      timeout: OBSERVATION_TIMEOUT_MS,
+    }),
   ]);
+  assert.equal(
+    workspace?.workspace?.workspace_id,
+    parentEnv.HERDR_WORKSPACE_ID,
+    "smoke parent workspace is not in the selected named session",
+  );
   const actualPiVersion = piVersion.trim();
   requireTestedBaseline("Pi", actualPiVersion, piBaseline);
   if (!status?.server?.running) throw new Error("Herdr server is not running");
@@ -1613,6 +1780,7 @@ async function prepareHerdr(paths) {
 async function startNestedHerdr(
   paths,
   owned,
+  parentEnv,
   primaryCheckoutPath,
   managerRecoveryDiagnostics,
 ) {
@@ -1625,7 +1793,7 @@ async function startNestedHerdr(
       "tab",
       "create",
       "--workspace",
-      process.env.HERDR_WORKSPACE_ID,
+      parentEnv.HERDR_WORKSPACE_ID,
       "--cwd",
       primaryCheckoutPath,
       "--label",
@@ -1645,7 +1813,7 @@ async function startNestedHerdr(
         ? ["--env", "PI_HERDSMAN_MANAGER_DIAGNOSTICS=1"]
         : []),
     ],
-    { env: process.env },
+    { env: parentEnv },
   );
   const result = host;
   owned.hostTabId = result.tab?.tab_id;
@@ -1669,7 +1837,7 @@ async function startNestedHerdr(
         paths.root,
       ]),
     ],
-    { env: process.env },
+    { env: parentEnv },
   ).catch((error) => {
     throw new Error(`could not launch nested host: ${error.message}`);
   });
@@ -1795,7 +1963,11 @@ async function startCandidate(ctx) {
       "pane",
       "run",
       paneId,
-      shellCommand(["pi", ...args, ...(prompt === undefined ? [] : [prompt])]),
+      rootCandidateCommand([
+        "pi",
+        ...args,
+        ...(prompt === undefined ? [] : [prompt]),
+      ]),
     ],
     {
       env: nestedControlEnv(process.env, ctx.paths, ctx.sessionName),
@@ -1877,6 +2049,55 @@ export function terminalFailureEvidence(contents, branch, sessionId) {
   };
 }
 
+export function matchPiProvenance(
+  records,
+  sessionId,
+  paneId,
+  foregroundProcesses,
+  expectedModel,
+  requireAgentDefinitions,
+) {
+  const matches = records.filter((record) => record.sessionId === sessionId);
+  assert.equal(
+    matches.length,
+    1,
+    `expected one provenance row for ${sessionId}`,
+  );
+  const [record] = matches;
+  assert.equal(record.packageName, "@earendil-works/pi-coding-agent");
+  assert.equal(record.piVersion, "1.2.0");
+  assert.equal(record.model, expectedModel);
+  assert.equal(record.hasAgentDefinitions, requireAgentDefinitions);
+  const processes = foregroundProcesses.filter(
+    (process) => process.pid === record.pid,
+  );
+  assert.equal(
+    processes.length,
+    1,
+    `expected one foreground PID match in pane ${paneId}`,
+  );
+  assert.ok(Number.isSafeInteger(record.pid) && record.pid > 0);
+  return { paneId, pid: record.pid, sessionId, piVersion: record.piVersion };
+}
+
+export function coreAgentDefinitionsExpectations(sessions, rootId) {
+  return new Map(
+    sessions.map(({ id, entries }) => [
+      id,
+      id === rootId ||
+        entries.some(
+          (entry) =>
+            entry.type === "message" &&
+            entry.message?.role === "assistant" &&
+            entry.message.content?.some(
+              (part) =>
+                part.type === "toolCall" && part.name === "delegate_agent",
+            ),
+        ),
+    ]),
+  );
+}
+
 async function runTerminalFailureSmoke(ctx) {
   const branch = `herdsman/smoke-terminal-failure-${randomUUID()}`;
   const task =
@@ -1886,6 +2107,7 @@ async function runTerminalFailureSmoke(ctx) {
   await mkdir(evidenceDir, { recursive: true });
   const attemptsPath = join(evidenceDir, "smoke-faux-attempts.jsonl");
   const settledPath = join(evidenceDir, "smoke-faux-settled.jsonl");
+  const provenancePath = join(evidenceDir, "smoke-faux-provenance.jsonl");
   const definitionDir = join(ctx.rootCwd, ".pi", "agents");
   await mkdir(definitionDir, { recursive: true });
   await writeFile(
@@ -1969,27 +2191,7 @@ async function runTerminalFailureSmoke(ctx) {
   const result = await waitForEvidence(
     ctx,
     "terminal-failure-assignment",
-    async () => {
-      const session = await root();
-      const delegated = session
-        ? staffDelegateResults(session.contents).filter(
-            (item) => item.branch === branch,
-          )
-        : [];
-      let child;
-      if (delegated.length === 1)
-        for (const agent of await agents())
-          if ((await agentSessionId(ctx, agent)) === delegated[0].session) {
-            child = agent;
-            break;
-          }
-      return {
-        done: !!child,
-        value: { delegated: delegated[0], child },
-        progress: { delegationCount: delegated.length },
-        evidence: session ? summarizeSession(session.contents) : null,
-      };
-    },
+    () => terminalFailureAssignmentPoll(ctx, branch, root, agents),
     { timeoutMs: 6 * 60_000, stallMs: MODEL_STALL_MS },
   );
   const assigned = result.delegated;
@@ -1999,6 +2201,8 @@ async function runTerminalFailureSmoke(ctx) {
   assert.ok(child?.pane_id);
   const sessionId = assigned.session;
   const paneId = child.pane_id;
+  const processObservation = result.processObservation;
+  assert.equal(processObservation?.paneId, paneId);
   const worktrees = await nestedCommand(ctx, [
     "worktree",
     "list",
@@ -2018,9 +2222,8 @@ async function runTerminalFailureSmoke(ctx) {
     typeof worktreePath === "string" && isAbsolute(worktreePath),
     "exact assigned Lead pane must identify its worktree path",
   );
-  ctx.owned.managerWorktreePath = worktreePath;
+  captureTerminalFailureAssignment(ctx, worktreePath, assigned.workspace_id);
   ctx.owned.managerWorktreeRetirementRequested = false;
-  ctx.owned.managerWorkspaceId = assigned.workspace_id;
   ctx.managerRecovery = { branch, worktreePath };
   assert.equal(resolve(paneCwd), resolve(worktreePath));
   const sessionSnapshot = () => exactIsolatedSession(ctx, sessionId);
@@ -2118,6 +2321,18 @@ async function runTerminalFailureSmoke(ctx) {
     { timeoutMs: 6 * 60_000, stallMs: MODEL_STALL_MS },
   );
   const managerSession = await root();
+  const provenance = (await readFile(provenancePath, "utf8"))
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  ctx.terminalFailure.provenance = matchPiProvenance(
+    provenance,
+    sessionId,
+    paneId,
+    processObservation.processes,
+    "terminal-error",
+    true,
+  );
   const report = terminalFailureEvidence(
     managerSession.contents,
     branch,
@@ -2647,6 +2862,23 @@ async function runCoreSmoke(ctx) {
       for (const item of inspection.verified) {
         observed.set(`${item.paneId}\0${item.pid}`, item);
       }
+      const rootInfo = await tryNestedCommand(ctx, [
+        "pane",
+        "process-info",
+        "--pane",
+        ctx.rootPaneId,
+      ]);
+      if (!rootInfo.ok) throw observationFailure(rootInfo.error);
+      const rootMatches = candidateProcess(
+        rootInfo.value,
+        ctx.candidateExtension,
+        ctx.herdrStateExtension,
+      );
+      if (rootMatches.length === 1)
+        ctx.coreRootProcess = {
+          paneId: ctx.rootPaneId,
+          pid: rootMatches[0].pid,
+        };
       ctx.coreProcessEvidence = [...observed.values()].slice(-40);
       ctx.coreProcessDiagnostics = inspection.records.slice(0, 40);
       const session = await rootSessionSnapshot(ctx);
@@ -2661,7 +2893,7 @@ async function runCoreSmoke(ctx) {
       }
       const paneCount = distinctPaneCount([...observed.values()]);
       return {
-        done: !!ctx.assistantResult && paneCount >= 2,
+        done: !!ctx.assistantResult && paneCount >= 2 && !!ctx.coreRootProcess,
         progress: {
           rootSessionBytes: session ? Buffer.byteLength(session.contents) : 0,
           verifiedProcesses: [...observed.keys()].sort(),
@@ -2678,6 +2910,83 @@ async function runCoreSmoke(ctx) {
     { timeoutMs: 6 * 60_000, stallMs: MODEL_STALL_MS },
   );
   if (ctx.simulated) {
+    const provenancePath = join(
+      ctx.paths.piAgent,
+      "pi-herdsman",
+      "runtime",
+      "smoke-faux-provenance.jsonl",
+    );
+    const provenance = (await readFile(provenancePath, "utf8"))
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const sessionFiles = (
+      await readdir(ctx.paths.piSessions, { recursive: true })
+    ).filter((file) => file.endsWith(".jsonl"));
+    const sessionIds = new Set();
+    for (const file of sessionFiles) {
+      const header = sessionEntries(
+        await readFile(join(ctx.paths.piSessions, file), "utf8"),
+      ).find((entry) => entry.type === "session");
+      if (typeof header?.id === "string" && header.id)
+        sessionIds.add(header.id);
+    }
+    const rootSession = await rootSessionSnapshot(ctx);
+    const rootId =
+      rootSession &&
+      sessionEntries(rootSession.contents).find(
+        (entry) => entry.type === "session",
+      )?.id;
+    assert.ok(rootId, "core root session has no exact Pi session identity");
+    const observedProcesses = [ctx.coreRootProcess, ...observed.values()].map(
+      ({ paneId, pid }) => ({ paneId, processes: [{ pid }] }),
+    );
+    const sessions = [];
+    for (const file of sessionFiles) {
+      const entries = sessionEntries(
+        await readFile(join(ctx.paths.piSessions, file), "utf8"),
+      );
+      const id = entries.find((entry) => entry.type === "session")?.id;
+      if (sessionIds.has(id)) sessions.push({ id, entries });
+    }
+    const expectedDefinitions = coreAgentDefinitionsExpectations(
+      sessions,
+      rootId,
+    );
+    for (const sessionId of sessionIds) {
+      const expectedAgentDefinitions = expectedDefinitions.get(sessionId);
+      assert.notEqual(
+        expectedAgentDefinitions,
+        undefined,
+        `missing persisted role evidence for ${sessionId}`,
+      );
+      const matches = provenance.filter(
+        (record) => record.sessionId === sessionId,
+      );
+      assert.equal(
+        matches.length,
+        1,
+        `expected one provenance row for ${sessionId}`,
+      );
+      const record = matches[0];
+      const pane = observedProcesses.find(({ processes }) =>
+        processes.some((process) => process.pid === record.pid),
+      );
+      assert.ok(pane, `no exact foreground PID match for ${sessionId}`);
+      matchPiProvenance(
+        provenance,
+        sessionId,
+        pane.paneId,
+        pane.processes,
+        "core",
+        expectedAgentDefinitions,
+      );
+    }
+    assert.equal(
+      provenance.length,
+      sessionIds.size,
+      "unexpected or duplicate core provenance rows",
+    );
     const files = (
       await readdir(ctx.paths.piSessions, { recursive: true })
     ).filter((file) => file.endsWith(".jsonl"));
@@ -4274,7 +4583,12 @@ async function waitForDescendantsToExit(ctx) {
   );
 }
 
-async function collectDiagnostics(ctx, owned, failure) {
+export async function collectDiagnostics(
+  ctx,
+  owned,
+  failure,
+  { execute = run, observe = tryHerdr, snapshot = rootSessionSnapshot } = {},
+) {
   const diagnostics = {};
   const env = nestedControlEnv(process.env, ctx.paths, ctx.sessionName);
   diagnostics.chiefTreeProbe = ctx.chiefTreeProbeDiagnostics ?? null;
@@ -4286,11 +4600,11 @@ async function collectDiagnostics(ctx, owned, failure) {
   diagnostics.preflight = ctx.preflight ?? null;
   const [agents, panes, rootSession, rootPane, hostPane] =
     await Promise.allSettled([
-      tryHerdr(["agent", "list"], { env, timeout: OBSERVATION_TIMEOUT_MS }),
-      tryHerdr(["pane", "list"], { env, timeout: OBSERVATION_TIMEOUT_MS }),
-      rootSessionSnapshot(ctx),
+      observe(["agent", "list"], { env, timeout: OBSERVATION_TIMEOUT_MS }),
+      observe(["pane", "list"], { env, timeout: OBSERVATION_TIMEOUT_MS }),
+      snapshot(ctx),
       ctx.rootPaneId
-        ? run(
+        ? execute(
             "herdr",
             [
               "pane",
@@ -4305,19 +4619,7 @@ async function collectDiagnostics(ctx, owned, failure) {
           )
         : null,
       owned.hostPaneId
-        ? run(
-            "herdr",
-            [
-              "pane",
-              "read",
-              owned.hostPaneId,
-              "--source",
-              "recent-unwrapped",
-              "--lines",
-              "80",
-            ],
-            { timeout: OBSERVATION_TIMEOUT_MS },
-          )
+        ? readParentHostPane(ctx, owned.hostPaneId, execute)
         : null,
     ]);
   diagnostics.agents =
@@ -4337,10 +4639,10 @@ async function collectDiagnostics(ctx, owned, failure) {
     paneIds,
     ctx.rootPaneId,
     async (paneId) => {
-      const result = await tryHerdr(
-        ["pane", "process-info", "--pane", paneId],
-        { env, timeout: OBSERVATION_TIMEOUT_MS },
-      );
+      const result = await observe(["pane", "process-info", "--pane", paneId], {
+        env,
+        timeout: OBSERVATION_TIMEOUT_MS,
+      });
       if (!result.ok) throw new Error(result.error);
       return result.value;
     },
@@ -4386,7 +4688,7 @@ async function collectDiagnostics(ctx, owned, failure) {
   ].slice(0, 4);
   const descendantReads = await Promise.allSettled(
     knownDescendants.map((paneId) =>
-      run(
+      execute(
         "herdr",
         [
           "pane",
@@ -4463,6 +4765,7 @@ async function cleanup(paths, owned, ctx) {
         cleanupTopology,
         owned.managerBranch,
         owned.managerWorktreePath,
+        owned.managerWorkspaceId,
         owned.managerWorktreeRetirementRequested === true,
       );
       if (target) {
@@ -4553,7 +4856,9 @@ async function cleanup(paths, owned, ctx) {
   }
   if (owned.hostTabId) {
     try {
-      await cleanupHerdr(["tab", "close", owned.hostTabId]);
+      await cleanupHerdr(["tab", "close", owned.hostTabId], {
+        env: ctx.parentEnv,
+      });
     } catch (error) {
       failures.push(`host tab ${owned.hostTabId}: ${error.message}`);
     }
@@ -4581,11 +4886,12 @@ function cleanupEvidence(owned) {
 }
 
 async function main() {
+  const parentEnv = parentControlEnv(process.env);
   const args = parseSmokeArgs(process.argv.slice(2));
   const pkg = JSON.parse(
     await readFile(join(repoRoot, "package.json"), "utf8"),
   );
-  const preflightEvidence = await preflight(pkg);
+  const preflightEvidence = await preflight(pkg, parentEnv);
   const model = await selectSmokeModel(args);
   const scenario = args.scenario;
   await run("npm", ["run", "build"], { cwd: repoRoot });
@@ -4623,6 +4929,7 @@ async function main() {
     managerRecoveryDiagnostics: args.managerRecoveryDiagnostics,
     expectedPackage: `${pkg.name}@${pkg.version}`,
     owned,
+    parentEnv,
     preflight: preflightEvidence,
   };
   ctx.initialPrompt = initialPromptForScenario(scenario, ctx);
@@ -4655,6 +4962,7 @@ async function main() {
     await startNestedHerdr(
       paths,
       owned,
+      parentEnv,
       ctx.rootCwd,
       ctx.managerRecoveryDiagnostics,
     );
