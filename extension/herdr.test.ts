@@ -30,6 +30,7 @@ import {
   runHerdr,
   sameShellProcessOwner,
   sameRunningProcessOwner,
+  terminalOccupierSurvived,
   sameCwd,
   stopHerdrAgentPreservingPane,
   closeHerdrPane,
@@ -3286,6 +3287,461 @@ test("unnamed pane-targeted stop settles only with exact ownership", async () =>
   }
 });
 
+test("preserving stop settles a shell shared with prompt hook children", async () => {
+  const environment = globalThis.process.env;
+  const previousWorkspace = environment.HERDR_WORKSPACE_ID;
+  environment.HERDR_WORKSPACE_ID = "workspace-1";
+  const session = {
+    source: "herdr:pi",
+    agent: "pi",
+    kind: "id",
+    value: "session-1",
+  };
+  const pane = {
+    pane_id: "pane-1",
+    workspace_id: "workspace-1",
+    tab_id: "tab-1",
+    cwd: "/tmp",
+    agent_session: session,
+  };
+  const running = {
+    pane_id: "pane-1",
+    shell_pid: 12,
+    foreground_process_group_id: 99,
+    foreground_processes: [{ pid: 99, argv0: "/usr/bin/pi" }],
+  };
+  // Observed after the agent exits: the shell owns the terminal and its prompt
+  // hook runs as a foreground child inside the shell's own process group.
+  const preserved = {
+    pane_id: "pane-1",
+    shell_pid: 12,
+    foreground_process_group_id: 12,
+    foreground_processes: [
+      { pid: 13, argv0: "/opt/homebrew/bin/mise" },
+      { pid: 12, argv0: "/bin/zsh" },
+    ],
+  };
+  const response = (value: unknown) => ({
+    code: 0,
+    stdout: JSON.stringify({ id: 1, result: value }),
+    stderr: "",
+  });
+  const stopWith = (markerObservation: unknown, agentStillListed = false) => {
+    const calls: string[][] = [];
+    let stopped = false;
+    let markerAsked = false;
+    const pi = {
+      exec: async (_command: string, args: string[]) => {
+        calls.push(args);
+        const key = args.slice(0, 2).join(" ");
+        if (key === "agent get") return response({ agent: pane });
+        if (key === "pane get") return response({ pane });
+        if (key === "tab list")
+          return response({
+            tabs: [{ tab_id: "tab-1", workspace_id: "workspace-1" }],
+          });
+        if (key === "pane process-info")
+          return response({
+            process_info: markerAsked
+              ? (markerObservation ?? preserved)
+              : !stopped
+                ? running
+                : preserved,
+          });
+        if (key === "agent list")
+          return response({
+            agents: stopped && !agentStillListed ? [] : [pane],
+          });
+        if (key === "agent send-keys") {
+          stopped = true;
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        if (key === "pane run") {
+          markerAsked = true;
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        if (key === "pane wait-output")
+          return { code: 0, stdout: "{}", stderr: "" };
+        throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+      },
+    } as any;
+    const stop = () =>
+      stopHerdrAgentPreservingPane(pi, { cwd: "/tmp" } as any, "pane-1", {
+        paneId: "pane-1",
+        tabId: "tab-1",
+        workspaceId: "workspace-1",
+        cwd: "/tmp",
+        session: { id: "session-1" },
+      });
+    return { calls, stop };
+  };
+  try {
+    const preservedRun = stopWith(undefined);
+    await preservedRun.stop();
+    assert.deepEqual(
+      preservedRun.calls.filter(
+        (args) => args[0] === "agent" && args[1] === "send-keys",
+      ),
+      [["agent", "send-keys", "pane-1", "ctrl+c", "ctrl+d"]],
+    );
+    assert.ok(
+      preservedRun.calls.some(
+        (args) => args[0] === "pane" && args[1] === "run",
+      ),
+      "the settled shell still proves readiness",
+    );
+
+    // A prompt hook in the shell's group must not hide a takeover: the pane
+    // ownership proof still fails closed when the agent keeps the terminal.
+    await assert.rejects(
+      stopWith(running).stop(),
+      /did not become an available shell/,
+    );
+
+    // A tracked agent that still occupies the pane keeps settlement blocked even
+    // when the process observation already looks like a settled shell: the
+    // agent-list guard, not the relaxed predicate, is what rules the agent out.
+    await assert.rejects(
+      stopWith(undefined, true).stop(),
+      /did not settle back to its original shell/,
+    );
+  } finally {
+    if (previousWorkspace === undefined) delete environment.HERDR_WORKSPACE_ID;
+    else environment.HERDR_WORKSPACE_ID = previousWorkspace;
+  }
+});
+
+test("preserving stop does not interrupt an already-restored shell", async () => {
+  const environment = globalThis.process.env;
+  const previousWorkspace = environment.HERDR_WORKSPACE_ID;
+  environment.HERDR_WORKSPACE_ID = "workspace-1";
+  const session = {
+    source: "herdr:pi" as const,
+    agent: "pi" as const,
+    kind: "id" as const,
+    value: "session-1",
+  };
+  const pane = {
+    name: "agent-1",
+    pane_id: "pane-1",
+    workspace_id: "workspace-1",
+    tab_id: "tab-1",
+    cwd: "/tmp",
+    agent_session: session,
+  };
+  const shell = {
+    pane_id: "pane-1",
+    shell_pid: 10,
+    foreground_process_group_id: 10,
+    foreground_processes: [{ pid: 10, argv0: "/bin/zsh" }],
+  };
+  const response = (value: unknown) => ({
+    code: 0,
+    stdout: JSON.stringify({ id: 1, result: value }),
+    stderr: "",
+  });
+
+  try {
+    for (const agentDisappears of [true, false]) {
+      const calls: string[][] = [];
+      let processInfoCalls = 0;
+      let agentListCalls = 0;
+      const pi = {
+        exec: async (_command: string, args: string[]) => {
+          calls.push(args);
+          const key = args.slice(0, 2).join(" ");
+          if (key === "agent get") return response({ agent: pane });
+          if (key === "pane get") return response({ pane });
+          if (key === "tab list")
+            return response({
+              tabs: [{ tab_id: "tab-1", workspace_id: "workspace-1" }],
+            });
+          if (key === "pane process-info") {
+            processInfoCalls++;
+            return response({ process_info: shell });
+          }
+          if (key === "agent list") {
+            agentListCalls++;
+            return response({
+              agents: agentDisappears && agentListCalls > 1 ? [] : [pane],
+            });
+          }
+          throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+        },
+      } as any;
+      const stop = stopHerdrAgentPreservingPane(
+        pi,
+        { cwd: "/tmp" } as any,
+        "agent-1",
+        {
+          paneId: "pane-1",
+          tabId: "tab-1",
+          workspaceId: "workspace-1",
+          cwd: "/tmp",
+          session: { id: "session-1" },
+        },
+      );
+      if (agentDisappears) await stop;
+      else
+        await assert.rejects(stop, /did not settle back to its original shell/);
+      assert.equal(
+        calls.some((args) => args[0] === "agent" && args[1] === "send-keys"),
+        false,
+      );
+      assert.equal(processInfoCalls >= 2, true);
+      assert.equal(agentListCalls > 1, true);
+    }
+  } finally {
+    if (previousWorkspace === undefined) delete environment.HERDR_WORKSPACE_ID;
+    else environment.HERDR_WORKSPACE_ID = previousWorkspace;
+  }
+});
+
+test("preserving stop does not interrupt an ambiguous shell process group", async () => {
+  const environment = globalThis.process.env;
+  const previousWorkspace = environment.HERDR_WORKSPACE_ID;
+  environment.HERDR_WORKSPACE_ID = "workspace-1";
+  const session = {
+    source: "herdr:pi" as const,
+    agent: "pi" as const,
+    kind: "id" as const,
+    value: "session-1",
+  };
+  const pane = {
+    name: "agent-1",
+    pane_id: "pane-1",
+    workspace_id: "workspace-1",
+    tab_id: "tab-1",
+    cwd: "/tmp",
+    agent_session: session,
+  };
+  const shellOnly = {
+    pane_id: "pane-1",
+    shell_pid: 12,
+    foreground_process_group_id: 12,
+    foreground_processes: [{ pid: 12, argv0: "/bin/zsh" }],
+  };
+  const promptStarted = {
+    ...shellOnly,
+    foreground_processes: [
+      { pid: 12, argv0: "/bin/zsh" },
+      { pid: 13, argv0: "prompt-helper" },
+    ],
+  };
+  const calls: string[][] = [];
+  let processInfoCalls = 0;
+  const response = (value: unknown) => ({
+    code: 0,
+    stdout: JSON.stringify({ id: 1, result: value }),
+    stderr: "",
+  });
+  const pi = {
+    exec: async (_command: string, args: string[]) => {
+      calls.push(args);
+      const key = args.slice(0, 2).join(" ");
+      if (key === "agent get") return response({ agent: pane });
+      if (key === "pane get") return response({ pane });
+      if (key === "tab list")
+        return response({
+          tabs: [{ tab_id: "tab-1", workspace_id: "workspace-1" }],
+        });
+      if (key === "pane process-info")
+        return response({
+          process_info: processInfoCalls++ === 0 ? shellOnly : promptStarted,
+        });
+      throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+    },
+  } as any;
+
+  try {
+    await assert.rejects(
+      stopHerdrAgentPreservingPane(pi, { cwd: "/tmp" } as any, "agent-1", {
+        paneId: "pane-1",
+        tabId: "tab-1",
+        workspaceId: "workspace-1",
+        cwd: "/tmp",
+        session: { id: "session-1" },
+      }),
+      /foreground shell has unproven occupants/,
+    );
+    assert.equal(processInfoCalls, 2);
+    assert.equal(
+      calls.some((args) => args[0] === "agent" && args[1] === "send-keys"),
+      false,
+    );
+  } finally {
+    if (previousWorkspace === undefined) delete environment.HERDR_WORKSPACE_ID;
+    else environment.HERDR_WORKSPACE_ID = previousWorkspace;
+  }
+});
+
+test("preserving stop rejects a surviving original agent process", async () => {
+  const environment = globalThis.process.env;
+  const previousWorkspace = environment.HERDR_WORKSPACE_ID;
+  environment.HERDR_WORKSPACE_ID = "workspace-1";
+  const session = {
+    source: "herdr:pi",
+    agent: "pi",
+    kind: "id",
+    value: "session-1",
+  };
+  const pane = {
+    pane_id: "pane-1",
+    workspace_id: "workspace-1",
+    tab_id: "tab-1",
+    cwd: "/tmp",
+    agent_session: session,
+  };
+  // Captured while the agent owns the terminal: the shell is not among the
+  // foreground processes and the foreground group is the agent's own group.
+  const running = {
+    pane_id: "pane-1",
+    shell_pid: 12,
+    foreground_process_group_id: 99,
+    foreground_processes: [{ pid: 99, argv0: "/usr/bin/pi" }],
+  };
+  // Herdr no longer lists the agent and the shell owns the terminal again.
+  const settled = {
+    pane_id: "pane-1",
+    shell_pid: 12,
+    foreground_process_group_id: 12,
+    foreground_processes: [
+      { pid: 13, argv0: "/opt/homebrew/bin/mise" },
+      { pid: 12, argv0: "/bin/zsh" },
+    ],
+  };
+  const surviving = {
+    ...settled,
+    foreground_processes: [
+      { pid: 13, argv0: "/opt/homebrew/bin/mise" },
+      { pid: 99, argv0: "/usr/bin/pi" },
+      { pid: 12, argv0: "/bin/zsh" },
+    ],
+  };
+  // A new process running the same executable carries a different pid, so it is
+  // not the captured original.
+  const respawned = {
+    ...settled,
+    foreground_processes: [
+      { pid: 98, argv0: "/usr/bin/pi" },
+      { pid: 12, argv0: "/bin/zsh" },
+    ],
+  };
+  const response = (value: unknown) => ({
+    code: 0,
+    stdout: JSON.stringify({ id: 1, result: value }),
+    stderr: "",
+  });
+  const stopWith = (
+    beforeMarker: unknown,
+    afterMarker?: unknown,
+    runningProcess: unknown = running,
+  ) => {
+    const calls: string[][] = [];
+    let stopped = false;
+    let markerAsked = false;
+    const pi = {
+      exec: async (_command: string, args: string[]) => {
+        calls.push(args);
+        const key = args.slice(0, 2).join(" ");
+        if (key === "agent get") return response({ agent: pane });
+        if (key === "pane get") return response({ pane });
+        if (key === "tab list")
+          return response({
+            tabs: [{ tab_id: "tab-1", workspace_id: "workspace-1" }],
+          });
+        if (key === "pane process-info")
+          return response({
+            process_info: markerAsked
+              ? (afterMarker ?? beforeMarker)
+              : stopped
+                ? beforeMarker
+                : runningProcess,
+          });
+        if (key === "agent list")
+          return response({ agents: stopped ? [] : [pane] });
+        if (key === "agent send-keys") {
+          stopped = true;
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        if (key === "pane run") {
+          markerAsked = true;
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        if (key === "pane wait-output")
+          return { code: 0, stdout: "{}", stderr: "" };
+        throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+      },
+    } as any;
+    return {
+      calls,
+      stop: () =>
+        stopHerdrAgentPreservingPane(pi, { cwd: "/tmp" } as any, "pane-1", {
+          paneId: "pane-1",
+          tabId: "tab-1",
+          workspaceId: "workspace-1",
+          cwd: "/tmp",
+          session: { id: "session-1" },
+        }),
+    };
+  };
+  try {
+    // The captured original pid is still alive in the restored shell's
+    // foreground group, so no observation settles the pane.
+    const settlement = stopWith(surviving);
+    await assert.rejects(
+      settlement.stop(),
+      /did not settle back to its original shell/,
+    );
+    assert.deepEqual(
+      settlement.calls.filter(
+        (args) => args[0] === "agent" && args[1] === "send-keys",
+      ),
+      [["agent", "send-keys", "pane-1", "ctrl+c", "ctrl+d"]],
+    );
+
+    // The running snapshot may already contain shell and Pi in the shell's
+    // group. Even though that shape skips the marker, Pi must still disappear.
+    const sharedGroup = stopWith(surviving, undefined, {
+      ...running,
+      foreground_process_group_id: 12,
+      foreground_processes: [
+        { pid: 12, argv0: "/bin/zsh" },
+        { pid: 99, argv0: "/usr/bin/pi" },
+      ],
+    });
+    await assert.rejects(
+      sharedGroup.stop(),
+      /foreground shell has unproven occupants/,
+    );
+
+    // The same process shows up only after the readiness marker already
+    // matched, which is the second arrival window.
+    const postMarker = stopWith(settled, surviving);
+    await assert.rejects(
+      postMarker.stop(),
+      /did not become an available shell/,
+    );
+
+    // An unrelated prompt child, even one running the same executable under a
+    // different pid, still settles.
+    const respawn = stopWith(respawned);
+    await respawn.stop();
+    assert.ok(
+      respawn.calls.some((args) => args[0] === "pane" && args[1] === "run"),
+      "the settled shell still proves readiness",
+    );
+    assert.ok(
+      respawn.calls.some(
+        (args) => args[0] === "pane" && args[1] === "wait-output",
+      ),
+    );
+  } finally {
+    if (previousWorkspace === undefined) delete environment.HERDR_WORKSPACE_ID;
+    else environment.HERDR_WORKSPACE_ID = previousWorkspace;
+  }
+});
+
 test("preserving stop refuses a process takeover at the destructive boundary", async () => {
   const environment = globalThis.process.env;
   const previousWorkspace = environment.HERDR_WORKSPACE_ID;
@@ -4118,6 +4574,230 @@ test("completed agent shell transition closes the pane without stop keys", async
   );
 });
 
+test("post-completion cleanup accepts only a complete shell-only initial snapshot", async () => {
+  const environment = globalThis.process.env;
+  const previousWorkspace = environment.HERDR_WORKSPACE_ID;
+  environment.HERDR_WORKSPACE_ID = "workspace-1";
+  const session = {
+    source: "herdr:pi" as const,
+    agent: "pi" as const,
+    kind: "id" as const,
+    value: "session-1",
+  };
+  const response = (value: unknown) => ({
+    code: 0,
+    stdout: JSON.stringify({ id: 1, result: value }),
+    stderr: "",
+  });
+
+  try {
+    for (const initial of ["complete", "incomplete", "multiprocess"] as const) {
+      const shellOnly = {
+        pane_id: "pane-1",
+        shell_pid: 10,
+        foreground_process_group_id: 10,
+        ...(initial === "incomplete"
+          ? {}
+          : { foreground_processes: [{ pid: 10, argv0: "/bin/zsh" }] }),
+      };
+      const afterCompletion =
+        initial === "multiprocess"
+          ? {
+              ...shellOnly,
+              foreground_processes: [
+                { pid: 10, argv0: "/bin/zsh" },
+                { pid: 13, argv0: "prompt-helper" },
+              ],
+            }
+          : shellOnly;
+      const calls: string[][] = [];
+      let closed = false;
+      let processInfoCalls = 0;
+      const pi = {
+        exec: async (_command: string, args: string[]) => {
+          calls.push(args);
+          const key = args.slice(0, 2).join(" ");
+          if (key === "agent get")
+            return response({
+              agent: {
+                name: "agent-1",
+                pane_id: "pane-1",
+                workspace_id: "workspace-1",
+                tab_id: "tab-1",
+                cwd: "/tmp",
+                agent_session: session,
+              },
+            });
+          if (key === "pane get")
+            return response({
+              pane: {
+                pane_id: "pane-1",
+                workspace_id: "workspace-1",
+                tab_id: "tab-1",
+                cwd: "/tmp",
+                agent_session: session,
+              },
+            });
+          if (key === "tab list")
+            return response({
+              tabs: [{ tab_id: "tab-1", workspace_id: "workspace-1" }],
+            });
+          if (key === "pane process-info")
+            return response({
+              process_info:
+                processInfoCalls++ === 0 ? shellOnly : afterCompletion,
+            });
+          if (key === "pane run" || key === "pane wait-output")
+            return { code: 0, stdout: "", stderr: "" };
+          if (key === "pane close") {
+            closed = true;
+            return { code: 0, stdout: "", stderr: "" };
+          }
+          if (key === "agent list")
+            return response({ agents: closed ? [] : [{ name: "agent-1" }] });
+          if (key === "pane list")
+            return response({ panes: closed ? [] : [{ pane_id: "pane-1" }] });
+          throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+        },
+      } as any;
+
+      const close = closeHerdrPane(pi, { cwd: "/tmp" } as any, "agent-1", {
+        paneId: "pane-1",
+        tabId: "tab-1",
+        workspaceId: "workspace-1",
+        cwd: "/tmp",
+        session: { id: "session-1" },
+        allowPostCompletionTransition: true,
+      });
+      if (initial === "complete") await close;
+      else await assert.rejects(close, /process ownership is unproven/);
+      assert.equal(closed, initial === "complete");
+      assert.equal(
+        calls.some((args) => args[0] === "pane" && args[1] === "run"),
+        initial === "complete",
+        "incomplete and multiprocess transition observations fail before readiness",
+      );
+    }
+  } finally {
+    if (previousWorkspace === undefined) delete environment.HERDR_WORKSPACE_ID;
+    else environment.HERDR_WORKSPACE_ID = previousWorkspace;
+  }
+});
+
+test("shared process-group equality cannot hide a completed shell transition", async () => {
+  const environment = globalThis.process.env;
+  const previousWorkspace = environment.HERDR_WORKSPACE_ID;
+  environment.HERDR_WORKSPACE_ID = "workspace-1";
+  const session = {
+    source: "herdr:pi" as const,
+    agent: "pi" as const,
+    kind: "id" as const,
+    value: "session-1",
+  };
+  const running = {
+    pane_id: "pane-1",
+    shell_pid: 10,
+    foreground_process_group_id: 10,
+    foreground_processes: [
+      { pid: 10, argv0: "/bin/zsh" },
+      { pid: 99, argv0: "/usr/bin/pi" },
+    ],
+  };
+  const shell = {
+    pane_id: "pane-1",
+    shell_pid: 10,
+    foreground_process_group_id: 10,
+    foreground_processes: [{ pid: 10, argv0: "/bin/zsh" }],
+  };
+  const surviving = {
+    ...running,
+    foreground_processes: [
+      { pid: 10, argv0: "/bin/zsh" },
+      { pid: 99, argv0: "/usr/bin/pi" },
+    ],
+  };
+  const calls: string[][] = [];
+  let processCalls = 0;
+  const response = (value: unknown) => ({
+    code: 0,
+    stdout: JSON.stringify({ id: 1, result: value }),
+    stderr: "",
+  });
+  const pi = {
+    exec: async (_command: string, args: string[]) => {
+      calls.push(args);
+      const key = args.slice(0, 2).join(" ");
+      if (key === "agent get")
+        return response({
+          agent: {
+            name: "agent-1",
+            pane_id: "pane-1",
+            workspace_id: "workspace-1",
+            tab_id: "tab-1",
+            cwd: "/tmp",
+            agent_session: session,
+          },
+        });
+      if (key === "pane get")
+        return response({
+          pane: {
+            pane_id: "pane-1",
+            workspace_id: "workspace-1",
+            tab_id: "tab-1",
+            cwd: "/tmp",
+            agent_session: session,
+          },
+        });
+      if (key === "tab list")
+        return response({
+          tabs: [{ tab_id: "tab-1", workspace_id: "workspace-1" }],
+        });
+      if (key === "pane process-info")
+        return response({
+          process_info:
+            processCalls++ === 0
+              ? running
+              : processCalls === 2
+                ? shell
+                : surviving,
+        });
+      if (key === "pane run" || key === "pane wait-output")
+        return { code: 0, stdout: "", stderr: "" };
+      if (key === "agent list")
+        return response({ agents: [{ name: "agent-1" }] });
+      throw new Error(
+        `unexpected or destructive Herdr call: ${args.join(" ")}`,
+      );
+    },
+  } as any;
+
+  try {
+    await assert.rejects(
+      closeHerdrPane(pi, { cwd: "/tmp" } as any, "agent-1", {
+        paneId: "pane-1",
+        tabId: "tab-1",
+        workspaceId: "workspace-1",
+        cwd: "/tmp",
+        session: { id: "session-1" },
+        allowPostCompletionTransition: true,
+      }),
+      /did not become an available shell/,
+    );
+  } finally {
+    if (previousWorkspace === undefined) delete environment.HERDR_WORKSPACE_ID;
+    else environment.HERDR_WORKSPACE_ID = previousWorkspace;
+  }
+  assert.equal(
+    processCalls,
+    3,
+    "the shell transition was revalidated after its marker",
+  );
+  assert.equal(
+    calls.some((args) => args[0] === "pane" && args[1] === "close"),
+    false,
+  );
+});
+
 test("strict close rejects a completed agent shell transition", async () => {
   const environment = globalThis.process.env;
   const previousWorkspace = environment.HERDR_WORKSPACE_ID;
@@ -4540,6 +5220,11 @@ test("rollback proves the boundary before keys and resources before close", asyn
       "tab list",
       "pane get",
       "pane process-info",
+      "agent list",
+      "pane get",
+      "pane process-info",
+      "tab list",
+      "agent list",
       "pane close",
       "agent list",
       "pane list",
@@ -4616,7 +5301,7 @@ test("rollback cleans an exited created pane", async () => {
   assert.equal(panePresent, false);
   assert.equal(
     calls.filter((args) => args[0] === "agent" && args[1] === "list").length,
-    3,
+    4,
   );
   assert.equal(
     calls.some((args) => args[1] === "send-keys"),
@@ -4624,6 +5309,215 @@ test("rollback cleans an exited created pane", async () => {
   );
   if (previousWorkspace === undefined) delete environment.HERDR_WORKSPACE_ID;
   else environment.HERDR_WORKSPACE_ID = previousWorkspace;
+});
+
+test("managed rollback does not interrupt an already-restored shell", async () => {
+  const environment = globalThis.process.env;
+  const previousWorkspace = environment.HERDR_WORKSPACE_ID;
+  environment.HERDR_WORKSPACE_ID = "workspace-1";
+  const session = {
+    source: "herdr:pi" as const,
+    agent: "pi" as const,
+    kind: "id" as const,
+    value: "session-1",
+  };
+  const shell = {
+    pane_id: "pane-1",
+    shell_pid: 10,
+    foreground_process_group_id: 10,
+    foreground_processes: [{ pid: 10, argv0: "/bin/zsh" }],
+  };
+  const response = (value: unknown) => ({
+    code: 0,
+    stdout: JSON.stringify({ id: 1, result: value }),
+    stderr: "",
+  });
+
+  try {
+    for (const agentDisappears of [true, false]) {
+      const calls: string[][] = [];
+      let agentLists = 0;
+      let panePresent = true;
+      let processInfoCalls = 0;
+      const managed = {
+        name: "agent-1",
+        pane_id: "pane-1",
+        workspace_id: "workspace-1",
+        tab_id: "tab-1",
+        cwd: "/tmp",
+        agent_session: session,
+      };
+      const pi = {
+        exec: async (_command: string, args: string[]) => {
+          calls.push(args);
+          const key = args.slice(0, 2).join(" ");
+          if (key === "agent list") {
+            agentLists++;
+            return response({
+              agents: agentDisappears && agentLists > 2 ? [] : [managed],
+            });
+          }
+          if (key === "agent get") return response({ agent: managed });
+          if (key === "pane get")
+            return response({
+              pane: {
+                pane_id: "pane-1",
+                workspace_id: "workspace-1",
+                tab_id: "tab-1",
+                terminal_id: "terminal-1",
+                cwd: "/tmp",
+                agent_session: session,
+              },
+            });
+          if (key === "tab list")
+            return response({
+              tabs: [{ tab_id: "tab-1", workspace_id: "workspace-1" }],
+            });
+          if (key === "pane process-info") {
+            processInfoCalls++;
+            return response({ process_info: shell });
+          }
+          if (key === "pane close") {
+            panePresent = false;
+            return { code: 0, stdout: "", stderr: "" };
+          }
+          if (key === "pane list")
+            return response({
+              panes: panePresent ? [{ pane_id: "pane-1" }] : [],
+            });
+          throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+        },
+      } as any;
+      const rollback = rollbackHerdrStart(pi, { cwd: "/tmp" } as any, {
+        herdrAgent: "agent-1",
+        workspaceId: "workspace-1",
+        tabId: "tab-1",
+        paneId: "pane-1",
+        terminalId: "terminal-1",
+        cwd: "/tmp",
+        createdTab: false,
+        launchMayHaveStarted: true,
+        shellProcess: shell,
+        sessionReference: { id: "session-1" },
+      });
+      if (agentDisappears) await rollback;
+      else
+        await assert.rejects(
+          rollback,
+          /did not settle back to its original shell/,
+        );
+      assert.equal(
+        calls.some((args) => args[0] === "agent" && args[1] === "send-keys"),
+        false,
+      );
+      assert.equal(
+        calls.some((args) => args[0] === "pane" && args[1] === "close"),
+        agentDisappears,
+      );
+      assert.equal(agentLists > 2, true);
+      assert.equal(processInfoCalls >= 2, true);
+    }
+  } finally {
+    if (previousWorkspace === undefined) delete environment.HERDR_WORKSPACE_ID;
+    else environment.HERDR_WORKSPACE_ID = previousWorkspace;
+  }
+});
+
+test("managed rollback does not interrupt an ambiguous shell process group", async () => {
+  const environment = globalThis.process.env;
+  const previousWorkspace = environment.HERDR_WORKSPACE_ID;
+  environment.HERDR_WORKSPACE_ID = "workspace-1";
+  const session = {
+    source: "herdr:pi" as const,
+    agent: "pi" as const,
+    kind: "id" as const,
+    value: "session-1",
+  };
+  const shellOnly = {
+    pane_id: "pane-1",
+    shell_pid: 12,
+    foreground_process_group_id: 12,
+    foreground_processes: [{ pid: 12, argv0: "/bin/zsh" }],
+  };
+  const promptStarted = {
+    ...shellOnly,
+    foreground_processes: [
+      { pid: 12, argv0: "/bin/zsh" },
+      { pid: 13, argv0: "prompt-helper" },
+    ],
+  };
+  const managed = {
+    name: "agent-1",
+    pane_id: "pane-1",
+    workspace_id: "workspace-1",
+    tab_id: "tab-1",
+    cwd: "/tmp",
+    agent_session: session,
+  };
+  const calls: string[][] = [];
+  let processInfoCalls = 0;
+  const response = (value: unknown) => ({
+    code: 0,
+    stdout: JSON.stringify({ id: 1, result: value }),
+    stderr: "",
+  });
+  const pi = {
+    exec: async (_command: string, args: string[]) => {
+      calls.push(args);
+      const key = args.slice(0, 2).join(" ");
+      if (key === "agent list") return response({ agents: [managed] });
+      if (key === "agent get") return response({ agent: managed });
+      if (key === "pane get")
+        return response({
+          pane: {
+            ...managed,
+            terminal_id: "terminal-1",
+          },
+        });
+      if (key === "tab list")
+        return response({
+          tabs: [{ tab_id: "tab-1", workspace_id: "workspace-1" }],
+        });
+      if (key === "pane process-info")
+        return response({
+          process_info: processInfoCalls++ === 0 ? shellOnly : promptStarted,
+        });
+      throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+    },
+  } as any;
+
+  try {
+    await assert.rejects(
+      rollbackHerdrStart(pi, { cwd: "/tmp" } as any, {
+        herdrAgent: "agent-1",
+        workspaceId: "workspace-1",
+        tabId: "tab-1",
+        paneId: "pane-1",
+        terminalId: "terminal-1",
+        cwd: "/tmp",
+        createdTab: false,
+        launchMayHaveStarted: true,
+        shellProcess: shellOnly,
+        sessionReference: { id: "session-1" },
+      }),
+      /foreground shell has unproven occupants/,
+    );
+    assert.equal(processInfoCalls, 2);
+    assert.equal(
+      calls.some((args) => args[0] === "agent" && args[1] === "send-keys"),
+      false,
+    );
+    assert.equal(
+      calls.some(
+        (args) =>
+          (args[0] === "pane" || args[0] === "tab") && args[1] === "close",
+      ),
+      false,
+    );
+  } finally {
+    if (previousWorkspace === undefined) delete environment.HERDR_WORKSPACE_ID;
+    else environment.HERDR_WORKSPACE_ID = previousWorkspace;
+  }
 });
 
 test("rollback closes an exactly owned exited created tab despite cwd mismatch", async () => {
@@ -4709,10 +5603,288 @@ test("rollback closes an exactly owned exited created tab despite cwd mismatch",
       );
       assert.equal(
         calls.filter((args) => args[1] === "process-info").length,
-        1,
+        2,
       );
       assert.equal(tabPresent, false);
       assert.equal(panePresent, false);
+    }
+  } finally {
+    if (previousWorkspace === undefined) delete environment.HERDR_WORKSPACE_ID;
+    else environment.HERDR_WORKSPACE_ID = previousWorkspace;
+  }
+});
+
+test("rollback carries the captured occupier through settlement and final cleanup", async () => {
+  const environment = globalThis.process.env;
+  const previousWorkspace = environment.HERDR_WORKSPACE_ID;
+  environment.HERDR_WORKSPACE_ID = "workspace-1";
+  const session = {
+    source: "herdr:pi" as const,
+    agent: "pi" as const,
+    kind: "id" as const,
+    value: "session-1",
+  };
+  const running = {
+    pane_id: "pane-1",
+    shell_pid: 12,
+    foreground_process_group_id: 99,
+    foreground_processes: [{ pid: 99, argv0: "/usr/bin/pi" }],
+  };
+  const shell = {
+    pane_id: "pane-1",
+    shell_pid: 12,
+    foreground_process_group_id: 12,
+    foreground_processes: [{ pid: 12, argv0: "/bin/zsh" }],
+  };
+  const surviving = {
+    ...shell,
+    foreground_processes: [
+      { pid: 12, argv0: "/bin/zsh" },
+      { pid: 99, argv0: "/usr/bin/pi" },
+    ],
+  };
+  const pane = {
+    pane_id: "pane-1",
+    workspace_id: "workspace-1",
+    tab_id: "tab-1",
+    terminal_id: "terminal-1",
+    cwd: "/tmp",
+    agent_session: session,
+  };
+  const response = (value: unknown) => ({
+    code: 0,
+    stdout: JSON.stringify({ id: 1, result: value }),
+    stderr: "",
+  });
+
+  try {
+    for (const createdTab of [false, true]) {
+      for (const survivingAt of [
+        "settlement",
+        "final",
+        "malformed",
+        "truncated",
+        "conflict",
+        "tab-membership",
+      ] as const) {
+        if (survivingAt === "tab-membership" && !createdTab) continue;
+        const calls: string[][] = [];
+        let processCalls = 0;
+        let agentLists = 0;
+        let paneLists = 0;
+        let tabPresent = true;
+        let panePresent = true;
+        const controller = new AbortController();
+        const pi = {
+          exec: async (_command: string, args: string[]) => {
+            calls.push(args);
+            const key = args.slice(0, 2).join(" ");
+            if (key === "agent list") {
+              agentLists++;
+              return response({
+                agents:
+                  agentLists === 1
+                    ? [{ name: "agent-1", pane_id: "pane-1" }]
+                    : survivingAt === "conflict" && agentLists === 5
+                      ? [{ name: "replacement", pane_id: "pane-1" }]
+                      : [],
+              });
+            }
+            if (key === "agent get")
+              return response({
+                agent: {
+                  name: "agent-1",
+                  pane_id: "pane-1",
+                  workspace_id: "workspace-1",
+                  tab_id: "tab-1",
+                  cwd: "/tmp",
+                  agent_session: session,
+                },
+              });
+            if (key === "agent send-keys") {
+              controller.signal.throwIfAborted();
+              return { code: 0, stdout: "", stderr: "" };
+            }
+            if (key === "pane get") return response({ pane });
+            if (key === "tab list")
+              return response({
+                tabs: tabPresent
+                  ? [{ tab_id: "tab-1", workspace_id: "workspace-1" }]
+                  : [],
+              });
+            if (key === "pane list") {
+              paneLists++;
+              return response({
+                panes: panePresent
+                  ? [
+                      { ...pane, tab_id: "tab-1" },
+                      ...(survivingAt === "tab-membership" && paneLists === 2
+                        ? [{ pane_id: "other-pane", tab_id: "tab-1" }]
+                        : []),
+                    ]
+                  : [],
+              });
+            }
+            if (key === "pane process-info") {
+              processCalls++;
+              if (survivingAt === "settlement" && processCalls === 3)
+                controller.abort();
+              const finalObservation =
+                survivingAt === "final"
+                  ? surviving
+                  : survivingAt === "malformed"
+                    ? {
+                        ...shell,
+                        foreground_processes: [
+                          { pid: 12, argv0: "/bin/zsh" },
+                          { pid: "invalid" },
+                        ],
+                      }
+                    : survivingAt === "truncated"
+                      ? {
+                          ...shell,
+                          foreground_processes: [
+                            { pid: 12, argv0: "/bin/zsh" },
+                            ...Array.from({ length: 8 }, (_, index) => ({
+                              pid: index + 20,
+                              argv0: "prompt-helper",
+                            })),
+                          ],
+                        }
+                      : shell;
+              const process =
+                processCalls <= 2
+                  ? running
+                  : survivingAt === "settlement" && processCalls === 3
+                    ? surviving
+                    : survivingAt !== "settlement" && processCalls === 6
+                      ? finalObservation
+                      : shell;
+              return response({ process_info: process });
+            }
+            if (key === "pane close") {
+              panePresent = false;
+              return { code: 0, stdout: "", stderr: "" };
+            }
+            if (key === "tab close") {
+              tabPresent = false;
+              panePresent = false;
+              return { code: 0, stdout: "", stderr: "" };
+            }
+            throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+          },
+        } as any;
+
+        await assert.rejects(
+          rollbackHerdrStart(
+            pi,
+            { cwd: "/tmp" } as any,
+            {
+              herdrAgent: "agent-1",
+              workspaceId: "workspace-1",
+              tabId: "tab-1",
+              paneId: "pane-1",
+              terminalId: "terminal-1",
+              cwd: "/tmp",
+              createdTab,
+              launchMayHaveStarted: true,
+              shellProcess: shell,
+              sessionReference: { id: "session-1" },
+            },
+            controller.signal,
+          ),
+        );
+        if (survivingAt === "conflict") assert.equal(agentLists, 5);
+        assert.ok(calls.some((args) => args[1] === "send-keys"));
+        assert.equal(
+          calls.some((args) => args[0] === "pane" && args[1] === "close"),
+          false,
+        );
+        assert.equal(
+          calls.some((args) => args[0] === "tab" && args[1] === "close"),
+          false,
+        );
+      }
+    }
+  } finally {
+    if (previousWorkspace === undefined) delete environment.HERDR_WORKSPACE_ID;
+    else environment.HERDR_WORKSPACE_ID = previousWorkspace;
+  }
+});
+
+test("uncertain rollback requires a complete singleton shell without a captured occupier", async () => {
+  const environment = globalThis.process.env;
+  const previousWorkspace = environment.HERDR_WORKSPACE_ID;
+  environment.HERDR_WORKSPACE_ID = "workspace-1";
+  const shell = {
+    pane_id: "pane-1",
+    shell_pid: 12,
+    foreground_process_group_id: 12,
+    foreground_processes: [{ pid: 12, argv0: "/bin/zsh" }],
+  };
+  const response = (value: unknown) => ({
+    code: 0,
+    stdout: JSON.stringify({ id: 1, result: value }),
+    stderr: "",
+  });
+  try {
+    for (const foreground_processes of [
+      [
+        { pid: 12, argv0: "/bin/zsh" },
+        { pid: 13, argv0: "prompt-helper" },
+      ],
+      [
+        { pid: 12, argv0: "/bin/zsh" },
+        { pid: 99, argv0: "/usr/bin/pi" },
+      ],
+    ]) {
+      const calls: string[][] = [];
+      const pi = {
+        exec: async (_command: string, args: string[]) => {
+          calls.push(args);
+          const key = args.slice(0, 2).join(" ");
+          if (key === "agent list") return response({ agents: [] });
+          if (key === "tab list")
+            return response({
+              tabs: [{ tab_id: "tab-1", workspace_id: "workspace-1" }],
+            });
+          if (key === "pane get")
+            return response({
+              pane: {
+                pane_id: "pane-1",
+                workspace_id: "workspace-1",
+                tab_id: "tab-1",
+                terminal_id: "terminal-1",
+                cwd: "/tmp",
+              },
+            });
+          if (key === "pane process-info")
+            return response({
+              process_info: { ...shell, foreground_processes },
+            });
+          throw new Error(
+            `unexpected or destructive Herdr call: ${args.join(" ")}`,
+          );
+        },
+      } as any;
+      await assert.rejects(
+        rollbackHerdrStart(pi, { cwd: "/tmp" } as any, {
+          herdrAgent: "agent-1",
+          workspaceId: "workspace-1",
+          tabId: "tab-1",
+          paneId: "pane-1",
+          terminalId: "terminal-1",
+          cwd: "/tmp",
+          createdTab: false,
+          launchMayHaveStarted: true,
+          shellProcess: shell,
+        }),
+        /process ownership is unproven/,
+      );
+      assert.equal(
+        calls.some((args) => args[1] === "close"),
+        false,
+      );
     }
   } finally {
     if (previousWorkspace === undefined) delete environment.HERDR_WORKSPACE_ID;
@@ -4889,6 +6061,44 @@ test("process ownership handles optional foreground process groups", () => {
       true,
     ],
     [
+      "prompt hook child inside the shell process group settles",
+      {
+        ...shell,
+        foreground_processes: [
+          { pid: 13, argv0: "/opt/homebrew/bin/starship" },
+          { pid: 12, argv0: "pwsh.exe" },
+        ],
+      },
+      true,
+    ],
+    [
+      // Predicate-only acceptance: with no shell allowlist an agent-like child in
+      // the shell's own process group is indistinguishable from a prompt hook
+      // here. Settlement additionally requires an empty agent list plus the
+      // session, pane and lifecycle-lock proofs, which reject tracked agents.
+      "agent-like child inside the shell process group is accepted",
+      {
+        ...shell,
+        foreground_processes: [
+          { pid: 12, argv0: "pwsh.exe" },
+          { pid: 99, argv0: "/usr/bin/pi" },
+        ],
+      },
+      true,
+    ],
+    [
+      "prompt hook child without a reported group fails closed",
+      {
+        ...shell,
+        foreground_process_group_id: undefined,
+        foreground_processes: [
+          { pid: 13, argv0: "/opt/homebrew/bin/starship" },
+          { pid: 12, argv0: "pwsh.exe" },
+        ],
+      },
+      false,
+    ],
+    [
       "busy foreground fails closed",
       { ...shell, foreground_processes: [{ pid: 99, argv0: "node" }] },
       false,
@@ -4989,6 +6199,13 @@ test("shell ownership uses captured identity without a shell allowlist", () => {
     ),
     true,
   );
+  // Interactive prompts run transient foreground children in the shell's own
+  // process group; the captured shell identity still has to match its entry.
+  // This comparison only applies when the expected observation carries a shell
+  // capture (rollback and close/post-completion transitions). The stop path
+  // passes the running-agent snapshot, which lists the agent, so it proves the
+  // original shell through pid, foreground group, foreground presence and the
+  // readiness marker rather than through argv0 continuity.
   assert.equal(
     sameShellProcessOwner(captured, {
       ...captured,
@@ -4997,8 +6214,105 @@ test("shell ownership uses captured identity without a shell allowlist", () => {
         { pid: 13, argv0: "child" },
       ],
     }),
+    true,
+  );
+  assert.equal(
+    sameShellProcessOwner(captured, {
+      ...captured,
+      foreground_processes: [
+        { pid: 13, argv0: "child" },
+        { pid: 12, argv0: "/bin/zsh" },
+      ],
+    }),
     false,
   );
+});
+
+test("shell ownership rejects a captured terminal occupier that survives", () => {
+  const running = {
+    pane_id: "pane-1",
+    shell_pid: 12,
+    foreground_process_group_id: 99,
+    foreground_processes: [{ pid: 99, argv0: "/usr/bin/pi" }],
+  };
+  const restored = {
+    pane_id: "pane-1",
+    shell_pid: 12,
+    foreground_process_group_id: 12,
+    foreground_processes: [
+      { pid: 13, argv0: "/opt/homebrew/bin/mise" },
+      { pid: 12, argv0: "/bin/zsh" },
+    ],
+  };
+  assert.equal(sameShellProcessOwner(running, restored), true);
+  assert.equal(terminalOccupierSurvived(running, restored), false);
+  // The captured original process is still listed in the restored shell's
+  // foreground group, so the pane has not settled.
+  assert.equal(
+    terminalOccupierSurvived(running, {
+      ...restored,
+      foreground_processes: [
+        { pid: 13, argv0: "/opt/homebrew/bin/mise" },
+        { pid: 99, argv0: "/usr/bin/pi" },
+        { pid: 12, argv0: "/bin/zsh" },
+      ],
+    }),
+    true,
+  );
+  // A different pid running the same executable is not the captured process.
+  assert.equal(
+    terminalOccupierSurvived(running, {
+      ...restored,
+      foreground_processes: [
+        { pid: 98, argv0: "/usr/bin/pi" },
+        { pid: 12, argv0: "/bin/zsh" },
+      ],
+    }),
+    false,
+  );
+  // An occupier snapshot that also lists the pane shell does not turn the
+  // settlement target into a surviving occupier.
+  const withShell = {
+    ...running,
+    foreground_processes: [
+      { pid: 12, argv0: "/bin/zsh" },
+      { pid: 99, argv0: "/usr/bin/pi" },
+    ],
+  };
+  assert.equal(terminalOccupierSurvived(withShell, restored), false);
+  assert.equal(
+    terminalOccupierSurvived(withShell, {
+      ...restored,
+      foreground_processes: [
+        { pid: 99, argv0: "/usr/bin/pi" },
+        { pid: 12, argv0: "/bin/zsh" },
+      ],
+    }),
+    true,
+  );
+  // The legacy helper reports observed survival only; settlement uses a
+  // separate positive disappearance proof for incomplete observations.
+  assert.equal(terminalOccupierSurvived(undefined, restored), false);
+  assert.equal(
+    terminalOccupierSurvived(running, {
+      ...restored,
+      foreground_processes: undefined,
+    }),
+    false,
+  );
+  assert.equal(
+    terminalOccupierSurvived(
+      {
+        ...running,
+        foreground_processes: undefined,
+      },
+      restored,
+    ),
+    false,
+  );
+  // A prelaunch shell capture is an expected identity, never an occupier, so a
+  // prompt-hook child of that capture is not mistaken for the original agent.
+  assert.equal(sameShellProcessOwner(restored, restored), true);
 });
 
 test("worktree group scope derives project before linked worktrees exist", async () => {
