@@ -1,12 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import {
   assistantResultForSession,
   assistantResponseCompletedForSession,
   assertCoreToolEvidence,
+  classifySmokeFailure,
   assertContinuationReadEvidence,
   bestEffortProcessDiagnostics,
   chiefTreeFooter,
@@ -81,6 +90,15 @@ import {
   resolveSmokeModel,
   selectSmokeModel,
   runScenario,
+  sanitizedFailureEvidence,
+  preserveFailureEvidence,
+  descendantCleanupStatus,
+  verifyParentShutdown,
+  startParent,
+  createParentWorkspace,
+  cleanup,
+  requireSmokeEvidence,
+  verifyCoreProvenanceEvidence,
 } from "../scripts/smoke.mjs";
 import installFaux, { decide } from "../scripts/smoke-faux.mjs";
 
@@ -94,28 +112,244 @@ test("package read identity accepts equivalent paths and rejects other files", (
   assert.equal(isPackageReadPath("package.json", undefined), false);
 });
 
-test("parent Herdr routing rejects default and stale sockets", () => {
+test("parent Herdr environment retains nesting context and clears caller routing", () => {
   const base = {
     HERDR_ENV: "1",
-    HERDR_SESSION: "smoke-parent",
+    HERDR_SESSION: "unrelated-session",
     HERDR_WORKSPACE_ID: "w2",
+    HERDR_TAB_ID: "t2",
+    HERDR_PANE_ID: "p2",
     HERDR_SOCKET_PATH: "/wrong/server.sock",
     HERDR_CLIENT_SOCKET_PATH: "/wrong/client.sock",
+    HERDR_STARTUP_CWD: "/wrong/cwd",
+    HERDR_MACOS_SERVER_CONTEXT: "wrong-context",
+    PI_HERDSMAN_RUN_ID: "wrong-agent",
+    PI_HERDSMAN_MAILBOX: "wrong-mailbox",
+    PI_HERDSMAN_OWNER_SESSION_ID: "wrong-owner",
+    PI_HERDSMAN_OWNER_DISPLAY: "wrong-display",
+    PI_HERDSMAN_LABEL: "wrong-label",
+    PI_HERDSMAN_WORKSPACE_ID: "wrong-agent-workspace",
+    PI_HERDSMAN_AGENT_DEFINITION: "wrong-definition",
+    PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS: "wrong-allowlist",
+    PI_SUBAGENT_PARENT_SESSION: "wrong-parent",
+    PI_SUBAGENT_CHILD: "wrong-child",
     XDG_CONFIG_HOME: "/tmp/smoke-parent",
   };
+  const paths = {
+    herdrConfig: "/tmp/isolated/herdr.toml",
+    xdgConfig: "/tmp/isolated/config",
+    xdgState: "/tmp/isolated/state",
+    piAgent: "/tmp/isolated/pi-agent",
+    piSessions: "/tmp/isolated/pi-sessions",
+  };
+  const env = parentControlEnv(base, paths, "phs-owned");
+  assert.equal(env.HERDR_SESSION, "phs-owned");
+  assert.equal(env.HERDR_WORKSPACE_ID, undefined);
+  assert.equal(env.HERDR_TAB_ID, undefined);
+  assert.equal(env.HERDR_PANE_ID, undefined);
+  assert.equal(env.HERDR_ENV, "1");
+  assert.equal(env.HERDR_STARTUP_CWD, undefined);
+  assert.equal(env.HERDR_MACOS_SERVER_CONTEXT, undefined);
+  assert.equal(env.HERDR_SOCKET_PATH, undefined);
+  assert.equal(env.PI_HERDSMAN_RUN_ID, undefined);
+  assert.equal(env.PI_HERDSMAN_MAILBOX, undefined);
+  assert.equal(env.PI_HERDSMAN_OWNER_SESSION_ID, undefined);
+  assert.equal(env.PI_HERDSMAN_OWNER_DISPLAY, undefined);
+  assert.equal(env.PI_HERDSMAN_LABEL, undefined);
+  assert.equal(env.PI_HERDSMAN_WORKSPACE_ID, undefined);
+  assert.equal(env.PI_HERDSMAN_AGENT_DEFINITION, undefined);
+  assert.equal(env.PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS, undefined);
+  assert.equal(env.PI_SUBAGENT_PARENT_SESSION, undefined);
+  assert.equal(env.PI_SUBAGENT_CHILD, undefined);
+  assert.equal(env.HERDR_CONFIG_PATH, paths.herdrConfig);
+  assert.equal(env.XDG_CONFIG_HOME, paths.xdgConfig);
+  assert.equal(base.HERDR_SOCKET_PATH, "/wrong/server.sock");
+});
 
-  assert.deepEqual(parentControlEnv(base), {
-    HERDR_ENV: "1",
-    HERDR_SESSION: "smoke-parent",
-    HERDR_WORKSPACE_ID: "w2",
-    XDG_CONFIG_HOME: "/tmp/smoke-parent",
+test("failure result projection allowlists only bounded nonsensitive fields", () => {
+  const result = sanitizedFailureEvidence(
+    {
+      scenario: "core",
+      simulated: true,
+      stage: "core-delegation",
+      lastVerified: "agent_process_observed",
+      coreProcessEvidence: [{ pid: 10 }, { pid: 11 }],
+      firstRequestObserved: true,
+      firstRequestVerified: false,
+      prompt: "private prompt",
+      environment: { TOKEN: "secret" },
+    },
+    {
+      error: Object.assign(new Error("private details"), {
+        code: "pane_not_found",
+      }),
+    },
+    "EVIDENCE_FAIL",
+    "PENDING",
+  );
+  assert.deepEqual(result, {
+    scenario: "core",
+    mode: "simulated",
+    outcome: "EVIDENCE_FAIL",
+    stage: "core-delegation",
+    errorCode: "pane_not_found",
+    lastVerified: "agent_process_observed",
+    processesVerified: 2,
+    sessionStartObserved: false,
+    firstRequestObserved: true,
+    firstRequestVerified: false,
+    parentOwnership: null,
+    parentCleanup: null,
+    cleanupErrorCode: null,
+    cleanup: "PENDING",
+  });
+  assert.equal(JSON.stringify(result).includes("private"), false);
+  assert.equal(JSON.stringify(result).includes("secret"), false);
+});
+
+test("terminal failure stall artifact retains only allowlisted report progress", async () => {
+  const progress = {
+    requestCount: 2,
+    settledCount: 1,
+    settledNonAborted: true,
+    finalError: true,
+    partialObserved: true,
+    leadToolCalls: 0,
+    reportCount: 0,
+    logicalReports: 0,
+    actionable: false,
+    managerResponded: false,
+    prompt: "private prompt",
+    transcript: "private transcript",
+    mailbox: "private mailbox",
+  };
+  const evidence = sanitizedFailureEvidence(
+    {
+      scenario: "terminal-failure",
+      simulated: true,
+      stage: "terminal-failure-settlement-and-report",
+    },
+    {
+      error: {
+        code: "SMOKE_STALLED",
+        smoke: { stage: "terminal-failure-report", lastProgress: progress },
+      },
+    },
+    "SCENARIO_FAIL",
+    "PASS",
+  );
+  const artifactPath = await preserveFailureEvidence(evidence);
+  const persisted = await readFile(artifactPath, "utf8");
+  assert.deepEqual(JSON.parse(persisted).terminalFailureProgress, {
+    requestCount: 2,
+    settledCount: 1,
+    settledNonAborted: true,
+    finalError: true,
+    partialObserved: true,
+    leadToolCalls: 0,
+    reportCount: 0,
+    logicalReports: 0,
+    actionable: false,
+    managerResponded: false,
+  });
+  assert.doesNotMatch(
+    persisted,
+    /private prompt|private transcript|private mailbox/,
+  );
+  const unrelated = sanitizedFailureEvidence(
+    { scenario: "core", simulated: true },
+    { error: { smoke: { stage: "core-delegation", lastProgress: progress } } },
+    "SCENARIO_FAIL",
+    "PASS",
+  );
+  assert.equal("terminalFailureProgress" in unrelated, false);
+  await rm(dirname(artifactPath), { recursive: true, force: true });
+});
+
+test("failure artifact retains allowlisted parent routing identity across cleanup update", async () => {
+  const paths = {
+    root: "/tmp/phs-owned",
+    herdrConfig: "/tmp/phs-owned/herdr.toml",
+    xdgConfig: "/tmp/phs-owned/xdg-config",
+    xdgState: "/tmp/phs-owned/xdg-state",
+  };
+  const ctx = {
+    scenario: "core",
+    simulated: true,
+    paths,
+    owned: {
+      parent: {
+        name: "phs-a1b2c3d4e5f6",
+        workspaceId: "workspace-owned",
+        server: { pid: 4321 },
+        exit: undefined,
+        env: { HERDR_SESSION: "phs-a1b2c3d4e5f6", TOKEN: "must-not-leak" },
+        stderr: "private server output",
+      },
+    },
+    parentCleanupDiagnostics: {
+      stop: { completed: false, errorCode: "COMMAND_FAILED" },
+      child: {
+        exitObservedBeforeStop: false,
+        exitObservedAfterStop: false,
+        waitAfterStop: "timeout",
+        sigtermSent: true,
+        exitObservedAfterSigterm: false,
+        waitAfterSigterm: "timeout",
+        sigkillSent: true,
+        exitObservedAfterSigkill: true,
+        waitAfterSigkill: "exited",
+      },
+      namedServer: { verified: true, running: false },
+      cleanupErrorCode: "PARENT_SHUTDOWN_UNVERIFIED",
+      stderr: "private post-cleanup stderr",
+      environment: { TOKEN: "must-not-leak" },
+    },
+    cleanupErrorCode: "PARENT_SHUTDOWN_UNVERIFIED",
+    prompt: "private prompt",
+    environment: { TOKEN: "must-not-leak" },
+  };
+  const result = sanitizedFailureEvidence(
+    ctx,
+    { error: Object.assign(new Error("private details"), { code: "failure" }) },
+    "SCENARIO_FAIL",
+    "PENDING",
+  );
+  assert.deepEqual(result.parentOwnership, {
+    session: "phs-a1b2c3d4e5f6",
+    workspaceId: "workspace-owned",
+    childPid: 4321,
+    childExitObserved: false,
   });
 
-  assert.throws(() => parentControlEnv({ ...base, HERDR_SESSION: "default" }));
-
-  assert.throws(() => parentControlEnv({ ...base, HERDR_SESSION: undefined }));
-
-  assert.equal(base.HERDR_SOCKET_PATH, "/wrong/server.sock");
+  const artifactPath = await preserveFailureEvidence(result);
+  const directory = dirname(artifactPath);
+  const permissions = await stat(artifactPath);
+  if (process.platform !== "win32") {
+    assert.equal(permissions.mode & 0o777, 0o600);
+    assert.equal((await stat(directory)).mode & 0o777, 0o700);
+  }
+  result.cleanup = "FAIL";
+  await preserveFailureEvidence(result, artifactPath);
+  const persisted = await readFile(artifactPath, "utf8");
+  assert.match(persisted, /"cleanup": "FAIL"/);
+  assert.match(persisted, /"session": "phs-a1b2c3d4e5f6"/);
+  assert.match(persisted, /"childExitObserved": false/);
+  assert.match(persisted, /"waitAfterStop": "timeout"/);
+  assert.match(persisted, /"sigtermSent": true/);
+  assert.match(persisted, /"waitAfterSigkill": "exited"/);
+  assert.match(persisted, /"running": false/);
+  assert.match(persisted, /"cleanupErrorCode": "PARENT_SHUTDOWN_UNVERIFIED"/);
+  assert.doesNotMatch(
+    persisted,
+    /private post-cleanup stderr|environment|TOKEN|\/tmp\/phs-owned/,
+  );
+  assert.match(persisted, /"session": "phs-a1b2c3d4e5f6"/);
+  assert.doesNotMatch(
+    persisted,
+    /TOKEN|must-not-leak|private server output|private prompt/,
+  );
+  await rm(directory, { recursive: true, force: true });
 });
 
 test("exact core and continuation tool evidence is enforced only in simulated mode", () => {
@@ -1555,7 +1789,7 @@ test("terminal-failure evidence remains actionable and Manager uses only delegat
   });
 });
 
-test("Pi provenance requires exact session, foreground PID, and Pi version", () => {
+test("Pi provenance enforces the supported baseline and reports the observed version", () => {
   const record = {
     pid: 42,
     sessionId: "session",
@@ -1573,6 +1807,7 @@ test("Pi provenance requires exact session, foreground PID, and Pi version", () 
       processes,
       "terminal-error",
       true,
+      "1.2.0",
     ),
     {
       paneId: "lead-pane",
@@ -1590,8 +1825,11 @@ test("Pi provenance requires exact session, foreground PID, and Pi version", () 
         [{ pid: 43 }],
         "terminal-error",
         true,
+        "1.2.0",
       ),
-    /foreground PID match/,
+    (error: Error & { code?: string }) =>
+      error.message.includes("foreground PID match") &&
+      error.code === "SMOKE_EVIDENCE",
   );
   assert.throws(
     () =>
@@ -1602,21 +1840,28 @@ test("Pi provenance requires exact session, foreground PID, and Pi version", () 
         processes,
         "terminal-error",
         true,
+        "1.2.0",
       ),
     /provenance row/,
   );
-  assert.throws(
-    () =>
+  for (const [observedVersion, accepted] of [
+    ["1.1.9", false],
+    ["1.2.0", true],
+    ["1.3.0", true],
+  ] as const) {
+    const attempt = () =>
       matchPiProvenance(
-        [{ ...record, piVersion: "1.1.0" }],
+        [{ ...record, piVersion: observedVersion }],
         "session",
         "lead-pane",
         processes,
         "terminal-error",
         true,
-      ),
-    /1\.2\.0/,
-  );
+        "1.2.0",
+      );
+    if (!accepted) assert.throws(attempt, /1\.2\.0/);
+    else assert.equal(attempt().piVersion, observedVersion);
+  }
   assert.throws(
     () =>
       matchPiProvenance(
@@ -1626,8 +1871,74 @@ test("Pi provenance requires exact session, foreground PID, and Pi version", () 
         processes,
         "terminal-error",
         true,
+        "1.2.0",
       ),
     /expected one provenance row/,
+  );
+});
+
+test("missing provenance row is classified as evidence failure", () => {
+  assert.throws(
+    () => matchPiProvenance([], "session", "pane", [], "core", true, "1.2.0"),
+    (error: Error & { code?: string }) => error.code === "SMOKE_EVIDENCE",
+  );
+  assert.throws(
+    () => requireSmokeEvidence(false, "missing persisted role evidence"),
+    (error: Error & { code?: string }) => error.code === "SMOKE_EVIDENCE",
+  );
+});
+
+test("extra core provenance row fails without retaining verified evidence", async () => {
+  const ctx = {
+    scenario: "core",
+    simulated: true,
+    firstRequestObserved: true,
+    firstRequestVerified: false,
+  };
+  assert.throws(
+    () =>
+      verifyCoreProvenanceEvidence(
+        ctx,
+        [{ sessionId: "root" }, { sessionId: "agent" }, { sessionId: "extra" }],
+        new Set(["root", "agent"]),
+      ),
+    (error: Error & { code?: string }) => error.code === "SMOKE_EVIDENCE",
+  );
+  const artifact = await preserveFailureEvidence(
+    sanitizedFailureEvidence(ctx, {}, "EVIDENCE_FAIL", "FAIL"),
+  );
+  assert.equal(
+    JSON.parse(await readFile(artifact, "utf8")).firstRequestVerified,
+    false,
+  );
+  await rm(dirname(artifact), { recursive: true, force: true });
+});
+
+test("required core tool-result gaps are evidence failures, not behavior failures", () => {
+  for (const result of [undefined, { isError: true }]) {
+    assert.throws(
+      () =>
+        requireSmokeEvidence(
+          result && !result.isError,
+          "missing successful correlated read result",
+        ),
+      (error: Error & { code?: string }) =>
+        classifySmokeFailure("scenario", error) === "EVIDENCE_FAIL",
+    );
+  }
+  assert.throws(
+    () =>
+      assertCoreToolEvidence(
+        true,
+        [{ name: "delegate_agent", result: "" }],
+        "pkg@1",
+      ),
+    (error: Error & { code?: string }) =>
+      classifySmokeFailure("scenario", error) === "EVIDENCE_FAIL",
+  );
+  assert.equal(
+    classifySmokeFailure("scenario", new Error("behavior did not occur")),
+    "SCENARIO_FAIL",
   );
 });
 
@@ -1698,6 +2009,7 @@ test("core Pi provenance matches the core model and role-specific roster", () =>
       [{ pid: 41 }],
       "core",
       expectations.get("root"),
+      "1.2.0",
     ),
     { paneId: "root-pane", pid: 41, sessionId: "root", piVersion: "1.2.0" },
   );
@@ -1709,6 +2021,7 @@ test("core Pi provenance matches the core model and role-specific roster", () =>
       [{ pid: 42 }],
       "core",
       expectations.get("child"),
+      "1.2.0",
     ),
     { paneId: "agent-pane", pid: 42, sessionId: "child", piVersion: "1.2.0" },
   );
@@ -1721,6 +2034,7 @@ test("core Pi provenance matches the core model and role-specific roster", () =>
         [{ pid: 41 }],
         "terminal-error",
         expectations.get("root"),
+        "1.2.0",
       ),
     /'core'/,
   );
@@ -1733,6 +2047,7 @@ test("core Pi provenance matches the core model and role-specific roster", () =>
         [{ pid: 43 }],
         "core",
         true,
+        "1.2.0",
       ),
     /false !== true/,
   );
@@ -1798,9 +2113,363 @@ test("provenance uses retained foreground PID evidence when a pane later disappe
       retained[0].processes,
       "core",
       false,
+      "1.2.0",
     ).pid,
     52,
   );
+});
+
+test("descendant cleanup requires verified PIDs to be absent after pane closure", () => {
+  const prior = new Map([[52, { paneId: "agent-pane", pid: 52 }]]);
+  const disappeared = { verified: [], paneIds: [], unresolved: [] };
+  assert.equal(
+    descendantCleanupStatus(disappeared, prior, () => true).done,
+    false,
+    "a vanished pane cannot prove its still-live PID exited",
+  );
+  assert.equal(
+    descendantCleanupStatus(disappeared, prior, () => false).done,
+    true,
+    "an OS-level absent PID resolves the retained observation",
+  );
+  assert.equal(
+    descendantCleanupStatus(
+      {
+        ...disappeared,
+        paneIds: ["agent-pane"],
+        unresolved: [{ paneId: "agent-pane" }],
+      },
+      new Map(),
+      () => false,
+    ).done,
+    false,
+    "an unresolved pane still listed by Herdr is ambiguous",
+  );
+});
+
+test("parent shutdown requires both owned child exit and named server stopped evidence", async () => {
+  const successParent = { server: {} };
+  const success = await verifyParentShutdown(successParent, {
+    stop: async () => {},
+    waitForExit: async () => {
+      successParent.exit = { code: 0 };
+    },
+    status: async () => ({ server: { running: false } }),
+  });
+  assert.deepEqual(success, []);
+
+  const exitCodeDiagnostics = {};
+  const exitCodeParent = { server: {} };
+  const exitedByCode = await verifyParentShutdown(
+    exitCodeParent,
+    {
+      stop: async () => {},
+      waitForExit: async () => {
+        exitCodeParent.server.exitCode = 0;
+      },
+      status: async () => ({ server: { running: false } }),
+    },
+    exitCodeDiagnostics,
+  );
+  assert.deepEqual(exitedByCode, []);
+  assert.equal(exitCodeDiagnostics.child.exitObservedAfterStop, false);
+  assert.equal(exitCodeDiagnostics.child.exitCode, 0);
+
+  const runningParent = { server: {} };
+  const serverStillRunningWithTerminalChild = await verifyParentShutdown(
+    runningParent,
+    {
+      stop: async () => {},
+      waitForExit: async () => {
+        runningParent.server.exitCode = 0;
+      },
+      status: async () => ({ server: { running: true } }),
+    },
+  );
+  assert.match(
+    serverStillRunningWithTerminalChild.join("\n"),
+    /named Herdr server stop not verified/,
+  );
+
+  const signalParent = { server: {} };
+  const exitedBySignal = await verifyParentShutdown(signalParent, {
+    stop: async () => {},
+    waitForExit: async () => {
+      signalParent.server.signalCode = "SIGTERM";
+    },
+    status: async () => ({ server: { running: false } }),
+  });
+  assert.deepEqual(exitedBySignal, []);
+
+  const childStillAlive = await verifyParentShutdown(
+    { server: {} },
+    {
+      stop: async () => {},
+      waitForExit: async () => {
+        throw new Error("timeout");
+      },
+      status: async () => ({ server: { running: false } }),
+    },
+  );
+  assert.match(childStillAlive.join("\n"), /owned child did not exit/);
+
+  const serverStillRunning = await verifyParentShutdown(
+    { server: {}, exit: { code: 0 } },
+    {
+      stop: async () => {},
+      waitForExit: async () => {},
+      status: async () => ({ server: { running: true } }),
+    },
+  );
+  assert.match(
+    serverStillRunning.join("\n"),
+    /named Herdr server stop not verified/,
+  );
+});
+
+test("cleanup artifact records false child signal results", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-herdsman-signal-cleanup-"));
+  const signals: string[] = [];
+  const parent = {
+    name: "phs-signal-test",
+    env: {},
+    server: {
+      kill(signal: string) {
+        signals.push(signal);
+        return false;
+      },
+    },
+  };
+  const ctx = {
+    scenario: "core",
+    simulated: true,
+    paths: { root },
+    owned: { parent },
+  };
+  const cleanupError = await cleanup(
+    { root, authLink: join(root, "missing-auth-link") },
+    { parent },
+    ctx,
+    {
+      runCommand: async () => ({}),
+      tryHerdrCommand: async () => ({
+        ok: true,
+        value: { server: { running: false } },
+      }),
+      sleepFor: async () => {
+        throw new Error("timeout");
+      },
+    },
+  );
+
+  assert.match(cleanupError ?? "", /owned child did not exit/);
+  assert.equal(ctx.parentCleanupDiagnostics.namedServer.running, false);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  assert.equal(
+    ctx.parentCleanupDiagnostics.cleanupErrorCode,
+    "PARENT_SHUTDOWN_UNVERIFIED",
+  );
+  assert.equal(
+    ctx.parentCleanupDiagnostics.child.exitObservedAfterSigkill,
+    false,
+  );
+  assert.equal(ctx.parentCleanupDiagnostics.child.exitCode, null);
+  assert.equal(ctx.parentCleanupDiagnostics.child.signalCode, null);
+  const evidence = sanitizedFailureEvidence(ctx, {}, "CLEANUP_FAIL", "FAIL");
+  const artifactPath = await preserveFailureEvidence(evidence);
+  const persisted = await readFile(artifactPath, "utf8");
+  assert.match(persisted, /"sigtermSent": false/);
+  assert.match(persisted, /"sigkillSent": false/);
+  await rm(dirname(artifactPath), {
+    recursive: true,
+    force: true,
+  });
+  await rm(root, { recursive: true, force: true });
+});
+
+test("cleanup does not SIGKILL when owned child exits after SIGTERM", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-herdsman-term-cleanup-"));
+  const signals: string[] = [];
+  const parent = {
+    name: "phs-term-test",
+    env: {},
+    server: {
+      exitCode: null as number | null,
+      signalCode: null as string | null,
+      kill(signal: string) {
+        signals.push(signal);
+        if (signal === "SIGTERM") this.exitCode = 0;
+        return true;
+      },
+    },
+  };
+  const ctx = {
+    scenario: "core",
+    simulated: true,
+    paths: { root },
+    owned: { parent },
+  };
+  await cleanup(
+    { root, authLink: join(root, "missing-auth-link") },
+    { parent },
+    ctx,
+    {
+      runCommand: async () => ({}),
+      tryHerdrCommand: async () => ({
+        ok: true,
+        value: { server: { running: false } },
+      }),
+      sleepFor: async () => {
+        throw new Error("initial exit wait timed out");
+      },
+    },
+  );
+  assert.deepEqual(signals, ["SIGTERM"]);
+  assert.equal(ctx.parentCleanupDiagnostics.child.waitAfterSigterm, "exited");
+  assert.equal("sigkillSent" in ctx.parentCleanupDiagnostics.child, false);
+  await rm(root, { recursive: true, force: true });
+});
+
+test("owned parent setup verifies readiness and workspace identity", async () => {
+  const paths = {
+    herdrConfig: "/tmp/isolated/herdr.toml",
+    xdgConfig: "/tmp/isolated/config",
+    xdgState: "/tmp/isolated/state",
+    piAgent: "/tmp/isolated/pi-agent",
+    piSessions: "/tmp/isolated/pi-sessions",
+  };
+  const stderr = new EventEmitter() as EventEmitter & {
+    setEncoding: (encoding: string) => void;
+  };
+  stderr.setEncoding = () => {};
+  const server = new EventEmitter() as EventEmitter & { stderr: typeof stderr };
+  server.stderr = stderr;
+  let ready = false;
+  const owned: Record<string, any> = {};
+  const parent = await startParent(paths, owned, {
+    spawnProcess: () => server,
+    tryHerdrCommand: async (_args: unknown, options: any) => ({
+      ok: true,
+      value: {
+        server: {
+          running: true,
+          compatible: true,
+          session: options.env.HERDR_SESSION,
+          socket: `/tmp/isolated/config/herdr/sessions/${options.env.HERDR_SESSION}/herdr.sock`,
+        },
+      },
+    }),
+    wait: async (
+      _ctx: unknown,
+      _stage: string,
+      observe: () => Promise<any>,
+    ) => {
+      ready = (await observe()).done;
+    },
+  });
+  assert.equal(ready, true);
+  assert.equal(owned.parent.server, server);
+
+  const calls: unknown[][] = [];
+  assert.equal(
+    await createParentWorkspace(paths, parent, owned, "/repo", async (args) => {
+      calls.push(args);
+      return args[1] === "create"
+        ? {
+            workspace: { workspace_id: "w-owned" },
+            root_pane: { pane_id: "p-owned" },
+          }
+        : { workspace: { workspace_id: "w-owned" } };
+    }),
+    "w-owned",
+  );
+  assert.deepEqual(
+    calls.map((args) => args[1]),
+    ["create", "get"],
+  );
+  await assert.rejects(
+    createParentWorkspace(paths, parent, owned, "/repo", async () => ({
+      workspace: { workspace_id: "w-other" },
+    })),
+  );
+});
+
+test("cleanup closes and verifies the owned parent through Herdr contracts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-herdsman-parent-cleanup-"));
+  const server = new EventEmitter() as EventEmitter & {
+    exit?: { code: number };
+    kill?: never;
+  };
+  const parentEnv = {
+    HERDR_SESSION: "phs-owned",
+    HERDR_CONFIG_PATH: "/tmp/isolated/herdr.toml",
+    XDG_CONFIG_HOME: "/tmp/isolated/config",
+    XDG_STATE_HOME: "/tmp/isolated/state",
+  };
+  const parent = {
+    name: "phs-owned",
+    env: parentEnv,
+    workspaceId: "w-owned",
+    server,
+  };
+  const calls: string[][] = [];
+  let stopCall: { args: string[]; env: unknown } | undefined;
+  const result = await cleanup(
+    { root, authLink: join(root, "missing-auth-link") },
+    { parent },
+    {},
+    {
+      herdrCommand: async (args) => {
+        calls.push(args);
+        return {};
+      },
+      runCommand: async (_file, args, options) => {
+        calls.push(args);
+        stopCall = { args, env: options.env };
+        parent.exit = { code: 0 };
+        return {};
+      },
+      tryHerdrCommand: async (args) => {
+        calls.push(args);
+        return { ok: true, value: { server: { running: false } } };
+      },
+    },
+  );
+  assert.equal(result, null);
+  assert.deepEqual(
+    calls.map((args) => args.slice(0, 2)),
+    [
+      ["workspace", "close"],
+      ["--session", "phs-owned"],
+      ["status", "--json"],
+    ],
+  );
+  assert.deepEqual(stopCall, {
+    args: ["--session", "phs-owned", "server", "stop"],
+    env: parentEnv,
+  });
+
+  const retainedRoot = await mkdtemp(
+    join(tmpdir(), "pi-herdsman-parent-failure-"),
+  );
+  const marker = join(retainedRoot, "retained");
+  await writeFile(marker, "owned state");
+  const failed = await cleanup(
+    { root: retainedRoot, authLink: join(retainedRoot, "missing-auth-link") },
+    { parent: { ...parent, server: { exit: { code: 0 } } } },
+    {},
+    {
+      herdrCommand: async () => ({}),
+      runCommand: async () => ({}),
+      tryHerdrCommand: async () => ({
+        ok: true,
+        value: { server: { running: true } },
+      }),
+    },
+  );
+  assert.match(failed ?? "", /named Herdr server stop not verified/);
+  assert.equal(await readFile(marker, "utf8"), "owned state");
+  await rm(retainedRoot, { recursive: true, force: true });
 });
 
 test("manager-recovery uses nonblocking messages only when information cannot wait for the automatic result", () => {
@@ -2423,10 +3092,11 @@ test("Manager cleanup selects the recreated workspace only for exact branch and 
 test("collectDiagnostics reads the host pane through the parent Herdr environment", async () => {
   const parentEnv = { HERDR_SESSION: "parent-session" };
   const calls = [];
+  let projection;
   const originalError = console.error;
   console.error = () => {};
   try {
-    await collectDiagnostics(
+    projection = await collectDiagnostics(
       {
         parentEnv,
         paths: {},
@@ -2447,6 +3117,13 @@ test("collectDiagnostics reads the host pane through the parent Herdr environmen
   } finally {
     console.error = originalError;
   }
+  assert.deepEqual(projection, {
+    stage: null,
+    agentsObserved: 0,
+    panesObserved: 0,
+    rootSessionObserved: false,
+    candidateProcessesObserved: 0,
+  });
   assert.deepEqual(
     calls.find(([, args]) => args.includes("host-pane")),
     [
