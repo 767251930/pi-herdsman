@@ -5336,7 +5336,7 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
   }
 });
 
-test("ordinary Leads message their Manager and receive Manager messages passively", async (t) => {
+test("ordinary Leads exchange turn-triggering messages with their Manager", async (t) => {
   setLeadEnvironment();
   const socketPath = join(tmpdir(), `manager-lead-inbox-${randomUUID()}.sock`);
   const leadSession = randomUUID();
@@ -5438,7 +5438,11 @@ test("ordinary Leads message their Manager and receive Manager messages passivel
     registerExtension!(lead.pi as never);
     const leadCtx = fakeContext(lead.entries) as any;
     leadCtx.sessionManager.getSessionId = () => leadSession;
-    leadCtx.isIdle = () => false;
+    let busyChecks = 0;
+    leadCtx.isIdle = () => {
+      busyChecks++;
+      return false;
+    };
     await lead.events.get("session_start")![0](undefined, leadCtx);
 
     useManagerIdentity();
@@ -5491,6 +5495,21 @@ test("ordinary Leads message their Manager and receive Manager messages passivel
         managerCtx,
       );
     useLeadIdentity();
+    busyChecks = 0;
+    await t.waitFor(() => assert.ok(busyChecks > 0));
+    assert.equal(
+      lead.sent.some(
+        (message: any) =>
+          message?.customType === "pi-herdsman-manager_message" &&
+          message?.details?.fromSessionId === LEAD_SESSION_ID &&
+          message?.details?.toSessionId === leadSession,
+      ),
+      false,
+    );
+    assert.equal(
+      listCoordinationMessagePaths(supervisionRuntime(), leadSession).length,
+      1,
+    );
     leadCtx.isIdle = () => true;
     await t.waitFor(() =>
       assert.ok(
@@ -5507,12 +5526,50 @@ test("ordinary Leads message their Manager and receive Manager messages passivel
         ({ message }: any) =>
           message?.customType === "pi-herdsman-manager_message",
       )?.options,
-      { triggerTurn: false },
+      { deliverAs: "followUp", triggerTurn: true },
     );
     assert.deepEqual(
       listCoordinationMessagePaths(supervisionRuntime(), leadSession),
       [],
     );
+
+    const sentBefore = lead.sentMessageCalls.length;
+    let imports = 0;
+    const appendEntry = lead.pi.appendEntry;
+    lead.pi.appendEntry = (type: string, data: unknown) => {
+      imports++;
+      appendEntry(type, data);
+    };
+    leadCtx.isIdle = () => false;
+    writeChiefMessage(
+      {
+        version: 2,
+        id: randomUUID(),
+        leaseId: randomUUID(),
+        kind: "manager_message",
+        fromSessionId: LEAD_SESSION_ID,
+        toSessionId: leadSession,
+        leadSessionId: leadSession,
+        text: "Do not import this unauthorized message",
+        resultBindings: [
+          {
+            ref: "result:researcher#1",
+            canonicalRef: `result:${randomUUID()}`,
+          },
+        ],
+        build: HERDSMAN_BUILD,
+        createdAt: Date.now(),
+      },
+      supervisionRuntime(),
+    );
+    await t.waitFor(() =>
+      assert.deepEqual(
+        listCoordinationMessagePaths(supervisionRuntime(), leadSession),
+        [],
+      ),
+    );
+    assert.equal(lead.sentMessageCalls.length, sentBefore);
+    assert.equal(imports, 0);
   } finally {
     if (lead) {
       useLeadIdentity();
