@@ -33,7 +33,6 @@ import {
   removeChiefMessage,
   readChiefMessage,
   readManagerDescriptor,
-  listPeerLeadRecords,
   peerLeadLockPath,
   peerRuntime,
   readPeerLeadRecord,
@@ -101,6 +100,7 @@ import support, {
   herdrAlias,
   isApiSnapshot,
   isAgentList,
+  isPreservePaneStop,
   isPaneList,
   isTabList,
   listResponse,
@@ -1837,6 +1837,14 @@ function fakeChiefPi(options: Parameters<typeof fakePi>[0] = {}) {
 
 test("root Lead explicitly enters Manager; a competing root session stays Lead", async (t) => {
   setLeadEnvironment();
+  const managerOverride = join(PI_AGENTS_DIR, "manager.md");
+  const outsideDefinition = join(PI_AGENTS_DIR, "generalist.md");
+  const previousManagerOverride = realFs.existsSync(managerOverride)
+    ? readFileSync(managerOverride, "utf8")
+    : undefined;
+  let persistedManager: ReturnType<typeof fakeChiefPi> | undefined;
+  let persistedManagerContext: any;
+  let persistedManagerSessionId = "";
   updateConfig("autoActivateManager", true);
   process.env.HERDR_PANE_ID = "root-pane";
   process.env.HERDR_TAB_ID = "root-tab";
@@ -2267,7 +2275,7 @@ test("root Lead explicitly enters Manager; a competing root session stays Lead",
       ),
     );
 
-    const persistedManager = fakeChiefPi({
+    persistedManager = fakeChiefPi({
       activeTools: ["read"],
       entries: [
         {
@@ -2279,11 +2287,10 @@ test("root Lead explicitly enters Manager; a competing root session stays Lead",
       exec,
     });
     registerExtension!(persistedManager.pi as never);
-    const persistedManagerContext = fakeContext(
-      persistedManager.entries,
-    ) as any;
+    persistedManagerContext = fakeContext(persistedManager.entries) as any;
+    persistedManagerSessionId = `restored-manager-${randomUUID()}`;
     persistedManagerContext.sessionManager.getSessionId = () =>
-      `restored-manager-${randomUUID()}`;
+      persistedManagerSessionId;
     const restorationNotices: string[] = [];
     persistedManagerContext.ui.notify = (message: string) =>
       restorationNotices.push(message);
@@ -2291,6 +2298,9 @@ test("root Lead explicitly enters Manager; a competing root session stays Lead",
       undefined,
       persistedManagerContext,
     );
+    await persistedManager.commandOptions
+      .get("manager")
+      .handler("", persistedManagerContext);
     assert.equal(
       persistedManager.pi.getActiveTools().includes("delegate_project"),
       false,
@@ -2307,7 +2317,6 @@ test("root Lead explicitly enters Manager; a competing root session stays Lead",
         ),
       ),
     );
-    await persistedManager.events.get("session_shutdown")?.[0]();
     updateConfig("autoActivateManager", undefined);
     assert.equal(
       readLeadCoordinationState(supervisionRuntime(), LEAD_SESSION_ID)?.role,
@@ -2365,6 +2374,82 @@ test("root Lead explicitly enters Manager; a competing root session stays Lead",
       readLeadCoordinationState(supervisionRuntime(), LEAD_SESSION_ID)?.role,
       "lead",
     );
+    writeFileSync(
+      managerOverride,
+      "---\nname: manager\ntools: [read]\nagents: [agent]\n---\n",
+    );
+    writeFileSync(
+      outsideDefinition,
+      "---\nname: generalist\n---\ngeneralist\n",
+    );
+    await persistedManager.events.get("session_shutdown")?.[0]();
+    persistedManagerContext = fakeContext(persistedManager.entries) as any;
+    persistedManagerSessionId = `restored-manager-${randomUUID()}`;
+    persistedManagerContext.sessionManager.getSessionId = () =>
+      persistedManagerSessionId;
+    await persistedManager.events.get("session_start")![0](
+      undefined,
+      persistedManagerContext,
+    );
+    assert.equal(
+      readManagerDescriptor(supervisionRuntime(), WORKSPACE)?.piSessionId,
+      persistedManagerSessionId,
+      "the restored Manager holds the verified workspace lease",
+    );
+    assert.equal(
+      sessionLeadRoleState(persistedManagerContext.sessionManager.getEntries())
+        ?.role,
+      "manager",
+    );
+    for (const name of managerTools)
+      assert.ok(persistedManager.pi.getActiveTools().includes(name), name);
+    assert.ok(persistedManager.pi.getActiveTools().includes("delegate_agent"));
+    const createTabsBeforeAllowed = persistedManager.calls.filter(
+      (args) => args[0] === "tab" && args[1] === "create",
+    ).length;
+    const firstAllowedAssignment = await agentTool(
+      persistedManager,
+      "delegate",
+    ).execute(
+      "restored-manager-allowed",
+      { definition: "agent", task: "allowed by the restored Manager profile" },
+      undefined,
+      undefined,
+      persistedManagerContext,
+    );
+    assert.notEqual(
+      firstAllowedAssignment.details.error?.category,
+      "invalid_request",
+      JSON.stringify(firstAllowedAssignment.details),
+    );
+    assert.ok(
+      persistedManager.calls.filter(
+        (args) => args[0] === "tab" && args[1] === "create",
+      ).length > createTabsBeforeAllowed,
+      "the restored agents: [agent] policy passes authorization to Herdr",
+    );
+    const createTabsBeforeDenied = persistedManager.calls.filter(
+      (args) => args[0] === "tab" && args[1] === "create",
+    ).length;
+    const deniedAssignment = await agentTool(
+      persistedManager,
+      "delegate",
+    ).execute(
+      "restored-manager-denied",
+      { definition: "generalist", task: "outside the restored allowlist" },
+      undefined,
+      undefined,
+      persistedManagerContext,
+    );
+    assert.equal(deniedAssignment.details.error.category, "invalid_request");
+    assert.equal(
+      persistedManager.calls.filter(
+        (args) => args[0] === "tab" && args[1] === "create",
+      ).length,
+      createTabsBeforeDenied,
+      "a definition outside agents: [agent] is denied before Herdr launch",
+    );
+    await persistedManager?.events.get("session_shutdown")?.[0]();
     await first.events.get("session_shutdown")![0]();
     const replacement = fakeChiefPi({ activeTools: ["read"], exec });
     registerExtension!(replacement.pi as never);
@@ -2384,10 +2469,15 @@ test("root Lead explicitly enters Manager; a competing root session stays Lead",
     updateConfig("autoActivateManager", undefined);
     await second.events.get("session_shutdown")?.[0]();
     await first.events.get("session_shutdown")?.[0]();
+    await persistedManager?.events.get("session_shutdown")?.[0]();
     delete process.env.HERDR_SOCKET_PATH;
     delete process.env.HERDR_TAB_ID;
     delete process.env.HERDR_PANE_ID;
     setLeadEnvironment();
+    if (previousManagerOverride === undefined)
+      rmSync(managerOverride, { force: true });
+    else writeFileSync(managerOverride, previousManagerOverride);
+    rmSync(outsideDefinition, { force: true });
   }
 });
 
@@ -2546,6 +2636,12 @@ test("Manager leave suspends authority when lease release fails", async () => {
   const ctx = fakeContext() as any;
   const notices: string[] = [];
   ctx.ui.notify = (message: string) => notices.push(message);
+  const ownerMailbox = agentMailboxPath(WORKSPACE, "manager-owned-agent");
+  resetAgentMailbox(ownerMailbox);
+  writeAgentState(ownerMailbox, {
+    ...managedState("manager-owned-agent"),
+    ownerSessionId: ctx.sessionManager.getSessionId(),
+  });
   registerExtension!(pi.pi as never);
   const runtime = supervisionRuntime();
   try {
@@ -2570,15 +2666,32 @@ test("Manager leave suspends authority when lease release fails", async () => {
         ),
       ),
     );
-    assert.deepEqual(pi.pi.getActiveTools(), ["read"]);
+    for (const name of ["list_agents", "reply_agent", "close_agent"])
+      assert.ok(pi.pi.getActiveTools().includes(name), name);
+    assert.ok(!pi.pi.getActiveTools().includes("delegate_agent"));
+    assert.ok(!pi.pi.getActiveTools().includes("continue_agent"));
+    const blocked = await agentTool(pi, "delegate").execute(
+      "suspended-manager",
+      { definition: "agent", task: "must not start" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(blocked.details.error.category, "invalid_request");
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+    );
     assert.equal(
       readLeadCoordinationState(runtime, LEAD_SESSION_ID),
       undefined,
     );
     await pi.commandOptions.get("manager").handler("", ctx);
-    assert.deepEqual(pi.pi.getActiveTools(), ["read"]);
+    for (const name of ["list_agents", "reply_agent", "close_agent"])
+      assert.ok(pi.pi.getActiveTools().includes(name), name);
   } finally {
     await pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(ownerMailbox);
     realFs.rmSync(runtime.root, { recursive: true, force: true });
     delete process.env.HERDR_SOCKET_PATH;
     delete process.env.HERDR_TAB_ID;
@@ -3078,7 +3191,7 @@ test("Manager auto-start finalization suspends and invalidates Lead when rollbac
   };
   let invalidated = false;
   const host: any = {
-    controllerScope: { kind: "lead" },
+    controllerScope: { kind: "root" },
     pi: pi.pi,
     persistLeadCoordination: () => false,
     markLeadCoordinationUnhealthy: () => {
@@ -5729,35 +5842,28 @@ test("ordinary Lead peer presence disappears in Chief mode and on shutdown", asy
   const entries: unknown[] = [];
   const pi = fakeChiefPi({ entries, activeTools: ["read", "bash"] });
   const context = fakeContext(entries) as any;
+  const sessionId = `peer-presence-${randomUUID()}`;
+  context.sessionManager.getSessionId = () => sessionId;
   context.ui.notify = () => undefined;
   registerExtension!(pi.pi as never);
   try {
     await pi.events.get("session_start")![0](undefined, context);
-    const first = readPeerLeadRecord(
-      peerRuntime(),
-      context.sessionManager.getSessionId(),
-    );
+    const first = readPeerLeadRecord(peerRuntime(), sessionId);
     assert.ok(first);
-    assert.equal(listPeerLeadRecords(peerRuntime()).length, 1);
 
     await pi.commandOptions.get("chief").handler("", context);
-    assert.equal(
-      readPeerLeadRecord(peerRuntime(), context.sessionManager.getSessionId()),
-      undefined,
-    );
-    assert.deepEqual(listPeerLeadRecords(peerRuntime()), []);
+    assert.equal(readPeerLeadRecord(peerRuntime(), sessionId), undefined);
 
     await pi.commandOptions.get("chief").handler("leave", context);
-    const restored = readPeerLeadRecord(
-      peerRuntime(),
-      context.sessionManager.getSessionId(),
-    );
+    const restored = readPeerLeadRecord(peerRuntime(), sessionId);
     assert.ok(restored);
     assert.notEqual(restored.claim.id, first.claim.id);
 
     await pi.events.get("session_shutdown")![0]();
-    assert.deepEqual(listPeerLeadRecords(peerRuntime()), []);
+    assert.equal(readPeerLeadRecord(peerRuntime(), sessionId), undefined);
   } finally {
+    await pi.events.get("session_shutdown")?.[0]();
+    removePeerLeadRecord(peerRuntime(), sessionId);
     delete process.env.HERDR_SOCKET_PATH;
     delete process.env.HERDR_TAB_ID;
     delete process.env.HERDR_PANE_ID;
@@ -6989,45 +7095,46 @@ test("selecting a pre-Chief branch restores the Lead lifecycle", async () => {
   const entries: unknown[] = [];
   const pi = fakeChiefPi({ activeTools: ["read", "bash"], entries });
   const context = fakeContext(entries) as any;
+  const sessionId = `pre-chief-${randomUUID()}`;
+  context.sessionManager.getSessionId = () => sessionId;
   context.mode = "rpc";
   context.ui.notify = () => undefined;
   registerExtension!(pi.pi as never);
-  await pi.events.get("session_start")![0](undefined, context);
-  const baseline = pi.pi.getActiveTools();
-  const preChiefBranch = [...entries];
-  assert.equal(sessionLeadRoleState(preChiefBranch), undefined);
-  await pi.commandOptions.get("chief").handler("", context);
-  assert.equal(
-    readPeerLeadRecord(peerRuntime(), context.sessionManager.getSessionId()),
-    undefined,
-  );
-  context.sessionManager.getBranch = () => preChiefBranch;
-  const appendEntry = pi.pi.appendEntry;
-  pi.pi.appendEntry = (type: string, data: unknown) => {
-    appendEntry(type, data);
-    preChiefBranch.push({ type: "custom", customType: type, data });
-  };
-  pi.pi.setActiveTools(baseline);
-  await pi.events.get("session_tree")![0](undefined, context);
-  assert.deepEqual(pi.pi.getActiveTools(), baseline);
-  const replacement = claimChiefLease({
-    piSessionId: "replacement-session",
-    paneId: "replacement-pane",
-    tabId: "replacement-tab",
-    workspaceId: WORKSPACE,
-  });
-  replacement.release();
-  assert.equal(
-    sessionLeadRoleState(context.sessionManager.getBranch())?.role,
-    "lead",
-  );
-  assert.ok(
-    readPeerLeadRecord(peerRuntime(), context.sessionManager.getSessionId()),
-  );
-  await pi.events.get("session_shutdown")?.[0]();
-  delete process.env.HERDR_SOCKET_PATH;
-  delete process.env.HERDR_TAB_ID;
-  delete process.env.HERDR_PANE_ID;
+  try {
+    await pi.events.get("session_start")![0](undefined, context);
+    const baseline = pi.pi.getActiveTools();
+    const preChiefBranch = [...entries];
+    assert.equal(sessionLeadRoleState(preChiefBranch), undefined);
+    await pi.commandOptions.get("chief").handler("", context);
+    assert.equal(readPeerLeadRecord(peerRuntime(), sessionId), undefined);
+    context.sessionManager.getBranch = () => preChiefBranch;
+    const appendEntry = pi.pi.appendEntry;
+    pi.pi.appendEntry = (type: string, data: unknown) => {
+      appendEntry(type, data);
+      preChiefBranch.push({ type: "custom", customType: type, data });
+    };
+    pi.pi.setActiveTools(baseline);
+    await pi.events.get("session_tree")![0](undefined, context);
+    assert.deepEqual(pi.pi.getActiveTools(), baseline);
+    const replacement = claimChiefLease({
+      piSessionId: "replacement-session",
+      paneId: "replacement-pane",
+      tabId: "replacement-tab",
+      workspaceId: WORKSPACE,
+    });
+    replacement.release();
+    assert.equal(
+      sessionLeadRoleState(context.sessionManager.getBranch())?.role,
+      "lead",
+    );
+    assert.ok(readPeerLeadRecord(peerRuntime(), sessionId));
+  } finally {
+    await pi.events.get("session_shutdown")?.[0]();
+    removePeerLeadRecord(peerRuntime(), sessionId);
+    delete process.env.HERDR_SOCKET_PATH;
+    delete process.env.HERDR_TAB_ID;
+    delete process.env.HERDR_PANE_ID;
+  }
 });
 
 test("selecting a historical Chief branch activates its lease and staff tools", async () => {
@@ -7041,6 +7148,8 @@ test("selecting a historical Chief branch activates its lease and staff tools", 
   const entries: unknown[] = [];
   const pi = fakeChiefPi({ activeTools: ["read", "bash"], entries });
   const context = fakeContext(entries) as any;
+  const sessionId = `chief-branch-${randomUUID()}`;
+  context.sessionManager.getSessionId = () => sessionId;
   context.mode = "rpc";
   context.ui.notify = () => undefined;
   registerExtension!(pi.pi as never);
@@ -7062,10 +7171,7 @@ test("selecting a historical Chief branch activates its lease and staff tools", 
       "read_staff_transcript",
       "message_staff",
     ]);
-    assert.equal(
-      readPeerLeadRecord(peerRuntime(), context.sessionManager.getSessionId()),
-      undefined,
-    );
+    assert.equal(readPeerLeadRecord(peerRuntime(), sessionId), undefined);
     assert.throws(() =>
       claimChiefLease({
         piSessionId: "replacement-session",
@@ -7077,6 +7183,7 @@ test("selecting a historical Chief branch activates its lease and staff tools", 
     assert.equal(sessionLeadRoleState(entries)?.role, "chief");
   } finally {
     await pi.events.get("session_shutdown")?.[0]();
+    removePeerLeadRecord(peerRuntime(), sessionId);
     delete process.env.HERDR_SOCKET_PATH;
     delete process.env.HERDR_TAB_ID;
     delete process.env.HERDR_PANE_ID;
@@ -7250,14 +7357,19 @@ test("lead session-start retries an exact baseline after restoration fails", asy
   pi.pi.setActiveTools = (next: string[]) => {
     if (failRestore && next.join("|") === baseline.join("|")) {
       failRestore = false;
-      throw new Error("lead session-start restoration failed");
+      const activeToolsBeforeFailure = [...pi.pi.getActiveTools()];
+      try {
+        throw new Error("lead session-start restoration failed");
+      } catch (error) {
+        assert.deepEqual(pi.pi.getActiveTools(), activeToolsBeforeFailure);
+        throw error;
+      }
     }
     setActiveTools(next);
   };
 
   await start(undefined, context);
 
-  assert.deepEqual(pi.pi.getActiveTools(), leadTools);
   assert.equal(
     chiefTools.some((name) => pi.pi.getActiveTools().includes(name)),
     false,
@@ -7352,7 +7464,7 @@ test("lead session-start continues when chief lease release fails", async () => 
   delete process.env.HERDR_PANE_ID;
 });
 
-test("Chief activation rejects owned work outside the current workspace", async () => {
+test("Chief activation preserves access to previously owned work", async () => {
   setLeadEnvironment();
   process.env.HERDR_PANE_ID = "chief-pane";
   process.env.HERDR_TAB_ID = "chief-tab";
@@ -7383,7 +7495,9 @@ test("Chief activation rejects owned work outside the current workspace", async 
   registerExtension!(pi.pi as never);
   await pi.events.get("session_start")![0](undefined, context);
   await pi.commandOptions.get("chief").handler("", context);
-  assert.ok(notices.some((message) => /owned agent work exists/.test(message)));
+  assert.ok(
+    !notices.some((message) => /owned agent work exists/.test(message)),
+  );
   realFs.rmSync(mailbox, { recursive: true, force: true });
   await pi.events.get("session_shutdown")?.[0]();
   delete process.env.HERDR_SOCKET_PATH;
@@ -7502,11 +7616,17 @@ test("Chief profile drives the turn-start tools, prompt, and tool-call guard", a
     tmpdir(),
     `chief-profile-${randomUUID()}.sock`,
   );
+  const ownerMailbox = agentMailboxPath(WORKSPACE, "chief-owned-agent");
+  resetAgentMailbox(ownerMailbox);
   try {
     const pi = fakeChiefPi({ activeTools: ["read"] });
     const ctx = fakeContext() as any;
     registerExtension!(pi.pi as never);
     await pi.events.get("session_start")![0](undefined, ctx);
+    writeAgentState(ownerMailbox, {
+      ...managedState("chief-owned-agent"),
+      ownerSessionId: ctx.sessionManager.getSessionId(),
+    });
     await pi.commandOptions.get("chief").handler("", ctx);
     const event = {
       systemPrompt: "base",
@@ -7517,9 +7637,21 @@ test("Chief profile drives the turn-start tools, prompt, and tool-call guard", a
       prompt?.systemPrompt ?? "",
       /verified workspace-neutral Chief/,
     );
+    assert.match(
+      prompt?.systemPrompt ?? "",
+      /Each unresolved unit of work has one executor/,
+    );
+    assert.match(
+      prompt?.systemPrompt ?? "",
+      /A proven lost Agent remains unresolved/,
+    );
     assert.match(prompt?.systemPrompt ?? "", /Configured chief body/);
     assert.ok(pi.pi.getActiveTools().includes("read"));
     assert.ok(pi.pi.getActiveTools().includes("list_staff"));
+    for (const name of ["list_agents", "reply_agent", "close_agent"])
+      assert.ok(pi.pi.getActiveTools().includes(name), name);
+    for (const name of ["message_supervisor", "list_peers", "message_peer"])
+      assert.ok(!pi.pi.getActiveTools().includes(name), name);
     assert.ok(!pi.pi.getActiveTools().includes("delegate_project"));
     assert.equal(
       await pi.events.get("tool_call")![0](
@@ -7548,10 +7680,250 @@ test("Chief profile drives the turn-start tools, prompt, and tool-call guard", a
         reason: "Tool is unavailable in the active Chief profile.",
       },
     );
+    for (const name of ["message_supervisor", "list_peers", "message_peer"])
+      assert.deepEqual(
+        await pi.events.get("tool_call")![0](
+          { toolName: name, input: {} },
+          ctx,
+        ),
+        {
+          block: true,
+          reason: "Tool is unavailable in the active Chief profile.",
+        },
+      );
+    resetAgentMailbox(ownerMailbox);
     await pi.events.get("session_shutdown")?.[0](undefined, ctx);
   } finally {
+    resetAgentMailbox(ownerMailbox);
     if (previousOverride === undefined) rmSync(overridePath, { force: true });
     else writeFileSync(overridePath, previousOverride);
+    for (const [key, value] of previousEnvironment)
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+  }
+});
+
+test("root assignment rejects a role generation changed during preflight", async () => {
+  setLeadEnvironment();
+  const previousEnvironment = new Map(
+    [
+      "HERDR_PANE_ID",
+      "HERDR_TAB_ID",
+      "HERDR_WORKSPACE_ID",
+      "HERDR_SOCKET_PATH",
+    ].map((key) => [key, process.env[key]]),
+  );
+  const chiefPath = join(PI_AGENTS_DIR, "chief.md");
+  const previousChief = realFs.existsSync(chiefPath)
+    ? readFileSync(chiefPath, "utf8")
+    : undefined;
+  writeFileSync(chiefPath, "---\nname: chief\nagents: []\n---\n");
+  process.env.HERDR_PANE_ID = "role-race-pane";
+  process.env.HERDR_TAB_ID = "role-race-tab";
+  process.env.HERDR_WORKSPACE_ID = WORKSPACE;
+  process.env.HERDR_SOCKET_PATH = join(
+    tmpdir(),
+    `role-race-${randomUUID()}.sock`,
+  );
+
+  let enteredPreflight!: () => void;
+  let releasePreflight!: () => void;
+  const preflightEntered = new Promise<void>(
+    (resolve) => (enteredPreflight = resolve),
+  );
+  const preflightRelease = new Promise<void>(
+    (resolve) => (releasePreflight = resolve),
+  );
+  let held = false;
+  let assignmentStarted = false;
+  const pi = fakeChiefPi({
+    exec: async (command, args) => {
+      if (command === "herdr" && assignmentStarted && !held) {
+        held = true;
+        enteredPreflight();
+        await preflightRelease;
+        return undefined;
+      }
+      return undefined;
+    },
+  });
+  const context = fakeContext() as any;
+  registerExtension!(pi.pi as never);
+  try {
+    await pi.events.get("session_start")![0](undefined, context);
+    const sessionId = context.sessionManager.getSessionId();
+    assignmentStarted = true;
+    const pending = pi.tools
+      .find((tool) => tool.name === "delegate_agent")!
+      .execute(
+        "role-race",
+        { definition: "agent", task: "must not launch" },
+        undefined,
+        undefined,
+        context,
+      );
+    await preflightEntered;
+    await pi.commandOptions.get("chief").handler("", context);
+    assert.equal(context.sessionManager.getSessionId(), sessionId);
+    releasePreflight();
+    const result = await pending;
+    assert.equal(
+      result.details.error.category,
+      "invalid_request",
+      JSON.stringify(result.details),
+    );
+    assert.match(result.details.error.message, /role or authority changed/i);
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+    );
+  } finally {
+    releasePreflight();
+    await pi.events.get("session_shutdown")?.[0](undefined, context);
+    if (previousChief === undefined) rmSync(chiefPath, { force: true });
+    else writeFileSync(chiefPath, previousChief);
+    for (const [key, value] of previousEnvironment)
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+  }
+});
+
+test("root assignment rechecks changed authority after Agent startup and rolls back", async () => {
+  setLeadEnvironment();
+  const previousEnvironment = new Map(
+    [
+      "HERDR_PANE_ID",
+      "HERDR_TAB_ID",
+      "HERDR_WORKSPACE_ID",
+      "HERDR_SOCKET_PATH",
+    ].map((key) => [key, process.env[key]]),
+  );
+  const chiefPath = join(PI_AGENTS_DIR, "chief.md");
+  const previousChief = realFs.existsSync(chiefPath)
+    ? readFileSync(chiefPath, "utf8")
+    : undefined;
+  writeFileSync(chiefPath, "---\nname: chief\nagents: []\n---\n");
+  process.env.HERDR_PANE_ID = "role-start-race-pane";
+  process.env.HERDR_TAB_ID = "role-start-race-tab";
+  process.env.HERDR_WORKSPACE_ID = WORKSPACE;
+  process.env.HERDR_SOCKET_PATH = join(
+    tmpdir(),
+    `role-start-race-${randomUUID()}.sock`,
+  );
+
+  const label = `role-start-race-${randomUUID().slice(0, 8)}`;
+  let taskAccepted = false;
+  const startup = startupExecutor(
+    label,
+    () => DEFAULT_PI_SESSION_ID,
+    undefined,
+    () => {
+      taskAccepted = true;
+    },
+    false,
+    undefined,
+    "/tmp",
+    AGENT_ID,
+    false,
+    true,
+  );
+  let enteredStart!: () => void;
+  let releaseStart!: () => void;
+  const startEntered = new Promise<void>((resolve) => (enteredStart = resolve));
+  const startRelease = new Promise<void>((resolve) => (releaseStart = resolve));
+  let paused = false;
+  let started = false;
+  let stopped = false;
+  const pi = fakeChiefPi({
+    exec: async (command, args, options) => {
+      if (command === "herdr" && isPreservePaneStop(args)) stopped = true;
+      if (
+        command === "herdr" &&
+        args[0] === "pane" &&
+        args[1] === "process-info"
+      )
+        return {
+          stdout: JSON.stringify({
+            id: AGENT_ID,
+            result: {
+              process_info: {
+                pane_id: "startup-pane",
+                shell_pid: 123,
+                foreground_process_group_id: started && !stopped ? 999 : 123,
+                foreground_processes:
+                  started && !stopped
+                    ? [
+                        { pid: 123, argv0: "/bin/zsh" },
+                        { pid: 999, argv0: "/usr/local/bin/pi" },
+                      ]
+                    : [{ pid: 123, argv0: "/bin/zsh" }],
+              },
+            },
+          }),
+          stderr: "",
+          code: 0,
+        };
+      const result = await startup.exec(command, args, options);
+      if (command === "herdr" && args[0] === "agent" && args[1] === "start") {
+        started = true;
+        paused = true;
+        enteredStart();
+        await startRelease;
+      }
+      return result;
+    },
+  });
+  const context = fakeContext() as any;
+  registerExtension!(pi.pi as never);
+  try {
+    await pi.events.get("session_start")![0](undefined, context);
+    const pending = pi.tools
+      .find((tool) => tool.name === "delegate_agent")!
+      .execute(
+        "role-start-race",
+        { definition: "agent", label, task: "must not be published" },
+        undefined,
+        undefined,
+        context,
+      );
+    await startEntered;
+    assert.equal(paused, true);
+    await pi.commandOptions.get("chief").handler("", context);
+    releaseStart();
+
+    const result = await pending;
+    assert.equal(
+      result.details.error.category,
+      "invalid_request",
+      JSON.stringify(result.details.error),
+    );
+    assert.match(result.details.error.message, /role or authority changed/i);
+    assert.equal(taskAccepted, false);
+    assert.equal(
+      stopped,
+      true,
+      "the unauthorized started Agent must be stopped",
+    );
+    assert.equal(
+      readAgentState(agentMailboxPath(WORKSPACE, label)),
+      undefined,
+      "rollback must leave no unresolved live Agent generation",
+    );
+    assert.equal(
+      realFs.existsSync(startup.mailbox) &&
+        realFs
+          .readdirSync(startup.mailbox)
+          .some((entry) => entry.startsWith("request-")),
+      false,
+      "no task request may remain committed",
+    );
+  } finally {
+    releaseStart();
+    startup.stopMailboxConsumer();
+    await pi.events.get("session_shutdown")?.[0](undefined, context);
+    resetAgentMailbox(startup.mailbox);
+    if (previousChief === undefined) rmSync(chiefPath, { force: true });
+    else writeFileSync(chiefPath, previousChief);
     for (const [key, value] of previousEnvironment)
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
@@ -8485,6 +8857,18 @@ test("persisted chief resume isolates tools and restores its ordinary baseline",
 
 test("persisted chief collision is suspended and has no lead authority", async () => {
   setLeadEnvironment();
+  const chiefOverride = join(PI_AGENTS_DIR, "chief.md");
+  const scoutDefinition = join(PI_AGENTS_DIR, "scout.md");
+  const outsideDefinition = join(PI_AGENTS_DIR, "generalist.md");
+  const previousChiefOverride = realFs.existsSync(chiefOverride)
+    ? readFileSync(chiefOverride, "utf8")
+    : undefined;
+  writeFileSync(
+    chiefOverride,
+    "---\nname: chief\ntools: [read]\nagents: [scout]\n---\n",
+  );
+  writeFileSync(scoutDefinition, "---\nname: scout\n---\nscout\n");
+  writeFileSync(outsideDefinition, "---\nname: generalist\n---\ngeneralist\n");
   process.env.HERDR_PANE_ID = "lead-pane";
   process.env.HERDR_TAB_ID = "lead-tab";
   process.env.HERDR_SOCKET_PATH = join(
@@ -8518,6 +8902,11 @@ test("persisted chief collision is suspended and has no lead authority", async (
     tabId: "incumbent-tab",
     workspaceId: "incumbent-workspace",
   });
+  const ownedMailbox = agentMailboxPath(
+    WORKSPACE,
+    "suspended-chief-owned-agent",
+  );
+  resetAgentMailbox(ownedMailbox);
   try {
     const pi = fakeChiefPi({
       entries,
@@ -8536,9 +8925,28 @@ test("persisted chief collision is suspended and has no lead authority", async (
     });
     registerExtension!(pi.pi as never);
     const context = fakeContext(entries) as any;
+    writeAgentState(ownedMailbox, {
+      ...managedState("suspended-chief-owned-agent"),
+      ownerSessionId: context.sessionManager.getSessionId(),
+    });
     context.ui.notify = () => undefined;
     await pi.events.get("session_start")![0](undefined, context);
-    assert.deepEqual(pi.pi.getActiveTools(), []);
+    for (const name of ["list_agents", "reply_agent", "close_agent"])
+      assert.ok(pi.pi.getActiveTools().includes(name), name);
+    assert.ok(!pi.pi.getActiveTools().includes("delegate_agent"));
+    assert.ok(!pi.pi.getActiveTools().includes("continue_agent"));
+    const denied = await agentTool(pi, "delegate").execute(
+      "suspended-chief",
+      { definition: "agent", task: "must not start" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(denied.details.error.category, "invalid_request");
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+    );
     assert.equal(
       readLeadCoordinationState(
         supervisionRuntime(),
@@ -8546,9 +8954,70 @@ test("persisted chief collision is suspended and has no lead authority", async (
       ),
       undefined,
     );
+
+    // Removing the verified incumbent allows normal startup to restore the
+    // persisted Chief role against the current profile and delegation policy.
+    incumbent.release();
+    await pi.events.get("session_start")![0](undefined, context);
+    assert.equal(
+      sessionLeadRoleState(context.sessionManager.getEntries())?.role,
+      "chief",
+    );
+    for (const name of chiefTools)
+      assert.ok(pi.pi.getActiveTools().includes(name));
+    assert.ok(pi.pi.getActiveTools().includes("read"));
+    for (const name of ["list_agents", "reply_agent", "close_agent"])
+      assert.ok(pi.pi.getActiveTools().includes(name), name);
+    for (const name of ["message_supervisor", "list_peers", "message_peer"])
+      assert.ok(!pi.pi.getActiveTools().includes(name), name);
+    assert.ok(pi.pi.getActiveTools().includes("delegate_agent"));
+    const restoredAssignment = await agentTool(pi, "delegate").execute(
+      "restored-chief-current-policy",
+      { definition: "scout", task: "exercise the restored current profile" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(
+      restoredAssignment.details.error.category,
+      "internal_failure",
+      "the allowed assignment reaches Herdr; the fixture stops at tab creation",
+    );
+    assert.equal(
+      restoredAssignment.details.error.operation,
+      "herdr tab create",
+    );
+    assert.ok(
+      pi.calls.some((args) => args[0] === "tab" && args[1] === "create"),
+      "agents: [scout] allows the fresh assignment past authorization",
+    );
+    const tabCreatesBeforeDenied = pi.calls.filter(
+      (args) => args[0] === "tab" && args[1] === "create",
+    ).length;
+    const outsideAllowlist = await agentTool(pi, "delegate").execute(
+      "restored-chief-outside-allowlist",
+      { definition: "generalist", task: "outside the restored allowlist" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(outsideAllowlist.details.error.category, "invalid_request");
+    assert.match(outsideAllowlist.details.error.message, /is not allowed/);
+    assert.equal(
+      pi.calls.filter((args) => args[0] === "tab" && args[1] === "create")
+        .length,
+      tabCreatesBeforeDenied,
+      "agents: [scout] denies another valid definition before Herdr launch",
+    );
     await pi.events.get("session_shutdown")?.[0]();
   } finally {
     incumbent.release();
+    resetAgentMailbox(ownedMailbox);
+    if (previousChiefOverride === undefined)
+      rmSync(chiefOverride, { force: true });
+    else writeFileSync(chiefOverride, previousChiefOverride);
+    rmSync(scoutDefinition, { force: true });
+    rmSync(outsideDefinition, { force: true });
     delete process.env.HERDR_SOCKET_PATH;
     delete process.env.HERDR_TAB_ID;
     setLeadEnvironment();
@@ -12284,8 +12753,12 @@ test("repeated lead starts replace the widget and ignore old refreshes", async (
   }
 });
 
-test("superseded lead startup cannot recover or publish over current session", async () => {
+test("session-start roster uses current delegation policy and ignores superseded startup", async () => {
   const { createLeadSessionStartRuntime } = await import("./lead-runtime.ts");
+  const { visibleAgentCapabilities } = await import("./agent-controller.ts");
+  const rosterDefinitions: AgentDefinition[] = ["allowed", "other"].map(
+    (name) => ({ name, path: `/${name}.md`, frontmatter: {}, body: "" }),
+  );
   let resolveOldDefinitions!: (value: {
     definitions: AgentDefinition[];
     roleDefinitions: AgentDefinition[];
@@ -12300,7 +12773,11 @@ test("superseded lead startup cannot recover or publish over current session", a
   const recovered: string[] = [];
   const prepared: string[] = [];
   const published: string[] = [];
+  const publishedRosters: string[][] = [];
   const pendingTransitions: boolean[] = [];
+  const projectedPolicies: unknown[] = [];
+  let managerActive = false;
+  let delegationPolicy: "all" | ReadonlySet<string> = "all";
   const host = {
     diagnostic() {},
     controller: {
@@ -12327,7 +12804,8 @@ test("superseded lead startup cannot recover or publish over current session", a
       start() {},
       requestRefresh() {},
     },
-    isLead: () => true,
+    isRoot: () => true,
+    rootDelegationPolicy: () => delegationPolicy,
     isManagedAgent: () => false,
     clearLeadExecution() {},
     setLeadExecutionPending(pending: boolean) {
@@ -12342,7 +12820,7 @@ test("superseded lead startup cannot recover or publish over current session", a
         previousControllerRole: "lead",
       }),
       reconcileRoleTools() {},
-      activeManager: () => false,
+      activeManager: () => managerActive,
       canRestoreChiefState: () => false,
       resolveControllerRole: async () => undefined,
       finalizeOptionalManagerStartup() {},
@@ -12376,7 +12854,7 @@ test("superseded lead startup cannot recover or publish over current session", a
       return ctx.sessionManager.getSessionId() === "old-session"
         ? oldDefinitions
         : Promise.resolve({
-            definitions: [],
+            definitions: rosterDefinitions,
             roleDefinitions: [],
             projectTrusted: true,
           });
@@ -12385,11 +12863,17 @@ test("superseded lead startup cannot recover or publish over current session", a
       assert.equal(signal.aborted, false);
       prepared.push(ctx.sessionManager.getSessionId());
     },
-    visibleAgentCapabilities: async (ctx: any) => [
-      { sessionId: ctx.sessionManager.getSessionId() },
-    ],
-    setDefinitionRoster(roster: { sessionId: string }) {
+    visibleAgentCapabilities: async (
+      ctx: any,
+      definitions: AgentDefinition[] = [],
+      policy: any,
+    ) => {
+      projectedPolicies.push(policy);
+      return visibleAgentCapabilities(definitions, { kind: "root" }, policy);
+    },
+    setDefinitionRoster(roster: { sessionId: string; definitions: any[] }) {
       published.push(roster.sessionId);
+      publishedRosters.push(roster.definitions.map(({ name }) => name));
     },
     appendRoleError() {},
     appendDefinitionError() {},
@@ -12417,6 +12901,24 @@ test("superseded lead startup cannot recover or publish over current session", a
   assert.deepEqual(prepared, ["current-session"]);
   assert.deepEqual(published, ["current-session"]);
   assert.deepEqual(pendingTransitions, [true, true, false]);
+  assert.deepEqual(projectedPolicies, ["all"]);
+  assert.deepEqual(publishedRosters, [["allowed", "other"]]);
+
+  delegationPolicy = new Set(["allowed"]);
+  await runtime.sessionStart(contextFor("supervisor-root"));
+  delegationPolicy = new Set();
+  await runtime.sessionStart(contextFor("unverified-root"));
+  assert.deepEqual(projectedPolicies, ["all", new Set(["allowed"]), new Set()]);
+  assert.deepEqual(publishedRosters, [["allowed", "other"], ["allowed"], []]);
+
+  managerActive = true;
+  await runtime.sessionStart(contextFor("restored-manager-session"));
+  assert.deepEqual(recovered, [
+    "current-session",
+    "supervisor-root",
+    "unverified-root",
+    "restored-manager-session",
+  ]);
 });
 
 test("TUI status refresh consumes the coherent Herdr session snapshot", async (t) => {

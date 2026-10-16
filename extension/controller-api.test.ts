@@ -5261,7 +5261,7 @@ test("empty stop inventory reports a valid Agent discovered in final verificatio
   resetAgentMailbox(mailbox);
   let discovered = false;
   const controller = createAgentController(pi.pi as never, {
-    scope: { kind: "lead" },
+    scope: { kind: "root" },
     build: HERDSMAN_BUILD,
     extensionPath: "test",
     isContextRetired: () => false,
@@ -5450,6 +5450,7 @@ test("semantic result refs attach persisted output and preserve canonical file r
   const pi = fakePi({ entries, exec: startup.exec });
   registerExtension!(pi.pi as never);
   try {
+    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
     const result = await agentTool(pi, "delegate").execute(
       "id",
       {
@@ -5501,6 +5502,7 @@ test("semantic result refs resolve only on the active branch", async () => {
   const entries: unknown[] = [resultEntry];
   const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
+  await pi.events.get("session_start")![0](undefined, fakeContext());
   try {
     const result = await agentTool(pi, "delegate").execute(
       "id",
@@ -5579,6 +5581,7 @@ test("conflicting duplicate result mappings fail closed", async () => {
   ];
   const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
+  await pi.events.get("session_start")![0](undefined, fakeContext());
   try {
     const result = await agentTool(pi, "delegate").execute(
       "id",
@@ -5637,6 +5640,7 @@ test("managed agent validates project definitions before publishing state", asyn
 
 test("trusted same-cwd project assignment launches with native approval", async () => {
   setLeadEnvironment();
+  process.env.HERDR_PANE_ID = "lead-pane";
   const project = realFs.mkdtempSync(
     join(tmpdir(), "pi-herdsman-assign-same-cwd-"),
   );
@@ -5659,9 +5663,10 @@ test("trusted same-cwd project assignment launches with native approval", async 
   );
   const pi = fakePi({ exec: startup.exec });
   registerExtension!(pi.pi as never);
-  const context = fakeContext() as any;
+  const context = fakeContext(pi.entries) as any;
   context.cwd = project;
   try {
+    await pi.events.get("session_start")![0](undefined, context);
     const result = await agentTool(pi, "delegate").execute(
       "id",
       {
@@ -5722,6 +5727,7 @@ test("trusted same-cwd project assignment launches with native approval", async 
     const context = fakeContext() as any;
     context.cwd = projectLink;
     try {
+      await pi.events.get("session_start")![0](undefined, context);
       const result = await agentTool(pi, "delegate").execute(
         "id",
         { definition: "project-only", task: "symlink cwd" },
@@ -5763,6 +5769,7 @@ test("untrusted assignments omit project approval", async () => {
   );
   const pi = fakePi({ exec: startup.exec });
   registerExtension!(pi.pi as never);
+  await pi.events.get("session_start")![0](undefined, fakeContext());
   const context = fakeContext() as any;
   context.cwd = project;
   context.isProjectTrusted = () => false;
@@ -6183,7 +6190,7 @@ test("visible capabilities omit unlaunchable parents and non-capability metadata
           extensions: ["private/extension.ts"],
         }),
       ],
-      { kind: "lead" },
+      { kind: "root" },
     ),
     [
       {
@@ -6214,7 +6221,7 @@ test("visible capabilities omit unlaunchable parents and non-capability metadata
         definition("child", { agents: ["disabled-grandchild"] }),
         definition("disabled-grandchild", { enabled: false }),
       ],
-      { kind: "lead" },
+      { kind: "root" },
     ),
     [],
   );
@@ -6235,7 +6242,7 @@ test("visible capabilities advertise children only when delegation is enabled", 
       excludeTools: ["agent"],
     }),
   ];
-  const projected = visibleAgentCapabilities(definitions, { kind: "lead" });
+  const projected = visibleAgentCapabilities(definitions, { kind: "root" });
   assert.deepEqual(
     projected.map(({ name }) => name),
     ["child", "allowed", "no-tools", "empty-tools", "exclude-agent"],
@@ -6244,6 +6251,20 @@ test("visible capabilities advertise children only when delegation is enabled", 
   assert.equal("agents" in projected[2]!, false);
   assert.equal("agents" in projected[3]!, false);
   assert.equal("agents" in projected[4]!, false);
+  assert.deepEqual(
+    visibleAgentCapabilities(
+      definitions,
+      { kind: "root" },
+      new Set(["allowed"]),
+    ).map(({ name }) => name),
+    ["allowed"],
+  );
+  assert.deepEqual(
+    visibleAgentCapabilities(definitions, { kind: "root" }, "all").map(
+      ({ name }) => name,
+    ),
+    ["child", "allowed", "no-tools", "empty-tools", "exclude-agent"],
+  );
 });
 
 test("parent list omits unrelated unknown mailbox diagnostics", async () => {
@@ -7012,6 +7033,7 @@ test("session continuation inherits the saved label without an override", async 
     context.model = { provider: "continue-provider", id: "continue-model" };
     context.thinkingLevel = "high";
     registerExtension!(pi.pi as never);
+    await pi.events.get("session_start")![0](undefined, fakeContext());
     try {
       const result = await agentTool(pi, "continue").execute(
         "id",
@@ -7086,6 +7108,7 @@ test("session continuation keeps explicit definition execution overrides", async
   const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
   const pi = fakePi({ exec: startup.exec });
   registerExtension!(pi.pi as never);
+  await pi.events.get("session_start")![0](undefined, fakeContext());
   const context = fakeContext([
     ownershipResult(sourceId, LEAD_SESSION_ID, {
       path: sourcePath,
@@ -7123,6 +7146,8 @@ test("session continuation rejects label overrides and occupied inherited labels
   nativeSessions.clear();
   const invalidPi = fakePi();
   registerExtension!(invalidPi.pi as never);
+  await invalidPi.events.get("session_start")![0](undefined, fakeContext());
+  const callsAfterActivation = invalidPi.calls.length;
   try {
     const invalidRequest = {
       session: "/tmp/session.jsonl",
@@ -7149,7 +7174,7 @@ test("session continuation rejects label overrides and occupied inherited labels
       fakeContext(),
     );
     assert.equal(invalid.details.error.category, "invalid_request");
-    assert.equal(invalidPi.calls.length, 0);
+    assert.equal(invalidPi.calls.length, callsAfterActivation);
   } finally {
     invalidPi.events.get("session_shutdown")?.[0]();
   }
@@ -7211,6 +7236,7 @@ test("session continuation rejects label overrides and occupied inherited labels
         : baseExec(command, args, options),
   });
   registerExtension!(pi.pi as never);
+  await pi.events.get("session_start")![0](undefined, fakeContext());
   try {
     const result = await agentTool(pi, "continue").execute(
       "id",
@@ -7262,6 +7288,8 @@ test("public assignment normalizes invalid and unknown session sources", async (
     exec: () => ({ stdout: "0.8.0", stderr: "", code: 0 }),
   });
   registerExtension!(pi.pi as never);
+  const context = fakeContext();
+  await pi.events.get("session_start")![0](undefined, context);
   try {
     for (const [value, diagnostic] of [
       ["11111111", /prefixes are not allowed/],
@@ -7275,7 +7303,7 @@ test("public assignment normalizes invalid and unknown session sources", async (
         },
         undefined,
         undefined,
-        fakeContext(),
+        context,
       );
       assert.equal(result.details.ok, false, JSON.stringify(result.details));
       assert.equal(result.details.error.category, "invalid_request");
@@ -7313,6 +7341,7 @@ test("session assignment rejects the controller's active session", async () => {
     exec: () => ({ stdout: "0.8.0", stderr: "", code: 0 }),
   });
   registerExtension!(pi.pi as never);
+  await pi.events.get("session_start")![0](undefined, fakeContext());
   try {
     const result = await agentTool(pi, "continue").execute(
       "id",
@@ -7351,6 +7380,7 @@ test("public assignment preserves session source open failures", async () => {
   const context = fakeContext([
     ownershipResult(session.id, LEAD_SESSION_ID, { path: session.path }),
   ]);
+  await pi.events.get("session_start")![0](undefined, context);
   const openOperationError = new OperationError({
     category: "internal_failure",
     message: "session dependency failed",
@@ -7416,6 +7446,7 @@ test("assignment session rejects unusable saved cwd headers without mutation", a
     const context = fakeContext([
       ownershipResult(id, LEAD_SESSION_ID, { path }),
     ]);
+    await pi.events.get("session_start")![0](undefined, context);
     const result = await agentTool(pi, "continue").execute(
       "id",
       {
@@ -7429,9 +7460,19 @@ test("assignment session rejects unusable saved cwd headers without mutation", a
     assert.equal(result.details.error.category, "invalid_request");
     assert.equal(result.details.error.rollbackOccurred, false);
     assert.match(result.details.error.message, /no non-empty cwd/);
-    assert.deepEqual(pi.calls, []);
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+    );
     assert.equal(realFs.existsSync(mailbox), false);
-    assert.deepEqual(pi.entries, []);
+    assert.equal(
+      pi.entries.some(
+        (entry: any) =>
+          entry.customType === "pi-herdsman-agent-result" ||
+          entry.message?.customType === "pi-herdsman-agent-result",
+      ),
+      false,
+    );
     pi.events.get("session_shutdown")?.[0]();
     realFs.rmSync(path, { force: true });
   }
@@ -7482,6 +7523,7 @@ test("managed historical sources require durable owner-side ancestry for continu
   });
   const pi = fakePi({ exec: () => ({ stdout: "0.8.0", stderr: "", code: 0 }) });
   registerExtension!(pi.pi as never);
+  await pi.events.get("session_start")![0](undefined, fakeContext());
   const request = async (selector: string, entries: unknown[]) =>
     agentTool(pi, "continue").execute(
       "id",
@@ -7536,6 +7578,7 @@ test("managed historical sources require durable owner-side ancestry for continu
         const owner = fakePi({ exec: startup.exec });
         registerExtension!(owner.pi as never);
         try {
+          await owner.events.get("session_start")![0](undefined, fakeContext());
           const result = await agentTool(owner, "continue").execute(
             "id",
             { session: sourceId, task: "follow up" },
@@ -7601,6 +7644,7 @@ test("copied fork result history does not invalidate the original owner edge", a
   const startup = startupExecutor("child", () => DEFAULT_PI_SESSION_ID);
   const pi = fakePi({ exec: startup.exec });
   registerExtension!(pi.pi as never);
+  await pi.events.get("session_start")![0](undefined, fakeContext());
   try {
     const result = await agentTool(pi, "continue").execute(
       "id",
@@ -7670,9 +7714,10 @@ test("historical continuation re-parenting preserves every valid ownership path"
     const startup = startupExecutor("child", () => childId);
     const pi = fakePi({ exec: startup.exec });
     registerExtension!(pi.pi as never);
+    const context = fakeContext(entries) as any;
+    context.sessionManager.getSessionId = () => callerId;
+    await pi.events.get("session_start")![0](undefined, context);
     try {
-      const context = fakeContext(entries) as any;
-      context.sessionManager.getSessionId = () => callerId;
       const result = await agentTool(pi, "continue").execute(
         "id",
         { session: childId, task: "continue child" },
@@ -7804,6 +7849,7 @@ test("session assignment fails closed on duplicate live representations", async 
     },
   });
   registerExtension!(pi.pi as never);
+  await pi.events.get("session_start")![0](undefined, fakeContext());
   try {
     const result = await agentTool(pi, "continue").execute(
       "id",
@@ -7950,6 +7996,7 @@ test("registered delegate protects a live mailbox owned by another owner", async
   const startup = startupExecutor("agent-2", () => DEFAULT_PI_SESSION_ID);
   const pi = fakePi({ exec: startup.exec });
   registerExtension!(pi.pi as never);
+  await pi.events.get("session_start")![0](undefined, fakeContext());
   const tool = agentTool(pi, "delegate");
   const result = await tool.execute(
     "id",
@@ -8001,6 +8048,7 @@ test("fresh assignments do not reset an unacknowledged stale mailbox", async () 
   );
   const automaticPi = fakePi({ exec: automaticStartup.exec });
   registerExtension!(automaticPi.pi as never);
+  await automaticPi.events.get("session_start")![0](undefined, fakeContext());
   const automatic = await agentTool(automaticPi, "delegate").execute(
     "id",
     {
@@ -8059,6 +8107,7 @@ test("request-only mailbox remnants reserve their labels", async () => {
   );
   const automaticPi = fakePi({ exec: automaticStartup.exec });
   registerExtension!(automaticPi.pi as never);
+  await automaticPi.events.get("session_start")![0](undefined, fakeContext());
   const automatic = await agentTool(automaticPi, "delegate").execute(
     "id",
     {
@@ -8088,6 +8137,7 @@ test("assignment retains its request when acknowledgement never arrives", async 
     exec: startup.exec,
   });
   registerExtension!(pi.pi as never);
+  await pi.events.get("session_start")![0](undefined, fakeContext());
   const result = await agentTool(pi, "delegate").execute(
     "id",
     {
@@ -9595,7 +9645,7 @@ test("listing and transcript action retain distinct transcript-readiness callbac
     ),
   });
   const controller = createAgentController(pi.pi as never, {
-    scope: { kind: "lead" },
+    scope: { kind: "root" },
     build: HERDSMAN_BUILD,
     extensionPath: "test",
     isContextRetired: () => false,
@@ -9637,4 +9687,168 @@ test("listing and transcript action retain distinct transcript-readiness callbac
     resetAgentMailbox(mailbox);
     realFs.rmSync(identity.piSessionFile, { force: true });
   }
+});
+
+test("root assignments fail closed when delegation authority callbacks are missing", async () => {
+  const { createAgentController } = await import("./agent-controller.ts");
+  const context = fakeContext() as any;
+  const pi = fakePi();
+  const baseOptions = {
+    scope: { kind: "root" },
+    build: HERDSMAN_BUILD,
+    extensionPath: "test",
+    isContextRetired: () => false,
+    snapshotDependencies: {
+      runtimeForLabel: () => undefined,
+      readLeadSessionIds: () => [],
+      staleAfterMs: 60_000,
+    },
+    persistedTranscriptReady: () => false,
+    agentDefinitions: async () => [],
+    readTranscript: () => ({ transcript: "", truncated: false }),
+    workspaceId: () => WORKSPACE,
+    sendResultMessage: () => undefined,
+    sendAskMessage: () => undefined,
+    sessionRetired: () => false,
+    appendError: () => undefined,
+    onChanged: () => undefined,
+    onWorkChanged: () => undefined,
+    reportWatcherError: () => undefined,
+  };
+  for (const missing of ["rootDelegationPolicy", "rootDelegationGeneration"]) {
+    const options = {
+      ...baseOptions,
+      rootDelegationPolicy: () => "all",
+      rootDelegationGeneration: () => ({
+        sessionId: context.sessionManager.getSessionId(),
+        roleGeneration: 1,
+      }),
+    } as Record<string, unknown>;
+    delete options[missing];
+    const controller = createAgentController(pi.pi as never, options as any);
+    for (const params of [
+      { action: "delegate", definition: "agent", task: "must reject" },
+      {
+        action: "continue",
+        session: "/tmp/existing-session.jsonl",
+        task: "must reject",
+      },
+    ])
+      await assert.rejects(
+        controller.action(context, params as any),
+        /Root delegation authority is unavailable/,
+      );
+  }
+  assert.equal(
+    pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+    false,
+  );
+});
+
+test("root discovery fails closed without policy and preserves explicit unrestricted Lead policy", async () => {
+  const { createAgentController } = await import("./agent-controller.ts");
+  const definition = {
+    name: "available",
+    path: "/tmp/available.md",
+    frontmatter: {},
+    body: "",
+  };
+  const context = fakeContext() as any;
+  const baseOptions = {
+    scope: { kind: "root" },
+    build: HERDSMAN_BUILD,
+    extensionPath: "test",
+    isContextRetired: () => false,
+    snapshotDependencies: {
+      runtimeForLabel: () => undefined,
+      readLeadSessionIds: () => [],
+      staleAfterMs: 60_000,
+    },
+    persistedTranscriptReady: () => false,
+    agentDefinitions: async () => [definition],
+    readTranscript: () => ({ transcript: "", truncated: false }),
+    workspaceId: () => WORKSPACE,
+    sendResultMessage: () => undefined,
+    sendAskMessage: () => undefined,
+    sessionRetired: () => false,
+    appendError: () => undefined,
+    onChanged: () => undefined,
+    onWorkChanged: () => undefined,
+    reportWatcherError: () => undefined,
+  };
+  const discover = async (rootDelegationPolicy?: () => "all") => {
+    const controller = createAgentController(
+      fakePi().pi as never,
+      {
+        ...baseOptions,
+        rootDelegationPolicy,
+      } as any,
+    );
+    return controller.action(context, { action: "list" } as any);
+  };
+  assert.deepEqual(
+    (await discover()).agent_definitions,
+    [],
+    "missing root policy must not advertise delegatable definitions",
+  );
+  assert.deepEqual(
+    (await discover(() => "all")).agent_definitions,
+    [{ name: "available", tools: "default", skills: "none" }],
+    "the verified Lead policy explicitly returns unrestricted access",
+  );
+});
+
+test("root assignments reject a generation owned by a different session", async () => {
+  const { createAgentController } = await import("./agent-controller.ts");
+  const context = fakeContext() as any;
+  const pi = fakePi();
+  const controller = createAgentController(
+    pi.pi as never,
+    {
+      scope: { kind: "root" },
+      rootDelegationPolicy: () => "all",
+      rootDelegationGeneration: () => ({
+        sessionId: "stale-root-session",
+        roleGeneration: 1,
+        role: "chief",
+        authority: undefined,
+        profile: undefined,
+      }),
+      build: HERDSMAN_BUILD,
+      extensionPath: "test",
+      isContextRetired: () => false,
+      snapshotDependencies: {
+        runtimeForLabel: () => undefined,
+        readLeadSessionIds: () => [],
+        staleAfterMs: 60_000,
+      },
+      persistedTranscriptReady: () => false,
+      agentDefinitions: async () => [],
+      readTranscript: () => ({ transcript: "", truncated: false }),
+      workspaceId: () => WORKSPACE,
+      sendResultMessage: () => undefined,
+      sendAskMessage: () => undefined,
+      sessionRetired: () => false,
+      appendError: () => undefined,
+      onChanged: () => undefined,
+      onWorkChanged: () => undefined,
+      reportWatcherError: () => undefined,
+    } as any,
+  );
+  for (const params of [
+    { action: "delegate", definition: "agent", task: "must reject" },
+    {
+      action: "continue",
+      session: "/tmp/existing-session.jsonl",
+      task: "must reject",
+    },
+  ])
+    await assert.rejects(
+      controller.action(context, params as any),
+      /Root delegation session changed/,
+    );
+  assert.equal(
+    pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+    false,
+  );
 });
