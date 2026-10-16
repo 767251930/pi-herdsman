@@ -27,6 +27,13 @@ import {
   projectTaskSummary,
   listProjectAssignments,
   listProjectMessages,
+  supervisionRuntime,
+  globalProjectAssignmentSnapshot,
+  withProjectAssignmentAuthority,
+  readPeerLeadRecord,
+  samePeerLeadGeneration,
+  samePeerLeadAuthority,
+  canMessagePeer,
   staffToolName,
   supervisorStateMessage,
   verifyManagerCoordinationAuthority,
@@ -94,7 +101,7 @@ import {
   type StatusSnapshot,
 } from "./presentation.ts";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { realpathSync, statSync, unlinkSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { persistedTranscriptReady as controllerPersistedTranscriptReady } from "./agent-controller.ts";
@@ -556,6 +563,7 @@ type LeadCoordinationBaseHost = {
   removeProjectMessage: typeof import("./supervision.ts").removeProjectMessage;
   readProjectAssignment: typeof import("./supervision.ts").readProjectAssignment;
   importResultBindings: typeof import("./agent-controller.ts").importResultBindings;
+  worktreeGroupScope: typeof import("./herdr.ts").worktreeGroupScope;
 };
 
 type LeadCoordinationHost = LeadCoordinationBaseHost & {
@@ -635,6 +643,15 @@ type LeadInboxHost = LeadInboxBaseHost & {
     record: PeerLeadRecord,
     ctx: ExtensionContext,
   ): Promise<boolean>;
+  peerContext(
+    record: PeerLeadRecord,
+    ctx: ExtensionContext,
+    assignmentSnapshot?: Map<
+      string,
+      import("./supervision.ts").GlobalProjectAssignment[]
+    >,
+    requireFreshGroup?: boolean,
+  ): Promise<import("./supervision.ts").PeerContext | undefined>;
   assertCurrentLeadCoordination(ctx: ExtensionContext): void;
   currentChiefAuthority: LeadRoleTransitionRuntime["currentChiefAuthority"];
   currentManager: LeadRoleTransitionRuntime["currentManager"];
@@ -2987,6 +3004,21 @@ export function registerLeadRuntime(
     livePeerLead: (...args) => coordinationRuntime.livePeerLead(...args),
     authorizePeerRecord: (record: ChiefMessageRecord, ctx: ExtensionContext) =>
       coordinationRuntime.authorizePeerRecord(record, ctx),
+    peerContext: (
+      record: PeerLeadRecord,
+      ctx: ExtensionContext,
+      assignmentSnapshot?: Map<
+        string,
+        import("./supervision.ts").GlobalProjectAssignment[]
+      >,
+      requireFreshGroup = false,
+    ) =>
+      coordinationRuntime.peerContext(
+        record,
+        ctx,
+        assignmentSnapshot,
+        requireFreshGroup,
+      ),
     assertCurrentLeadCoordination: (ctx: ExtensionContext) =>
       coordinationRuntime.assertCurrentLeadCoordination(ctx),
     currentChiefAuthority: (
@@ -7974,13 +8006,14 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
         return;
       }
       const record: PeerLeadRecord = {
-        version: 1,
+        version: 2,
         build: HERDSMAN_BUILD,
         role: activeRole() === "manager" ? "manager" : "lead",
         piSessionId: sessionId,
         paneId,
         tabId,
         workspaceId,
+        socket: process.env.HERDR_SOCKET_PATH ?? "unknown-socket",
         ...(name ? { name } : {}),
         cwd: ctx.cwd,
         claim: lease.claim,
@@ -7994,6 +8027,40 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
       peerPresenceLease = lease;
       peerPresenceRecord = record;
       void (async () => {
+        let group: PeerLeadRecord["group"];
+        try {
+          const scope = await currentWorktreeScope(ctx);
+          if (!isCurrent() || peerPresenceRecord !== record) return;
+          if (scope) {
+            const assignments = findProjectAssignmentBySession(
+              supervisionRuntime(record.socket),
+              scope.repoKey,
+              sessionId,
+            );
+            if (assignments.length > 1) return;
+            group = {
+              repoKey: scope.repoKey,
+              primaryWorkspaceId: scope.primaryWorkspaceId,
+            };
+          } else {
+            group = null;
+          }
+        } catch {
+          group = undefined;
+        }
+        if (!isCurrent() || peerPresenceRecord !== record) return;
+        const verified: PeerLeadRecord =
+          group === undefined ? record : { ...record, group };
+        if (group !== undefined) {
+          try {
+            const current = readPeerLeadRecord(peerRuntime(), sessionId);
+            if (!current || !samePeerLeadGeneration(current, record)) return;
+            writePeerLeadRecord(peerRuntime(), verified);
+            peerPresenceRecord = verified;
+          } catch {
+            return;
+          }
+        }
         let provenance: WorkspaceProvenance;
         try {
           provenance =
@@ -8009,7 +8076,7 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
         } catch {
           return;
         }
-        if (!isCurrent() || peerPresenceRecord !== record) return;
+        if (!isCurrent() || peerPresenceRecord !== verified) return;
         const workspaceLabel =
           provenance.repoName && provenance.branch
             ? `${provenance.repoName}/${provenance.branch}`
@@ -8018,21 +8085,21 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
                 ? basename(provenance.workspaceCwd)
                 : workspaceId));
         const enriched: PeerLeadRecord = {
-          ...record,
+          ...verified,
           ...(provenance.repoName ? { repo: provenance.repoName } : {}),
           ...(provenance.branch ? { branch: provenance.branch } : {}),
           workspaceLabel,
           updatedAt: Date.now(),
         };
-        if (!isCurrent() || peerPresenceRecord !== record) return;
+        if (!isCurrent() || peerPresenceRecord !== verified) return;
         try {
           const current = readPeerLeadRecord(peerRuntime(), sessionId);
-          if (!current || !samePeerLeadRecord(current, record)) return;
-          if (!isCurrent() || peerPresenceRecord !== record) return;
+          if (!current || !samePeerLeadRecord(current, verified)) return;
+          if (!isCurrent() || peerPresenceRecord !== verified) return;
           writePeerLeadRecord(peerRuntime(), enriched);
           peerPresenceRecord = enriched;
         } catch (error) {
-          if (isCurrent() && peerPresenceRecord === record)
+          if (isCurrent() && peerPresenceRecord === verified)
             appendDurableError(pi, ctx, "pi_herdsman_state_error", error);
         }
       })();
@@ -8092,7 +8159,7 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
   const currentPeerPresenceValid = (ctx: ExtensionContext): boolean => {
     if (
       leadRuntime.chiefMode !== "inactive" ||
-      leadRuntime.roleSuspended ||
+      (leadRuntime.roleSuspended && activeRole() !== "manager") ||
       !leadCoordinationHealthy ||
       !peerPresenceLease ||
       !peerPresenceRecord ||
@@ -8108,6 +8175,77 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
     } catch {
       return false;
     }
+  };
+  const peerContext = async (
+    record: PeerLeadRecord,
+    ctx: ExtensionContext,
+    assignmentSnapshot?: Map<
+      string,
+      import("./supervision.ts").GlobalProjectAssignment[]
+    >,
+    requireFreshGroup = false,
+  ): Promise<import("./supervision.ts").PeerContext | undefined> => {
+    const role = record.role ?? "lead";
+    if (role === "manager") return { role: "manager" };
+    const socket = record.socket;
+    const assignments =
+      (assignmentSnapshot ?? globalProjectAssignmentSnapshot()).get(
+        record.piSessionId,
+      ) ?? [];
+    if (assignments.length > 1) return undefined;
+    if (assignments.length === 0 && !requireFreshGroup) {
+      return {
+        role: "lead",
+        socket,
+        group: record.group ?? null,
+        managed: false,
+      };
+    }
+    const localSession =
+      record.piSessionId === ctx.sessionManager.getSessionId();
+    const localSocket =
+      socket === (process.env.HERDR_SOCKET_PATH ?? "unknown-socket");
+    const scope = localSession
+      ? await currentWorktreeScope(ctx)
+      : localSocket && (record.group || requireFreshGroup)
+        ? await host.worktreeGroupScope(pi, ctx, record.workspaceId, ctx.signal)
+        : undefined;
+    // Same-socket peers are checked against live Herdr topology. For another
+    // socket, only its generation-bound published group and socket-scoped
+    // assignment store are available; Pi has no socket override primitive.
+    const group = scope
+      ? {
+          repoKey: scope.repoKey,
+          primaryWorkspaceId: scope.primaryWorkspaceId,
+        }
+      : !localSession && !localSocket && !requireFreshGroup
+        ? record.group
+        : undefined;
+    if (group === undefined) return undefined;
+    if (scope && !scope.workspaceIds.includes(record.workspaceId))
+      return undefined;
+    if (
+      record.group &&
+      (!group ||
+        group.repoKey !== record.group.repoKey ||
+        group.primaryWorkspaceId !== record.group.primaryWorkspaceId)
+    )
+      return undefined;
+    const assignment = assignments[0];
+    if (
+      assignment &&
+      (!group ||
+        assignment.assignment.repoKey !== group.repoKey ||
+        assignment.socketHash !==
+          createHash("sha256").update(socket).digest("hex"))
+    )
+      return undefined;
+    return {
+      role: "lead",
+      socket,
+      group,
+      managed: !!assignment,
+    };
   };
   const authorizePeerRecord = async (
     record: ChiefMessageRecord,
@@ -8131,11 +8269,25 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
     )
       return false;
     const target = await livePeerLead(ctx, record.toSessionId);
-    return (
-      !!target &&
-      (target.role ?? "lead") === activeRole() &&
-      target.piSessionId === record.toSessionId
+    if (
+      !target ||
+      (target.role ?? "lead") !== activeRole() ||
+      target.piSessionId !== record.toSessionId
+    )
+      return false;
+    const source = record.peerSource;
+    const assignmentSnapshot =
+      source?.role === "lead" ? globalProjectAssignmentSnapshot() : undefined;
+    const targetAssignments = assignmentSnapshot?.get(target.piSessionId) ?? [];
+    const recipientContext = await peerContext(
+      target,
+      ctx,
+      assignmentSnapshot,
+      source?.role === "lead" &&
+        (source.managed || targetAssignments.length > 0),
     );
+    if (!recipientContext || !source) return false;
+    return canMessagePeer(source, recipientContext);
   };
   const queuePeerRecord = async (
     text: string,
@@ -8187,6 +8339,35 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
       throw new Error(
         "Peer sender or target changed before the message was queued",
       );
+    const contextSnapshot =
+      (sender.role ?? "lead") === "manager" &&
+      (target.role ?? "lead") === "manager"
+        ? undefined
+        : globalProjectAssignmentSnapshot();
+    const senderAssignments = contextSnapshot?.get(sender.piSessionId) ?? [];
+    const targetAssignments = contextSnapshot?.get(target.piSessionId) ?? [];
+    const requireFreshGroup =
+      senderAssignments.length > 0 || targetAssignments.length > 0;
+    let senderContext = await peerContext(
+      sender,
+      ctx,
+      contextSnapshot,
+      requireFreshGroup,
+    );
+    let targetContext = await peerContext(
+      target,
+      ctx,
+      contextSnapshot,
+      requireFreshGroup,
+    );
+    if (
+      !senderContext ||
+      !targetContext ||
+      !canMessagePeer(senderContext, targetContext)
+    )
+      throw new Error(
+        "Peer is unavailable or outside the permitted project scope. Run `list_peers` again.",
+      );
     requireCompatibleBuild(
       HERDSMAN_BUILD,
       sender.build,
@@ -8199,9 +8380,6 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
       "peer_message",
       `peer ${target.piSessionId}`,
     );
-    // Best effort only: the target's held presence lock and the inbox
-    // message lock are independent process locks, so replacement can race
-    // after this reread and before durable publication.
     const record: ChiefMessageRecord = {
       version: 2,
       build: HERDSMAN_BUILD,
@@ -8211,12 +8389,62 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
       fromSessionId: sender.piSessionId,
       toSessionId: target.piSessionId,
       leadSessionId: sender.piSessionId,
+      peerSource: senderContext,
       text,
       ...(resultBindings.length ? { resultBindings: [...resultBindings] } : {}),
       createdAt,
     };
-    writeCoordinationMessage(record, peerRuntime());
-    return record;
+    const publish = (
+      snapshot?: Map<
+        string,
+        import("./supervision.ts").GlobalProjectAssignment[]
+      >,
+    ) => {
+      const currentSender = readPeerLeadRecord(
+        peerRuntime(),
+        sender.piSessionId,
+      );
+      const currentTarget = readPeerLeadRecord(
+        peerRuntime(),
+        target.piSessionId,
+      );
+      const stillCurrent = (
+        peer: PeerLeadRecord,
+        context: typeof senderContext,
+      ) => {
+        // Managers are globally eligible peers; ProjectAssignment only
+        // classifies Lead scope and is not a Manager authorization gate.
+        if (context.role === "manager") return true;
+        if (!snapshot) return false;
+        const matches = snapshot.get(peer.piSessionId) ?? [];
+        if (matches.length > 1 || !!matches.length !== context.managed)
+          return false;
+        if (!matches.length) return true;
+        return (
+          !!context.group &&
+          matches[0].assignment.repoKey === context.group.repoKey &&
+          matches[0].socketHash ===
+            createHash("sha256").update(peer.socket).digest("hex")
+        );
+      };
+      if (
+        !currentSender ||
+        !currentTarget ||
+        !samePeerLeadAuthority(currentSender, sender) ||
+        !samePeerLeadAuthority(currentTarget, target) ||
+        !stillCurrent(sender, senderContext) ||
+        !stillCurrent(target, targetContext) ||
+        !canMessagePeer(senderContext, targetContext)
+      )
+        throw new Error(
+          "Peer assignment changed before the message was queued",
+        );
+      writeCoordinationMessage(record, peerRuntime());
+      return record;
+    };
+    return senderContext.role === "manager" && targetContext.role === "manager"
+      ? publish()
+      : withProjectAssignmentAuthority(publish);
   };
 
   const queueChiefRecord = async (
@@ -8502,20 +8730,59 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
     const params = raw as PeerOperation;
     if (params.action === "list") {
       const self = ctx.sessionManager.getSessionId();
-      const peers = listPeerLeadRecords(peerRuntime())
-        .filter(
-          (record) =>
-            (record.role ?? "lead") === activeRole() &&
-            record.piSessionId !== self,
+      const assignmentSnapshot =
+        activeRole() === "manager"
+          ? undefined
+          : globalProjectAssignmentSnapshot();
+      const own = await livePeerLead(ctx, self);
+      const ownContext =
+        own &&
+        (await peerContext(
+          own,
+          ctx,
+          assignmentSnapshot,
+          (assignmentSnapshot?.get(self)?.length ?? 0) > 0,
+        ));
+      if (!ownContext)
+        throw new Error(
+          "Peer eligibility could not be verified; retry list_peers.",
+        );
+      const peers = [];
+      for (const record of listPeerLeadRecords(peerRuntime())) {
+        if (
+          (record.role ?? "lead") !== activeRole() ||
+          record.piSessionId === self
         )
-        .map((record) => ({
+          continue;
+        const candidateManaged =
+          (assignmentSnapshot?.get(record.piSessionId)?.length ?? 0) > 0;
+        const requireFreshGroup =
+          ownContext.role === "lead" &&
+          (ownContext.managed || candidateManaged);
+        const currentOwnContext = requireFreshGroup
+          ? await peerContext(own!, ctx, assignmentSnapshot, true)
+          : ownContext;
+        const context = await peerContext(
+          record,
+          ctx,
+          assignmentSnapshot,
+          requireFreshGroup,
+        ).catch(() => undefined);
+        if (
+          !context ||
+          !currentOwnContext ||
+          !canMessagePeer(currentOwnContext, context)
+        )
+          continue;
+        peers.push({
           session: record.piSessionId,
           name: record.name ?? `lead-${record.piSessionId.slice(0, 8)}`,
           cwd: record.cwd ?? "",
           repo: record.repo ?? "",
           branch: record.branch ?? "",
           workspace_label: record.workspaceLabel ?? "",
-        }));
+        });
+      }
       return {
         content: [{ type: "text", text: JSON.stringify({ self, peers }) }],
         details: { ok: true, action: "list", self, peers },
@@ -8534,6 +8801,11 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
       );
     const recordId = randomUUID();
     const createdAt = Date.now();
+    const submissionSource = await peerContext(sender, ctx);
+    if (!submissionSource)
+      throw new Error(
+        "Peer is unavailable or outside the permitted project scope. Run `list_peers` again.",
+      );
     const prepared = await prepareCoordinationInput(
       ctx,
       params.message,
@@ -8549,6 +8821,7 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
         fromSessionId: sender.piSessionId,
         toSessionId: target.piSessionId,
         leadSessionId: sender.piSessionId,
+        peerSource: submissionSource,
         text: candidate,
         ...(resultBindings.length
           ? { resultBindings: [...resultBindings] }
@@ -8689,6 +8962,7 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
     livePeerLead,
     currentPeerPresenceValid,
     authorizePeerRecord,
+    peerContext,
     queuePeerRecord,
     queueChiefRecord,
     enterCoordinationPublication,
@@ -8748,6 +9022,7 @@ export function createLeadInboxRuntime(host: LeadInboxHost) {
     appendDurableError,
     managerDiagnostic,
     authorizePeerRecord,
+    peerContext,
     assertCurrentLeadCoordination,
     currentChiefAuthority,
     currentManager,
@@ -9130,11 +9405,13 @@ export function createLeadInboxRuntime(host: LeadInboxHost) {
         leadRuntime.chiefMode !== transaction.role ||
         (transaction.role === "active" && chiefStartPreflightHeld(ctx)) ||
         (transaction.role === "inactive" &&
-          (!coordinationHealthy() || leadRuntime.roleSuspended))
+          (!coordinationHealthy() ||
+            (leadRuntime.roleSuspended && activeRole() !== "manager")))
       ) {
         throw new Error(`Stale inbox transaction (${phase})`);
       }
-      if (transaction.role === "inactive") assertCurrentLeadCoordination(ctx);
+      if (transaction.role === "inactive" && activeRole() !== "manager")
+        assertCurrentLeadCoordination(ctx);
     };
     const inboxOptions = (
       verifyLease: boolean,
@@ -9337,11 +9614,89 @@ export function createLeadInboxRuntime(host: LeadInboxHost) {
                   "Coordination authority changed before delivery",
                 );
             }
-            importResultBindings(pi, ctx, resultBindings, record.kind);
             if (messageDelivered(ctx, record)) return;
-            let result: void;
+            if (
+              record.kind === "peer_message" &&
+              !(await authorizePeerRecord(record, ctx))
+            )
+              throw new Error("Peer eligibility changed before delivery");
+            let result: void | Promise<void>;
             try {
-              result = pi.sendMessage(payload, options);
+              if (record.kind === "peer_message") {
+                const recipient = await livePeerLead(ctx, record.toSessionId);
+                const source = record.peerSource;
+                if (!recipient || !source)
+                  throw new Error("Peer eligibility changed before delivery");
+                const assignmentSnapshot =
+                  source.role === "lead"
+                    ? globalProjectAssignmentSnapshot()
+                    : undefined;
+                const recipientManaged =
+                  (assignmentSnapshot?.get(recipient.piSessionId)?.length ??
+                    0) > 0;
+                const recipientContext = await peerContext(
+                  recipient,
+                  ctx,
+                  assignmentSnapshot,
+                  source.role === "lead" &&
+                    (source.managed || recipientManaged),
+                );
+                if (
+                  !recipientContext ||
+                  !canMessagePeer(source, recipientContext)
+                )
+                  throw new Error("Peer eligibility changed before delivery");
+                let submitted: void | Promise<void>;
+                const submit = (
+                  snapshot?: Map<
+                    string,
+                    import("./supervision.ts").GlobalProjectAssignment[]
+                  >,
+                ) => {
+                  const current = readPeerLeadRecord(
+                    peerRuntime(),
+                    recipient.piSessionId,
+                  );
+                  const matches = snapshot?.get(recipient.piSessionId) ?? [];
+                  const assignment = matches[0];
+                  const contextCurrent =
+                    recipientContext.role === "manager"
+                      ? !snapshot
+                      : !!snapshot &&
+                        matches.length <= 1 &&
+                        !!matches.length === recipientContext.managed &&
+                        (!assignment ||
+                          (!!recipientContext.group &&
+                            assignment.assignment.repoKey ===
+                              recipientContext.group.repoKey &&
+                            assignment.socketHash ===
+                              createHash("sha256")
+                                .update(recipient.socket)
+                                .digest("hex")));
+                  if (
+                    !current ||
+                    !samePeerLeadAuthority(current, recipient) ||
+                    current.group?.repoKey !== recipient.group?.repoKey ||
+                    current.group?.primaryWorkspaceId !==
+                      recipient.group?.primaryWorkspaceId ||
+                    !contextCurrent ||
+                    !canMessagePeer(source, recipientContext)
+                  )
+                    throw new Error("Peer eligibility changed before delivery");
+                  importResultBindings(pi, ctx, resultBindings, record.kind);
+                  submitted = pi.sendMessage(payload, options);
+                };
+                if (
+                  source.role === "manager" &&
+                  recipientContext.role === "manager"
+                )
+                  submit();
+                else withProjectAssignmentAuthority(submit);
+                result = submitted;
+              } else {
+                importResultBindings(pi, ctx, resultBindings, record.kind);
+                result = pi.sendMessage(payload, options);
+              }
             } catch (error) {
               submittedAt.delete(record.id);
               settledSubmissions.delete(record.id);

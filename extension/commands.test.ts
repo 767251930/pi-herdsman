@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createServer } from "node:net";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { mock, test, type TestContext } from "node:test";
 import packageMetadata from "../package.json" with { type: "json" };
@@ -24,6 +24,7 @@ import type {
 import { acquireProcessLock, claimProcessLock } from "./lock.ts";
 import {
   claimChiefLease as claimChiefLeaseRaw,
+  globalProjectAssignmentSnapshot,
   listProjectAssignments,
   projectAssignmentPath,
   listCoordinationMessagePaths,
@@ -42,6 +43,7 @@ import {
   sessionLeadRoleState,
   writeLeadCoordinationState as writeLeadCoordinationStateRaw,
   writeProjectAssignment,
+  removeProjectAssignment,
   writeChiefMessage as writeChiefMessageRaw,
   writeCoordinationMessage as writeCoordinationMessageRaw,
   writePeerLeadRecord as writePeerLeadRecordRaw,
@@ -53,6 +55,25 @@ import {
   createLeadCommandRuntime,
   createLeadProjectRuntime,
 } from "./lead-runtime.ts";
+
+const peerTopologyExec = (_command: string, args: string[]) =>
+  args[0] === "worktree" && args[1] === "list"
+    ? {
+        stdout: JSON.stringify({
+          id: AGENT_ID,
+          result: {
+            source: {
+              repo_key: "peer-test-repo",
+              repo_name: "peer-test-repo",
+              source_workspace_id: WORKSPACE,
+            },
+            worktrees: [],
+          },
+        }),
+        stderr: "",
+        code: 0,
+      }
+    : { stdout: "{}", stderr: "", code: 0 };
 import support, {
   CHILD_SESSION_ID,
   DEFAULT_PI_SESSION_ID,
@@ -433,6 +454,52 @@ test("Manager transitions and mode changes preserve the ordinary Lead baseline",
     assert.deepEqual(pi.pi.getActiveTools(), leadTools);
     await pi.commandOptions.get("manager").handler("", context);
     assert.deepEqual(pi.pi.getActiveTools(), [...baseline, ...managerTools]);
+    const targetId = `manager-peer-${randomUUID()}`;
+    const targetLease = acquireProcessLock(
+      peerLeadLockPath(peerRuntime(), targetId),
+      { name: "Lead peer presence" },
+    );
+    writePeerLeadRecordRaw(peerRuntime(), {
+      version: 2,
+      build: HERDSMAN_BUILD,
+      piSessionId: targetId,
+      paneId: "other-manager-pane",
+      tabId: "other-manager-tab",
+      workspaceId: WORKSPACE,
+      socket: join(tmpdir(), `other-manager-${randomUUID()}.sock`),
+      role: "manager",
+      claim: targetLease.claim,
+      updatedAt: Date.now(),
+    });
+    try {
+      const peers = pi.tools.find((tool) => tool.name === "list_peers")!;
+      const message = pi.tools.find((tool) => tool.name === "message_peer")!;
+      assert.equal(
+        JSON.parse(
+          (await peers.execute("list", {}, undefined, undefined, context))
+            .content[0].text,
+        ).peers.some((peer: { session: string }) => peer.session === targetId),
+        true,
+      );
+      await message.execute(
+        "message",
+        { session: targetId, message: "Manager peer" },
+        undefined,
+        undefined,
+        context,
+      );
+      const queued = listCoordinationMessagePaths(peerRuntime(), targetId);
+      assert.equal(queued.length, 1);
+      assert.equal(readChiefMessage(queued[0]).peerSource?.role, "manager");
+      removeChiefMessage(
+        peerRuntime(),
+        targetId,
+        readChiefMessage(queued[0]).id,
+      );
+    } finally {
+      targetLease.release();
+      removePeerLeadRecord(peerRuntime(), targetId);
+    }
     await pi.commandOptions.get("lead").handler("flexible", context);
     assert.deepEqual(pi.pi.getActiveTools(), [...baseline, ...managerTools]);
     assert.deepEqual(sessionLeadExecutionState(pi.entries), {
@@ -472,6 +539,311 @@ test("Manager transitions and mode changes preserve the ordinary Lead baseline",
     delete process.env.HERDR_PANE_ID;
     delete process.env.HERDR_TAB_ID;
     rmSync(managerOverride, { force: true });
+  }
+});
+
+test("ordinary Leads deliver peer messages across non-Git sockets", async (t) => {
+  setLeadEnvironment();
+  const runtime = peerRuntime();
+  const leads = ["sender", "recipient"].map((name) => ({
+    sessionId: `${name}-${randomUUID()}`,
+    paneId: `${name}-pane-${randomUUID()}`,
+    tabId: `${name}-tab-${randomUUID()}`,
+    workspaceId: `${name}-workspace-${randomUUID()}`,
+    socket: join(tmpdir(), `${name}-${randomUUID()}.sock`),
+  }));
+  const recipientEntries: unknown[] = [];
+  const fixtures = leads.map((lead, index) => {
+    const pi = fakeChiefPi({
+      activeTools: ["read", "bash"],
+      ...(index === 1
+        ? {
+            entries: recipientEntries,
+            sendMessage: (message: unknown) => recipientEntries.push(message),
+          }
+        : {}),
+    });
+    const context = fakeContext(pi.entries) as any;
+    const notices: string[] = [];
+    context.ui.notify = (message: string) => notices.push(message);
+    context.sessionManager = {
+      ...context.sessionManager,
+      getSessionId: () => lead.sessionId,
+    };
+    return { pi, context };
+  });
+  const setEnvironment = (lead: (typeof leads)[number]) => {
+    process.env.HERDR_PANE_ID = lead.paneId;
+    process.env.HERDR_TAB_ID = lead.tabId;
+    process.env.HERDR_SOCKET_PATH = lead.socket;
+    process.env.HERDR_WORKSPACE_ID = lead.workspaceId;
+  };
+  try {
+    for (let index = 0; index < leads.length; index++) {
+      setEnvironment(leads[index]!);
+      registerExtension!(fixtures[index]!.pi.pi as never);
+      await fixtures[index]!.pi.events.get("session_start")![0](
+        undefined,
+        fixtures[index]!.context,
+      );
+      await fixtures[index]!.pi.commandOptions.get("lead").handler(
+        "orchestrate",
+        fixtures[index]!.context,
+      );
+    }
+
+    for (const lead of leads) {
+      assert.equal(readPeerLeadRecord(runtime, lead.sessionId)?.group, null);
+    }
+    const assignmentSnapshot = globalProjectAssignmentSnapshot();
+    for (const lead of leads) {
+      assert.equal(assignmentSnapshot.get(lead.sessionId)?.length ?? 0, 0);
+    }
+    const sender = fixtures[0]!;
+    await sender.pi.tools
+      .find((tool) => tool.name === "message_peer")!
+      .execute(
+        "message",
+        { session: leads[1]!.sessionId, message: "ordinary non-Git message" },
+        undefined,
+        undefined,
+        sender.context,
+      );
+    assert.equal(
+      listCoordinationMessagePaths(runtime, leads[1]!.sessionId).length,
+      1,
+    );
+
+    setEnvironment(leads[1]!);
+    await t.waitFor(
+      () => {
+        assert.deepEqual(
+          listCoordinationMessagePaths(runtime, leads[1]!.sessionId),
+          [],
+        );
+        assert.equal(
+          fixtures[1]!.pi.sentMessageCalls.filter((call) =>
+            String((call.message as any)?.content ?? "").includes(
+              "ordinary non-Git message",
+            ),
+          ).length,
+          1,
+        );
+      },
+      { timeout: 5000 },
+    );
+  } finally {
+    for (let index = leads.length - 1; index >= 0; index--) {
+      setEnvironment(leads[index]!);
+      await fixtures[index]!.pi.events.get("session_shutdown")?.[0]();
+    }
+    delete process.env.HERDR_SOCKET_PATH;
+    delete process.env.HERDR_PANE_ID;
+    delete process.env.HERDR_TAB_ID;
+    delete process.env.HERDR_WORKSPACE_ID;
+  }
+});
+
+test("Manager peer messages deliver to a live Manager without changing its role", async (t) => {
+  setLeadEnvironment();
+  const runtime = peerRuntime();
+  const malformedRuntime = supervisionRuntime(
+    join(tmpdir(), `unrelated-${randomUUID()}.sock`),
+  );
+  const malformedAssignment = projectAssignmentPath(
+    malformedRuntime,
+    `unrelated-${randomUUID()}`,
+    "main",
+  );
+  mkdirSync(dirname(malformedAssignment), { recursive: true });
+  writeFileSync(malformedAssignment, "{broken", "utf8");
+  const managers = [
+    {
+      sessionId: `manager-sender-${randomUUID()}`,
+      paneId: `manager-sender-pane-${randomUUID()}`,
+      tabId: `manager-sender-tab-${randomUUID()}`,
+      workspaceId: `manager-sender-workspace-${randomUUID()}`,
+      socket: join(tmpdir(), `manager-sender-${randomUUID()}.sock`),
+    },
+    {
+      sessionId: `manager-recipient-${randomUUID()}`,
+      paneId: `manager-recipient-pane-${randomUUID()}`,
+      tabId: `manager-recipient-tab-${randomUUID()}`,
+      workspaceId: `manager-recipient-workspace-${randomUUID()}`,
+      socket: join(tmpdir(), `manager-recipient-${randomUUID()}.sock`),
+    },
+  ];
+  const recipientEntries: unknown[] = [];
+  const respond = (result: unknown) => ({
+    stdout: JSON.stringify({ id: AGENT_ID, result }),
+    stderr: "",
+    code: 0,
+  });
+  const makeFixture = (
+    manager: (typeof managers)[number],
+    recipient: boolean,
+  ) => {
+    const identity = {
+      pane_id: manager.paneId,
+      tab_id: manager.tabId,
+      workspace_id: manager.workspaceId,
+      agent_session: {
+        source: "herdr:pi",
+        agent: "pi",
+        kind: "id",
+        value: manager.sessionId,
+      },
+    };
+    const pi = fakeChiefPi({
+      entries: recipient ? recipientEntries : undefined,
+      activeTools: ["read", "bash"],
+      exec: (_command, args) =>
+        args[0] === "workspace" && args[1] === "get"
+          ? respond({
+              workspace: { worktree: { repo_key: manager.workspaceId } },
+            })
+          : args[0] === "worktree" && args[1] === "list"
+            ? respond({
+                source: {
+                  source_workspace_id: manager.workspaceId,
+                  repo_key: manager.workspaceId,
+                  repo_name: manager.workspaceId,
+                  source_checkout_path: manager.workspaceId,
+                },
+                worktrees: [],
+              })
+            : isAgentList(args)
+              ? respond({ agents: [identity] })
+              : args[0] === "agent" && args[1] === "get"
+                ? respond({ agent: identity })
+                : isApiSnapshot(args)
+                  ? respond({ snapshot: { agents: [], panes: [] } })
+                  : respond({}),
+      ...(recipient
+        ? {
+            sendMessage: (message: unknown) => recipientEntries.push(message),
+          }
+        : {}),
+    });
+    const context = fakeContext(pi.entries) as any;
+    const notices: string[] = [];
+    context.ui.notify = (message: string) => notices.push(message);
+    context.sessionManager = {
+      ...context.sessionManager,
+      getSessionId: () => manager.sessionId,
+    };
+    return { pi, context, notices };
+  };
+  const [senderManager, recipientManager] = managers;
+  const recipient = makeFixture(recipientManager!, true);
+  const sender = makeFixture(senderManager!, false);
+  process.env.HERDR_PANE_ID = recipientManager!.paneId;
+  process.env.HERDR_TAB_ID = recipientManager!.tabId;
+  process.env.HERDR_SOCKET_PATH = recipientManager!.socket;
+  process.env.HERDR_WORKSPACE_ID = recipientManager!.workspaceId;
+  registerExtension!(recipient.pi.pi as never);
+  process.env.HERDR_PANE_ID = senderManager!.paneId;
+  process.env.HERDR_TAB_ID = senderManager!.tabId;
+  process.env.HERDR_SOCKET_PATH = senderManager!.socket;
+  process.env.HERDR_WORKSPACE_ID = senderManager!.workspaceId;
+  registerExtension!(sender.pi.pi as never);
+  const enterManager = async (
+    manager: (typeof managers)[number],
+    fixture: ReturnType<typeof makeFixture>,
+  ) => {
+    process.env.HERDR_PANE_ID = manager.paneId;
+    process.env.HERDR_TAB_ID = manager.tabId;
+    process.env.HERDR_SOCKET_PATH = manager.socket;
+    process.env.HERDR_WORKSPACE_ID = manager.workspaceId;
+    await fixture.pi.events.get("session_start")![0](
+      undefined,
+      fixture.context,
+    );
+    await fixture.pi.commandOptions
+      .get("lead")
+      .handler("orchestrate", fixture.context);
+    await fixture.pi.commandOptions.get("manager").handler("", fixture.context);
+    assert.ok(
+      fixture.pi.pi.getActiveTools().includes("list_staff"),
+      `${manager.sessionId} did not enter Manager: ${fixture.notices.join("; ")}`,
+    );
+  };
+  try {
+    await enterManager(recipientManager!, recipient);
+    await enterManager(senderManager!, sender);
+
+    const peers = sender.pi.tools.find((tool) => tool.name === "list_peers")!;
+    const listed = JSON.parse(
+      (await peers.execute("list", {}, undefined, undefined, sender.context))
+        .content[0].text,
+    );
+    assert.ok(
+      listed.peers.some(
+        (peer: { session: string }) =>
+          peer.session === recipientManager!.sessionId,
+      ),
+      JSON.stringify(listed),
+    );
+    assert.equal(
+      readPeerLeadRecord(runtime, recipientManager!.sessionId)?.role,
+      "manager",
+    );
+    await sender.pi.tools
+      .find((tool) => tool.name === "message_peer")!
+      .execute(
+        "message",
+        { session: recipientManager!.sessionId, message: "manager queued" },
+        undefined,
+        undefined,
+        sender.context,
+      );
+    assert.equal(
+      listCoordinationMessagePaths(runtime, recipientManager!.sessionId).length,
+      1,
+    );
+
+    process.env.HERDR_PANE_ID = recipientManager!.paneId;
+    process.env.HERDR_TAB_ID = recipientManager!.tabId;
+    process.env.HERDR_SOCKET_PATH = recipientManager!.socket;
+    process.env.HERDR_WORKSPACE_ID = recipientManager!.workspaceId;
+    await t.waitFor(
+      () => {
+        assert.equal(
+          recipient.pi.sentMessageCalls.filter((call) =>
+            String((call.message as any)?.content ?? "").includes(
+              "manager queued",
+            ),
+          ).length,
+          1,
+        );
+        assert.deepEqual(
+          listCoordinationMessagePaths(runtime, recipientManager!.sessionId),
+          [],
+        );
+      },
+      { timeout: 5000 },
+    );
+    assert.ok(recipient.pi.pi.getActiveTools().includes("list_staff"));
+    assert.deepEqual(
+      listCoordinationMessagePaths(runtime, recipientManager!.sessionId),
+      [],
+    );
+  } finally {
+    for (const [manager, fixture] of [
+      [senderManager!, sender],
+      [recipientManager!, recipient],
+    ] as const) {
+      process.env.HERDR_PANE_ID = manager.paneId;
+      process.env.HERDR_TAB_ID = manager.tabId;
+      process.env.HERDR_SOCKET_PATH = manager.socket;
+      process.env.HERDR_WORKSPACE_ID = manager.workspaceId;
+      await fixture.pi.events.get("session_shutdown")?.[0]();
+    }
+    delete process.env.HERDR_SOCKET_PATH;
+    delete process.env.HERDR_PANE_ID;
+    delete process.env.HERDR_TAB_ID;
+    rmSync(malformedAssignment, { force: true });
+    setLeadEnvironment();
   }
 });
 
@@ -723,12 +1095,28 @@ const writeChiefMessage = (record: any, runtime?: any) =>
   );
 const writeCoordinationMessage = (record: any, runtime?: any) =>
   writeCoordinationMessageRaw(
-    { ...record, build: record.build ?? HERDSMAN_BUILD },
+    {
+      ...record,
+      build: record.build ?? HERDSMAN_BUILD,
+      ...(record.kind === "peer_message"
+        ? {
+            peerSource: record.peerSource ?? {
+              role: "lead",
+              socket: "/test-socket",
+              group: { repoKey: "test-repo", primaryWorkspaceId: "workspace" },
+              managed: false,
+            },
+          }
+        : {}),
+    },
     runtime,
   );
 const writePeerLeadRecord = (runtime: any, record: any) =>
   writePeerLeadRecordRaw(runtime, {
     ...record,
+    version: 2,
+    socket: record.socket ?? "/test-socket",
+    group: record.group ?? null,
     build: record.build ?? HERDSMAN_BUILD,
   });
 const { readConfig, updateConfig } = await import("./config.ts");
@@ -5621,6 +6009,7 @@ test("queued peer traffic stays durable through Chief mode and drains after leav
   const entries: unknown[] = [];
   const delivered = testGate<void>();
   const receiver = fakeChiefPi({
+    exec: peerTopologyExec,
     entries,
     sendMessage: (message) => {
       if (String((message as any)?.content ?? "").includes("queued peer")) {
@@ -5644,11 +6033,15 @@ test("queued peer traffic stays durable through Chief mode and drains after leav
     name: "Lead peer presence",
   });
   const senderRecord = {
-    version: 1 as const,
+    version: 2 as const,
+    build: HERDSMAN_BUILD,
+    role: "lead" as const,
     piSessionId: senderId,
     paneId: "sender-pane",
     tabId: "sender-tab",
     workspaceId: WORKSPACE,
+    socket,
+    group: { repoKey: "peer-test-repo", primaryWorkspaceId: WORKSPACE },
     claim: senderLease.claim,
     updatedAt: Date.now(),
   };
@@ -5665,6 +6058,12 @@ test("queued peer traffic stays durable through Chief mode and drains after leav
       fromSessionId: senderId,
       toSessionId: receiverId,
       leadSessionId: senderId,
+      peerSource: {
+        role: "lead" as const,
+        socket,
+        group: { repoKey: "peer-test-repo", primaryWorkspaceId: WORKSPACE },
+        managed: false,
+      },
       text: "queued peer",
       createdAt: Date.now(),
     };
@@ -5708,7 +6107,10 @@ test("peer delivery survives sender shutdown and is accepted exactly once", asyn
   process.env.HERDR_SOCKET_PATH = socket;
   process.env.HERDR_PANE_ID = "sender-pane";
   process.env.HERDR_TAB_ID = "sender-tab";
-  const sender = fakeChiefPi({ activeTools: ["read", "bash"] });
+  const sender = fakeChiefPi({
+    activeTools: ["read", "bash"],
+    exec: peerTopologyExec,
+  });
   const senderContext = fakeContext() as any;
   senderContext.sessionManager = {
     ...senderContext.sessionManager,
@@ -5720,12 +6122,14 @@ test("peer delivery survives sender shutdown and is accepted exactly once", asyn
     name: "Lead peer presence",
   });
   const targetRecord = {
-    version: 1 as const,
+    version: 2 as const,
     build: OTHER_HERDSMAN_BUILD,
     piSessionId: targetId,
     paneId: "target-pane",
     tabId: "target-tab",
     workspaceId: WORKSPACE,
+    socket,
+    group: { repoKey: "peer-test-repo", primaryWorkspaceId: WORKSPACE },
     claim: targetLease.claim,
     updatedAt: Date.now(),
   };
@@ -5775,6 +6179,7 @@ test("peer delivery survives sender shutdown and is accepted exactly once", asyn
     const delivered = testGate<void>();
     const receiver = fakeChiefPi({
       entries,
+      exec: peerTopologyExec,
       sendMessage: (message) => {
         if (
           String((message as any)?.content ?? "").includes("sender survived")
@@ -5818,6 +6223,453 @@ test("peer delivery survives sender shutdown and is accepted exactly once", asyn
     try {
       targetLease.release();
     } catch {}
+    delete process.env.HERDR_SOCKET_PATH;
+    delete process.env.HERDR_PANE_ID;
+    delete process.env.HERDR_TAB_ID;
+    setLeadEnvironment();
+  }
+});
+
+test("peer delivery preserves queued sender assignment context", async (t) => {
+  for (const scenario of [
+    {
+      name: "managed sender takeover",
+      queuedManaged: true,
+      assignSender: false,
+    },
+    {
+      name: "ordinary sender assigned later",
+      queuedManaged: false,
+      assignSender: true,
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      setLeadEnvironment();
+      const socket = join(tmpdir(), `peer-sender-context-${randomUUID()}.sock`);
+      const receiverId = randomUUID();
+      const senderId = randomUUID();
+      const group = {
+        repoKey: "peer-test-repo",
+        primaryWorkspaceId: WORKSPACE,
+      };
+      process.env.HERDR_SOCKET_PATH = socket;
+      process.env.HERDR_PANE_ID = "receiver-pane";
+      process.env.HERDR_TAB_ID = "receiver-tab";
+      const runtime = peerRuntime();
+      const branch = `peer-${randomUUID()}`;
+      const senderLease = acquireProcessLock(
+        peerLeadLockPath(runtime, senderId),
+        {
+          name: "Lead peer presence",
+        },
+      );
+      writePeerLeadRecord(runtime, {
+        version: 2,
+        build: HERDSMAN_BUILD,
+        role: "lead",
+        piSessionId: senderId,
+        paneId: "sender-pane",
+        tabId: "sender-tab",
+        workspaceId: WORKSPACE,
+        socket,
+        group,
+        claim: senderLease.claim,
+        updatedAt: Date.now(),
+      });
+      writeProjectAssignment(supervisionRuntime(), {
+        version: 2,
+        id: receiverId,
+        repoKey: group.repoKey,
+        branch: `receiver-${branch}`,
+        text: "managed peer receiver",
+      });
+      if (scenario.queuedManaged)
+        writeProjectAssignment(supervisionRuntime(), {
+          version: 2,
+          id: senderId,
+          repoKey: group.repoKey,
+          branch,
+          text: "sender before takeover",
+        });
+
+      const entries: unknown[] = [];
+      const receiver = fakeChiefPi({
+        entries,
+        exec: peerTopologyExec,
+        sendMessage: (message) => entries.push(message),
+        activeTools: ["read", "bash"],
+      });
+      const context = fakeContext(entries) as any;
+      context.sessionManager = {
+        ...context.sessionManager,
+        getSessionId: () => receiverId,
+      };
+      registerExtension!(receiver.pi as never);
+      try {
+        await receiver.events.get("session_start")![0](undefined, context);
+        await t.waitFor(() =>
+          assert.ok(readPeerLeadRecord(runtime, receiverId)),
+        );
+        const record = {
+          version: 2 as const,
+          build: HERDSMAN_BUILD,
+          id: randomUUID(),
+          leaseId: senderLease.claim.id,
+          kind: "peer_message" as const,
+          fromSessionId: senderId,
+          toSessionId: receiverId,
+          leadSessionId: senderId,
+          peerSource: {
+            role: "lead" as const,
+            socket,
+            group,
+            managed: scenario.queuedManaged,
+          },
+          text: `sender context ${scenario.name}`,
+          createdAt: Date.now(),
+        };
+        writeCoordinationMessage(record, runtime);
+        if (scenario.assignSender)
+          writeProjectAssignment(supervisionRuntime(), {
+            version: 2,
+            id: senderId,
+            repoKey: group.repoKey,
+            branch,
+            text: "sender assigned after queueing",
+          });
+        else
+          removeProjectAssignment(supervisionRuntime(), group.repoKey, branch);
+        await receiver.commandOptions.get("chief").handler("", context);
+        await receiver.commandOptions.get("chief").handler("leave", context);
+        await t.waitFor(
+          () => {
+            assert.deepEqual(
+              listCoordinationMessagePaths(runtime, receiverId),
+              [],
+            );
+          },
+          { timeout: 5000 },
+        );
+        assert.equal(
+          receiver.sentMessageCalls.filter((call) =>
+            String((call.message as any)?.content ?? "").includes(record.text),
+          ).length,
+          1,
+        );
+      } finally {
+        await receiver.events.get("session_shutdown")?.[0]();
+        removeProjectAssignment(supervisionRuntime(), group.repoKey, branch);
+        removeProjectAssignment(
+          supervisionRuntime(),
+          group.repoKey,
+          `receiver-${branch}`,
+        );
+        removePeerLeadRecord(runtime, senderId);
+        senderLease.release();
+        delete process.env.HERDR_SOCKET_PATH;
+        delete process.env.HERDR_PANE_ID;
+        delete process.env.HERDR_TAB_ID;
+        setLeadEnvironment();
+      }
+    });
+  }
+});
+
+test("peer delivery rejects same-generation recipient provenance changes before send", async (t) => {
+  setLeadEnvironment();
+  const socket = join(tmpdir(), `peer-authority-delivery-${randomUUID()}.sock`);
+  const targetId = randomUUID();
+  process.env.HERDR_SOCKET_PATH = socket;
+  process.env.HERDR_PANE_ID = "target-pane";
+  process.env.HERDR_TAB_ID = "target-tab";
+  process.env.HERDR_WORKSPACE_ID = WORKSPACE;
+  const runtime = peerRuntime();
+  const entries: unknown[] = [];
+  const releaseTopology = testGate<void>();
+  let topologyCalls = 0;
+  let gateSecondTopology = false;
+  let secondTopologyStarted = false;
+  const receiver = fakeChiefPi({
+    entries,
+    exec: async (command, args) => {
+      if (args[0] === "worktree" && args[1] === "list") {
+        topologyCalls++;
+        if (gateSecondTopology && topologyCalls === 2) {
+          secondTopologyStarted = true;
+          await releaseTopology.promise;
+        }
+        return peerTopologyExec(command, args);
+      }
+      return { stdout: "{}", stderr: "", code: 0 };
+    },
+    activeTools: ["read", "bash"],
+  });
+  const context = fakeContext(entries) as any;
+  context.sessionManager = {
+    ...context.sessionManager,
+    getSessionId: () => targetId,
+  };
+  const senderId = randomUUID();
+  const group = { repoKey: "peer-test-repo", primaryWorkspaceId: WORKSPACE };
+  const message = {
+    version: 2 as const,
+    build: HERDSMAN_BUILD,
+    id: randomUUID(),
+    leaseId: randomUUID(),
+    kind: "peer_message" as const,
+    fromSessionId: senderId,
+    toSessionId: targetId,
+    leadSessionId: senderId,
+    peerSource: { role: "lead" as const, socket, group, managed: true },
+    text: "must not deliver after recipient authority changes",
+    createdAt: Date.now(),
+  };
+  registerExtension!(receiver.pi as never);
+  try {
+    await receiver.events.get("session_start")![0](undefined, context);
+    await t.waitFor(() => {
+      assert.ok(readPeerLeadRecord(runtime, targetId));
+    });
+    topologyCalls = 0;
+    gateSecondTopology = true;
+    writeCoordinationMessageRaw(message, runtime);
+    await t.waitFor(() => assert.equal(secondTopologyStarted, true), {
+      timeout: 5000,
+    });
+    const before = readPeerLeadRecord(runtime, targetId);
+    assert.ok(before);
+    const beforeClaim = before.claim;
+    writePeerLeadRecordRaw(runtime, {
+      ...before,
+      group: { repoKey: "peer-other-repo", primaryWorkspaceId: "other" },
+      updatedAt: Date.now(),
+    });
+    assert.deepEqual(readPeerLeadRecord(runtime, targetId)?.claim, beforeClaim);
+    releaseTopology.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(listCoordinationMessagePaths(runtime, targetId).length, 1);
+    assert.equal(
+      receiver.sentMessageCalls.some((call) =>
+        String((call.message as any)?.content ?? "").includes(
+          "must not deliver after recipient authority changes",
+        ),
+      ),
+      false,
+    );
+  } finally {
+    releaseTopology.resolve();
+    await receiver.events.get("session_shutdown")?.[0]();
+    delete process.env.HERDR_SOCKET_PATH;
+    delete process.env.HERDR_PANE_ID;
+    delete process.env.HERDR_TAB_ID;
+    delete process.env.HERDR_WORKSPACE_ID;
+    setLeadEnvironment();
+  }
+});
+
+test("managed peer scope loss rejects stale local group and defers transient failure", async (t) => {
+  setLeadEnvironment();
+  const socket = join(tmpdir(), `peer-current-group-${randomUUID()}.sock`);
+  const receiverId = randomUUID();
+  process.env.HERDR_SOCKET_PATH = socket;
+  process.env.HERDR_PANE_ID = "receiver-pane";
+  process.env.HERDR_TAB_ID = "receiver-tab";
+  const entries: unknown[] = [];
+  let topology: "available" | "not-git" | "unavailable" | "moved" = "available";
+  const receiver = fakeChiefPi({
+    entries,
+    exec: (_command, args) =>
+      args[0] === "worktree" && args[1] === "list" && topology === "not-git"
+        ? nonGitWorkspaceResponse()
+        : args[0] === "worktree" &&
+            args[1] === "list" &&
+            topology === "unavailable"
+          ? { stdout: "", stderr: "temporary Herdr outage", code: 1 }
+          : args[0] === "worktree" && args[1] === "list" && topology === "moved"
+            ? {
+                stdout: JSON.stringify({
+                  id: AGENT_ID,
+                  result: {
+                    source: {
+                      repo_key: "peer-other-repo",
+                      repo_name: "peer-other-repo",
+                      source_workspace_id: "other-primary",
+                    },
+                    worktrees: [{ open_workspace_id: WORKSPACE }],
+                  },
+                }),
+                stderr: "",
+                code: 0,
+              }
+            : args[0] === "worktree" && args[1] === "list"
+              ? {
+                  stdout: JSON.stringify({
+                    id: AGENT_ID,
+                    result: {
+                      source: {
+                        repo_key: "peer-test-repo",
+                        repo_name: "peer-test-repo",
+                        source_workspace_id: "new-primary",
+                      },
+                      worktrees: [{ open_workspace_id: WORKSPACE }],
+                    },
+                  }),
+                  stderr: "",
+                  code: 0,
+                }
+              : { stdout: "{}", stderr: "", code: 0 },
+    activeTools: ["read", "bash"],
+  });
+  const context = fakeContext(entries) as any;
+  context.sessionManager = {
+    ...context.sessionManager,
+    getSessionId: () => receiverId,
+  };
+  const runtime = peerRuntime();
+  const senderTargetId = `target-${randomUUID()}`;
+  const senderTargetLease = acquireProcessLock(
+    peerLeadLockPath(runtime, senderTargetId),
+    { name: "Lead peer presence" },
+  );
+  writePeerLeadRecordRaw(runtime, {
+    version: 2,
+    build: HERDSMAN_BUILD,
+    piSessionId: senderTargetId,
+    paneId: "target-pane",
+    tabId: "target-tab",
+    workspaceId: WORKSPACE,
+    socket,
+    group: { repoKey: "peer-test-repo", primaryWorkspaceId: "new-primary" },
+    claim: senderTargetLease.claim,
+    updatedAt: Date.now(),
+  });
+  const managedBranch = `peer-${randomUUID()}`;
+  writeProjectAssignment(supervisionRuntime(), {
+    version: 2,
+    id: receiverId,
+    repoKey: "peer-test-repo",
+    branch: managedBranch,
+    text: "managed peer scope test",
+  });
+  const record = {
+    version: 2 as const,
+    build: HERDSMAN_BUILD,
+    id: randomUUID(),
+    leaseId: randomUUID(),
+    kind: "peer_message" as const,
+    fromSessionId: `sender-${randomUUID()}`,
+    toSessionId: receiverId,
+    leadSessionId: "",
+    peerSource: {
+      role: "lead" as const,
+      socket,
+      group: { repoKey: "peer-test-repo", primaryWorkspaceId: "new-primary" },
+      managed: true,
+    },
+    resultBindings: [
+      { ref: "result:peer-review#1", canonicalRef: `result:${randomUUID()}` },
+    ],
+    text: "must not cross the changed worktree group",
+    createdAt: Date.now(),
+  };
+  record.leadSessionId = record.fromSessionId;
+  writeCoordinationMessageRaw(record, runtime);
+  registerExtension!(receiver.pi as never);
+  try {
+    topology = "not-git";
+    await receiver.events.get("session_start")![0](undefined, context);
+    await assert.rejects(
+      receiver.tools
+        .find((tool) => tool.name === "list_peers")!
+        .execute("list", {}, undefined, undefined, context),
+      /Peer eligibility could not be verified/,
+    );
+    await assert.rejects(
+      receiver.tools
+        .find((tool) => tool.name === "message_peer")!
+        .execute(
+          "message",
+          { session: senderTargetId, message: "must not queue" },
+          undefined,
+          undefined,
+          context,
+        ),
+      /outside the permitted project scope/,
+    );
+    await t.waitFor(
+      () =>
+        assert.deepEqual(listCoordinationMessagePaths(runtime, receiverId), []),
+      { timeout: 5000 },
+    );
+    assert.equal(
+      receiver.sentMessageCalls.some((call) =>
+        String((call.message as any)?.content ?? "").includes(
+          "must not cross the changed worktree group",
+        ),
+      ),
+      false,
+    );
+
+    topology = "moved";
+    removeProjectAssignment(
+      supervisionRuntime(),
+      "peer-test-repo",
+      managedBranch,
+    );
+    writeCoordinationMessageRaw(
+      {
+        ...record,
+        id: randomUUID(),
+        text: "ordinary recipient moved to another group",
+        createdAt: Date.now(),
+      },
+      runtime,
+    );
+    await t.waitFor(
+      () =>
+        assert.deepEqual(listCoordinationMessagePaths(runtime, receiverId), []),
+      { timeout: 5000 },
+    );
+    assert.equal(
+      receiver.sentMessageCalls.some((call) =>
+        String((call.message as any)?.content ?? "").includes(
+          "ordinary recipient moved to another group",
+        ),
+      ),
+      false,
+    );
+    assert.equal(
+      entries.some(
+        (entry: any) =>
+          entry?.customType === "pi-herdsman-result-ref" &&
+          entry?.data?.ref === "result:peer-review#1",
+      ),
+      false,
+    );
+    topology = "unavailable";
+    writeCoordinationMessageRaw(
+      {
+        ...record,
+        id: randomUUID(),
+        text: "defer while current scope is unavailable",
+        createdAt: Date.now(),
+      },
+      runtime,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(listCoordinationMessagePaths(runtime, receiverId).length, 1);
+    assert.equal(
+      receiver.sentMessageCalls.some((call) =>
+        String((call.message as any)?.content ?? "").includes(
+          "defer while current scope is unavailable",
+        ),
+      ),
+      false,
+    );
+  } finally {
+    await receiver.events.get("session_shutdown")?.[0]();
+    removePeerLeadRecord(runtime, senderTargetId);
+    senderTargetLease.release();
     delete process.env.HERDR_SOCKET_PATH;
     delete process.env.HERDR_PANE_ID;
     delete process.env.HERDR_TAB_ID;
