@@ -228,7 +228,7 @@ test("chief message admission accepts exactly 8 KiB and rejects the next byte", 
   );
 });
 
-test("coordination records require branch only for project message kinds", () => {
+test("coordination records bind branch only for project and assigned Manager messages", () => {
   const runtime = supervisionRuntime(socket());
   const kinds = [
     "chief_message",
@@ -240,17 +240,26 @@ test("coordination records require branch only for project message kinds", () =>
   assert.deepEqual(COORDINATION_MESSAGE_KINDS, kinds);
   for (const kind of kinds) {
     const projectMessage = kind === "project_assignment";
+    const managerProjectMessage = kind === "manager_message";
     const record = message({
       kind,
-      ...(projectMessage ? { branch: "feat/bootstrap" } : {}),
+      ...(projectMessage || managerProjectMessage
+        ? { branch: "feat/bootstrap" }
+        : {}),
     });
     const path = writeCoordinationMessage(record, runtime);
     assert.deepEqual(readCoordinationMessage(path), record, kind);
     for (const branch of projectMessage
       ? [undefined, "", " ", "x".repeat(513), 1, null]
-      : ["feat/bootstrap", "", null]) {
+      : managerProjectMessage
+        ? ["", " ", "x".repeat(513), 1, null]
+        : ["feat/bootstrap", "", null]) {
       assert.throws(
-        () => writeCoordinationMessage({ ...record, branch } as never, runtime),
+        () =>
+          writeCoordinationMessage(
+            { ...record, id: randomUUID(), branch } as never,
+            runtime,
+          ),
         /Invalid Chief message record/,
         `${kind}: ${String(branch)}`,
       );
@@ -1552,6 +1561,60 @@ test("deferred inbox records remain pending without authorization", async () => 
   assert.equal(authorized, 0);
   assert.equal(sent, 0);
   assert.deepEqual(listChiefMessagePaths(runtime, record.toSessionId), [path]);
+});
+
+test("a rejected delivery policy leaves its record pending and drains later records", async () => {
+  const runtime = supervisionRuntime(socket());
+  const rejected = message({ text: "reject policy", createdAt: 1 });
+  const accepted = message({ text: "deliver normally", createdAt: 2 });
+  const rejectedPath = writeChiefMessage(rejected, runtime);
+  writeChiefMessage(accepted, runtime);
+  const delivered = new Set<string>();
+
+  assert.equal(
+    await drainCoordinationInbox({
+      runtime,
+      sessionId: rejected.toSessionId,
+      deliveryMode: async (record) => {
+        if (record.id === rejected.id)
+          throw new Error("authority changed during delivery policy");
+        return "followUp";
+      },
+      isAuthorized: () => true,
+      isDelivered: (id) => delivered.has(id),
+      sendMessage: (_payload, _options, record) => {
+        delivered.add(record.id);
+      },
+    }),
+    1,
+  );
+
+  assert.equal(delivered.has(accepted.id), true);
+  assert.equal(existsSync(rejectedPath), true);
+  assert.deepEqual(listChiefMessagePaths(runtime, rejected.toSessionId), [
+    rejectedPath,
+  ]);
+});
+
+test("passive inbox delivery does not trigger a Pi turn", async () => {
+  const runtime = supervisionRuntime(socket());
+  const record = message();
+  writeChiefMessage(record, runtime);
+  let delivered = false;
+  let sendOptions: unknown;
+  await drainCoordinationInbox({
+    runtime,
+    sessionId: record.toSessionId,
+    deliveryMode: () => "passive",
+    isAuthorized: () => true,
+    isDelivered: () => delivered,
+    sendMessage: (_payload, options) => {
+      sendOptions = options;
+      delivered = true;
+    },
+  });
+  assert.deepEqual(sendOptions, { triggerTurn: false });
+  assert.deepEqual(listChiefMessagePaths(runtime, record.toSessionId), []);
 });
 
 test("Pi send return is not a receipt; later exact receipt enables safe cleanup", async () => {
