@@ -68,6 +68,7 @@ import {
   retainedProjectMessageRecord,
   managerCleanupTarget,
   collectDiagnostics,
+  bestEffortDiagnostics,
   captureTerminalFailureAssignment,
   coreAgentDefinitionsExpectations,
   captureTerminalFailureWorktree,
@@ -3175,6 +3176,106 @@ test("collectDiagnostics reads the host pane through the parent Herdr environmen
   );
 });
 
+test("diagnostic collection failure preserves sanitized primary failure evidence", async () => {
+  const secondaryException = "PRIVATE secondary diagnostic exception";
+  const ctx = {
+    scenario: "supervisor-agent",
+    simulated: true,
+    stage: "supervisor-agent-verification",
+    sessionName: "smoke-supervisor-agent",
+  };
+  const diagnostics = await bestEffortDiagnostics(ctx, async () => {
+    throw new Error(secondaryException);
+  });
+  const evidence = sanitizedFailureEvidence(
+    ctx,
+    { phase: "scenario", error: new Error("primary scenario failure") },
+    "SCENARIO_FAIL",
+    "PENDING",
+  );
+  evidence.diagnostics = diagnostics;
+  const artifact = await preserveFailureEvidence(evidence);
+  try {
+    const persisted = await readFile(artifact, "utf8");
+    const result = JSON.parse(persisted);
+    assert.equal(result.outcome, "SCENARIO_FAIL");
+    assert.equal(result.stage, "supervisor-agent-verification");
+    assert.deepEqual(result.diagnostics, {
+      stage: "supervisor-agent-verification",
+      collectionFailed: true,
+    });
+    assert.doesNotMatch(persisted, /PRIVATE secondary diagnostic exception/u);
+  } finally {
+    await rm(dirname(artifact), { recursive: true, force: true });
+  }
+});
+
+test("collectDiagnostics projects supervisor-agent evidence without private session data", async () => {
+  const privatePrompt = "PRIVATE_PROMPT PRIVATE_TOKEN";
+  const privatePath = "/PRIVATE_PATH/session.jsonl";
+  const projection = await collectDiagnostics(
+    {
+      scenario: "supervisor-agent",
+      stage: "supervisor-agent-verification",
+      paths: {},
+      sessionName: "smoke-supervisor-agent",
+      rootPaneId: "root-pane",
+    },
+    { hostPaneId: "host-pane" },
+    null,
+    {
+      execute: async () => ({ stdout: "root terminal output" }),
+      observe: async () => ({ ok: true, value: { agents: [], panes: [] } }),
+      snapshot: async () => ({
+        path: privatePath,
+        status: "saved",
+        contents:
+          [
+            JSON.stringify({
+              type: "session",
+              id: "root-session",
+              cwd: "/workspace",
+            }),
+            JSON.stringify({
+              type: "message",
+              message: { role: "user", content: privatePrompt },
+            }),
+          ].join("\n") + "\n",
+      }),
+    },
+  );
+
+  assert.deepEqual(projection, {
+    stage: "supervisor-agent-verification",
+    agentsObserved: 0,
+    panesObserved: 0,
+    rootSessionObserved: true,
+    candidateProcessesObserved: 0,
+    supervisorAgent: {
+      assignmentsObserved: 0,
+      childSessionObserved: false,
+      matchingMailboxes: 0,
+    },
+  });
+  assert.doesNotMatch(
+    JSON.stringify(projection),
+    /PRIVATE_PROMPT|PRIVATE_TOKEN|PRIVATE_PATH/u,
+  );
+  const evidence = sanitizedFailureEvidence(
+    { scenario: "supervisor-agent", simulated: true, stage: "verification" },
+    { error: { code: "SCENARIO_FAIL" } },
+    "SCENARIO_FAIL",
+    "PENDING",
+  );
+  evidence.diagnostics = projection;
+  const artifactPath = await preserveFailureEvidence(evidence);
+  const persisted = await readFile(artifactPath, "utf8");
+  assert.doesNotMatch(persisted, /PRIVATE_PROMPT|PRIVATE_TOKEN|PRIVATE_PATH/u);
+  assert.match(persisted, /"agentsObserved": 0/u);
+  assert.match(persisted, /"rootSessionObserved": true/u);
+  await rm(dirname(artifactPath), { recursive: true, force: true });
+});
+
 test("terminal-failure assignment polling captures topology before assignment succeeds", async () => {
   const ctx = {
     rootWorkspaceId: "parent-workspace",
@@ -4318,6 +4419,46 @@ test("process evidence requires both exact extension paths and excludes root pan
       ["missing-extension", false, null],
       ["missing-pane", false, "pane disappeared"],
     ],
+  );
+});
+
+test("Linux Pi process-title evidence requires an exact title and valid PID", async () => {
+  const result = await inspectPaneProcesses(
+    ["candidate"],
+    "root",
+    async () => ({
+      process_info: {
+        foreground_processes: [
+          { pid: 42, name: "pi", argv: ["pi"], cmdline: "pi" },
+          { pid: 43, name: "Pi", argv: ["pi"], cmdline: "pi" },
+          { pid: 44, name: "pi", argv: ["pi", "--extension"], cmdline: "pi" },
+          { pid: "45", name: "pi", argv: ["pi"], cmdline: "pi" },
+          {
+            pid: 46,
+            name: "pi",
+            argv: ["pi"],
+            cmdline: "pi --extension /candidate/dist/index.js",
+          },
+          {
+            pid: 47,
+            name: "pi",
+            argv: ["pi", "--extension", "/wrong/extension.js"],
+            cmdline:
+              "pi --extension /candidate/dist/index.js --extension /isolated/herdr-agent-state.ts",
+          },
+        ],
+      },
+    }),
+    "/candidate/dist/index.js",
+    "/isolated/herdr-agent-state.ts",
+  );
+
+  assert.deepEqual(
+    result.verified.map(({ pid, processMatchSource }) => [
+      pid,
+      processMatchSource,
+    ]),
+    [[42, "process-title"]],
   );
 });
 

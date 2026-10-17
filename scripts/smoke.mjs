@@ -2732,11 +2732,24 @@ function commandLineHasPath(cmdline, path) {
 }
 
 function candidateProcessMatch(proc, extension, integration) {
-  if (Array.isArray(proc.argv))
-    return hasExtensionArg(proc.argv, extension) &&
+  if (Array.isArray(proc.argv)) {
+    if (
+      hasExtensionArg(proc.argv, extension) &&
       hasExtensionArg(proc.argv, integration)
-      ? "argv"
-      : null;
+    )
+      return "argv";
+    // shortcut: accepts Pi's exact process title when Linux hides CLI args, later scenario evidence still proves loaded extensions; upgrade when Herdr exposes executable and extension provenance.
+    if (
+      proc.name === "pi" &&
+      proc.argv.length === 1 &&
+      proc.argv[0] === "pi" &&
+      proc.cmdline === "pi" &&
+      Number.isSafeInteger(proc.pid) &&
+      proc.pid > 0
+    )
+      return "process-title";
+    return null;
+  }
   if (typeof proc.cmdline === "string")
     return commandLineHasPath(proc.cmdline, extension) &&
       commandLineHasPath(proc.cmdline, integration)
@@ -5765,9 +5778,28 @@ export async function collectDiagnostics(
       ? diagnostics.processes.filter((record) => record.processMatch).length
       : null,
     ...(diagnostics.supervisorAgent
-      ? { supervisorAgent: diagnostics.supervisorAgent }
+      ? {
+          supervisorAgent: {
+            assignmentsObserved: diagnostics.supervisorAgent.assignments.length,
+            childSessionObserved: Boolean(
+              diagnostics.supervisorAgent.childSession,
+            ),
+            matchingMailboxes:
+              diagnostics.supervisorAgent.mailboxes?.filter(
+                (item) => item.stateMatches,
+              ).length ?? 0,
+          },
+        }
       : {}),
   };
+}
+
+export async function bestEffortDiagnostics(ctx, collect) {
+  try {
+    return await collect();
+  } catch {
+    return { stage: ctx.stage ?? null, collectionFailed: true };
+  }
 }
 
 export async function cleanup(
@@ -6351,7 +6383,9 @@ async function main() {
     );
     try {
       const diagnosticProjection = ctx.sessionName
-        ? await collectDiagnostics(ctx, owned, failure)
+        ? await bestEffortDiagnostics(ctx, () =>
+            collectDiagnostics(ctx, owned, failure),
+          )
         : null;
       evidence = sanitizedFailureEvidence(
         ctx,
