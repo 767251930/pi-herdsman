@@ -2741,6 +2741,70 @@ test("global assignment authority finds cross-socket matches and serializes the 
   assert.equal(globalProjectAssignmentSnapshot().get(assignmentId), undefined);
 });
 
+test("global assignment scan ignores only regular incidental metadata", () => {
+  const runtime = supervisionRuntime(socket());
+  const assignment = {
+    version: 2 as const,
+    id: id(),
+    repoKey: "metadata-repo",
+    branch: "main",
+    text: "task",
+  };
+  writeProjectAssignment(runtime, assignment);
+  const recordPath = projectAssignmentPath(runtime, assignment.repoKey, "main");
+  const repositoryDirectory = dirname(recordPath);
+  const assignmentsDirectory = dirname(repositoryDirectory);
+  const socketDirectory = dirname(assignmentsDirectory);
+  const directories = [
+    dirname(socketDirectory),
+    assignmentsDirectory,
+    repositoryDirectory,
+  ];
+  const metadataNames = [".DS_Store", "desktop.ini", "Thumbs.db", ".directory"];
+  const metadata = directories.flatMap((directory) =>
+    metadataNames.map((name) => join(directory, name)),
+  );
+  try {
+    for (const path of metadata) writeFileSync(path, "metadata", "utf8");
+    unlinkSync(join(directories[0]!, "desktop.ini"));
+    writeFileSync(join(directories[0]!, "DESKTOP.INI"), "metadata", "utf8");
+    assert.deepEqual(globalProjectAssignmentSnapshot().get(assignment.id), [
+      { socketHash: basename(socketDirectory), assignment },
+    ]);
+
+    unlinkSync(join(directories[0]!, "DESKTOP.INI"));
+    for (const path of metadata) {
+      if (path !== join(directories[0]!, "desktop.ini")) unlinkSync(path);
+    }
+    for (const directory of directories) {
+      for (const name of metadataNames) {
+        const path = join(directory, name);
+        mkdirSync(path);
+        assert.throws(() => globalProjectAssignmentSnapshot());
+        rmSync(path, { recursive: true });
+
+        const target = join(directory, "metadata-target");
+        writeFileSync(target, "metadata", "utf8");
+        realFs.symlinkSync(target, path);
+        assert.throws(() => globalProjectAssignmentSnapshot());
+        unlinkSync(path);
+        unlinkSync(target);
+      }
+    }
+
+    const unexpected = join(repositoryDirectory, "unrelated-file");
+    writeFileSync(unexpected, "metadata", "utf8");
+    assert.throws(
+      () => globalProjectAssignmentSnapshot(),
+      /Unexpected project assignment record/,
+    );
+    unlinkSync(unexpected);
+  } finally {
+    for (const path of metadata) rmSync(path, { recursive: true, force: true });
+    removeProjectAssignment(runtime, assignment.repoKey, assignment.branch);
+  }
+});
+
 test("global assignment scans fail closed on a malformed canonical record", () => {
   const runtime = supervisionRuntime(socket());
   const path = projectAssignmentPath(runtime, "scan-repo", "main");

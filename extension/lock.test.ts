@@ -5,6 +5,8 @@ import {
   mkdtempSync,
   readdirSync,
   rmSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,6 +19,8 @@ import {
   readLiveProcessLock,
   readProcessLockStatus,
 } from "./lock.ts";
+
+const metadataNames = [".DS_Store", "desktop.ini", "Thumbs.db", ".directory"];
 
 function temporaryPath(): string {
   return join(mkdtempSync(join(tmpdir(), "pi-herdsman-lock-")), "lock");
@@ -41,6 +45,30 @@ test("acquireProcessLock returns an exact claim", () => {
     const lease = acquireProcessLock(path);
     deepEqual(lease.claim, { pid: process.pid, id: lease.claim.id });
     assertOccupied(path);
+    lease.release();
+  } finally {
+    rmSync(path, { recursive: true, force: true });
+  }
+});
+
+test("release rejects a dangling owner symlink", () => {
+  const path = temporaryPath();
+  try {
+    const lease = acquireProcessLock(path);
+    const owner = readdirSync(path)[0]!;
+    unlinkSync(join(path, owner));
+    symlinkSync("missing-target", join(path, owner));
+    throws(() => lease.release(), /Unable to verify .* ownership/);
+  } finally {
+    rmSync(path, { recursive: true, force: true });
+  }
+});
+
+test("release remains harmless when its owner entry is already removed", () => {
+  const path = temporaryPath();
+  try {
+    const lease = acquireProcessLock(path);
+    unlinkSync(join(path, readdirSync(path)[0]!));
     lease.release();
   } finally {
     rmSync(path, { recursive: true, force: true });
@@ -72,6 +100,89 @@ test("claim wrapper retains atomic stale recovery after a crash", () => {
     release();
   } finally {
     rmSync(path, { recursive: true, force: true });
+  }
+});
+
+test("metadata does not affect live lock verification and is removed on release", () => {
+  const path = temporaryPath();
+  try {
+    const lease = acquireProcessLock(path);
+    for (const name of metadataNames)
+      writeFileSync(join(path, name), "metadata");
+    unlinkSync(join(path, "desktop.ini"));
+    writeFileSync(join(path, "DESKTOP.INI"), "metadata");
+    deepEqual(readProcessLockStatus(path), { claim: lease.claim, live: true });
+    assertOccupied(path);
+    lease.release();
+    throws(() => readdirSync(path), { code: "ENOENT" });
+
+    const reacquired = acquireProcessLock(path);
+    reacquired.release();
+  } finally {
+    rmSync(path, { recursive: true, force: true });
+  }
+});
+
+test("stale recovery removes metadata only after verifying the stale owner", () => {
+  const path = temporaryPath();
+  const id = randomUUID();
+  try {
+    mkdirSync(path, 0o700);
+    writeFileSync(
+      join(path, `2147483647-${id}`),
+      JSON.stringify({ pid: 2147483647, id }),
+    );
+    for (const name of metadataNames)
+      writeFileSync(join(path, name), "metadata");
+    const release = claimProcessLock(path);
+    assertOccupied(path);
+    release();
+    throws(() => readdirSync(path), { code: "ENOENT" });
+  } finally {
+    rmSync(path, { recursive: true, force: true });
+  }
+});
+
+test("metadata alone and unsafe entries remain ambiguous", () => {
+  for (const name of metadataNames) {
+    const path = temporaryPath();
+    try {
+      mkdirSync(path, 0o700);
+      writeFileSync(join(path, name), "metadata");
+      throws(() => claimProcessLock(path), /Unable to verify/);
+      throws(() => readProcessLockStatus(path), /Unable to verify/);
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
+    for (const entry of ["symlink", "directory"]) {
+      const unsafePath = temporaryPath();
+      try {
+        mkdirSync(unsafePath, 0o700);
+        if (entry === "symlink") symlinkSync("missing", join(unsafePath, name));
+        else mkdirSync(join(unsafePath, name));
+        throws(() => claimProcessLock(unsafePath), /Unable to verify/);
+        throws(() => readProcessLockStatus(unsafePath), /Unable to verify/);
+      } finally {
+        rmSync(unsafePath, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+test("owner with a metadata symlink or unknown file is rejected", () => {
+  for (const entry of ["symlink", "directory", "unknown"]) {
+    const path = temporaryPath();
+    const lease = acquireProcessLock(path);
+    try {
+      if (entry === "symlink")
+        symlinkSync("missing", join(path, "desktop.ini"));
+      else if (entry === "directory") mkdirSync(join(path, ".directory"));
+      else writeFileSync(join(path, "unexpected"), "unknown");
+      throws(() => readProcessLockStatus(path), /Unable to verify/);
+      throws(() => lease.release(), /Unable to verify/);
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
   }
 });
 
