@@ -276,7 +276,7 @@ const SEMANTIC_TOOL_CASES = [
   ["list_agents", {}, { agent: "x" }, []],
   [
     "delegate_agent",
-    { definition: "scout", task: "work" },
+    { definition: "scout", task: "work", retain: true },
     { definition: "scout", task: "work", session: "x" },
     ["definition", "task"],
   ],
@@ -353,7 +353,7 @@ const STAFF_TOOL_CASES = [
   ],
   [
     "message_staff",
-    { session: "session-id", message: "progress" },
+    { session: "session-id", message: "progress", retain: true },
     { session: "session-id", message: "progress", lead: "x" },
     ["session", "message"],
   ],
@@ -557,7 +557,7 @@ test("semantic coordination tools expose exact strict object contracts", () => {
     leaf.tools.map((tool) => tool.name),
     ["ask_owner"],
   );
-  const askOwner = leaf.tools[0]!;
+  const askOwner = leaf.tools.find((tool) => tool.name === "ask_owner")!;
   assertPortableToolSchema(askOwner);
   assert.deepEqual(askOwner.parameters.required, ["question"]);
   assert.equal(
@@ -565,6 +565,10 @@ test("semantic coordination tools expose exact strict object contracts", () => {
     true,
   );
   assert.equal(Value.Check(askOwner.parameters, {}), false);
+  assert.equal(
+    leaf.tools.some((tool) => tool.name === "update_assignment_evidence"),
+    false,
+  );
   leaf.events.get("session_shutdown")?.[0]();
   resetAgentMailbox(mailbox);
   setLeadEnvironment();
@@ -2023,7 +2027,10 @@ test("active chief describes authoritative remote ask projection", async () => {
     [listTool, "List direct-report supervision state."],
     [inspectTool, "Read bounded live terminal/process evidence"],
     [transcriptTool, "Read bounded persisted Pi conversation/tool evidence"],
-    [tool, "Send a durable supervisor message to a direct report"],
+    [
+      tool,
+      "Send a message to a direct report; active work is steered cooperatively.",
+    ],
   ] as const)
     assert.match(operation.description, new RegExp(phrase));
   assert.doesNotMatch(
@@ -2033,6 +2040,11 @@ test("active chief describes authoritative remote ask projection", async () => {
   assert.equal(tool.label, "message staff");
   assert.equal(typeof tool.renderCall, "function");
   assert.equal(typeof tool.renderResult, "function");
+  assert.equal(
+    (tool.parameters as { properties: { retain: { description: string } } })
+      .properties.retain.description,
+    "For Manager messages to assigned project Leads: retain both message text and files as required evidence for future Agents. Use for lasting requirements and accepted reviews; omit for temporary communication.",
+  );
   assert.equal(
     Value.Check(tool.parameters, {
       session: LEAD_SESSION_ID,

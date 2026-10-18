@@ -12,7 +12,7 @@ import {
   truncateTail,
 } from "@earendil-works/pi-coding-agent";
 import { contentText } from "@earendil-works/pi-ai";
-import { realpathSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { unlinkSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -69,6 +69,9 @@ import {
   resultRef,
   type ResultBinding,
   herdsmanTempRoot,
+  readRequiredEvidenceSnapshot,
+  isRequiredEvidence,
+  type RequiredEvidence,
 } from "./storage.ts";
 import { requireCompatibleBuild, type RuntimeBuild } from "./compatibility.ts";
 import { readConfig } from "./config.ts";
@@ -91,6 +94,8 @@ import {
   MANAGED_AGENT_BOOTSTRAP_EVENT,
   prepareMessageInput,
   chooseLabel,
+  persistRequiredTextFiles,
+  snapshotTextFiles,
 } from "./core.ts";
 import { normalizeHerdrLifecycleState } from "./supervision.ts";
 import {
@@ -752,7 +757,71 @@ type ResolvedAssignmentSession = {
   definition: string;
   label: string;
   cwd: string;
+  evidence?: {
+    requestId: string;
+    projectAssignmentId?: string;
+    evidenceAssignmentId?: string;
+    inheritedEvidence: RequiredEvidence[];
+    localEvidence: RequiredEvidence[];
+  };
 };
+
+function requiredEvidenceEntriesForRequest(
+  entries: readonly any[],
+  requestId: string,
+): any[] {
+  return entries.filter(
+    (entry) =>
+      entry?.type === "custom" &&
+      entry.customType === "pi-herdsman-agent-required-evidence" &&
+      entry.data?.requestId === requestId,
+  );
+}
+
+function currentManagedEvidence(ctx: ExtensionContext):
+  | {
+      projectAssignmentId: string;
+      workspaceId: string;
+      evidenceAssignmentId: string;
+      inheritedEvidence: RequiredEvidence[];
+      localEvidence: RequiredEvidence[];
+    }
+  | undefined {
+  const state = readAgentState(process.env.PI_HERDSMAN_MAILBOX ?? "");
+  if (!state?.projectAssignmentId || !state.activeRequestId) return undefined;
+  const sessionId = ctx.sessionManager.getSessionId();
+  const entries = ctx.sessionManager
+    .getBranch()
+    .filter(
+      (entry: any) =>
+        entry?.type === "custom" &&
+        entry.customType === "pi-herdsman-agent-required-evidence" &&
+        entry.data?.requestId === state.activeRequestId,
+    ) as any[];
+  if (!entries.length) return undefined;
+  const data = entries.at(-1)?.data;
+  if (
+    data?.sessionId !== sessionId ||
+    data?.runId !== state.runId ||
+    data?.ownerSessionId !== state.ownerSessionId ||
+    data?.workspaceId !== state.workspaceId ||
+    data?.agentLabel !== state.agentLabel ||
+    data?.paneId !== state.paneId ||
+    data?.projectAssignmentId !== state.projectAssignmentId ||
+    !Array.isArray(data.inheritedEvidence) ||
+    !Array.isArray(data.localEvidence)
+  )
+    throw new Error(
+      "Managed-agent required-evidence session metadata is foreign or malformed",
+    );
+  return {
+    projectAssignmentId: data.projectAssignmentId,
+    workspaceId: data.workspaceId,
+    evidenceAssignmentId: data.evidenceAssignmentId,
+    inheritedEvidence: data.inheritedEvidence,
+    localEvidence: data.localEvidence,
+  };
+}
 type AssignmentSessionSelector =
   { kind: "id"; value: string } | { kind: "path"; value: string };
 type OwnedAssignmentSession = {
@@ -1719,12 +1788,228 @@ export function resolveAssignmentSession(
             "continue",
           );
       }
+      const allEvidenceEntries = manager
+        .getEntries()
+        .filter(
+          (entry: any) =>
+            entry?.type === "custom" &&
+            entry.customType === "pi-herdsman-agent-required-evidence",
+        ) as any[];
+      for (const entry of allEvidenceEntries) {
+        const record = entry?.data;
+        if (
+          !record ||
+          record.version !== 1 ||
+          record.sessionId !== child.id ||
+          !validId(record.requestId) ||
+          !validId(record.runId) ||
+          !validId(record.ownerSessionId) ||
+          typeof record.workspaceId !== "string" ||
+          !record.workspaceId.trim() ||
+          typeof record.agentLabel !== "string" ||
+          !validAgentLabel(record.agentLabel) ||
+          typeof record.paneId !== "string" ||
+          !record.paneId.trim() ||
+          (record.projectAssignmentId !== undefined &&
+            !validId(record.projectAssignmentId)) ||
+          (record.evidenceAssignmentId !== undefined &&
+            !validId(record.evidenceAssignmentId)) ||
+          (record.projectAssignmentId === undefined) !==
+            (record.evidenceAssignmentId === undefined) ||
+          !Array.isArray(record.inheritedEvidence) ||
+          !record.inheritedEvidence.every(isRequiredEvidence) ||
+          !Array.isArray(record.localEvidence) ||
+          !record.localEvidence.every(isRequiredEvidence) ||
+          (record.projectAssignmentId === undefined &&
+            (record.inheritedEvidence.length || record.localEvidence.length)) ||
+          new Set(
+            [...record.inheritedEvidence, ...record.localEvidence].map(
+              (item: RequiredEvidence) => item.id,
+            ),
+          ).size !==
+            record.inheritedEvidence.length + record.localEvidence.length
+        )
+          fail(
+            "invalid_request",
+            "Saved assignment has malformed required-evidence metadata",
+            "continue",
+          );
+      }
+      const hasProjectEvidenceHistory = allEvidenceEntries.some(
+        (entry) =>
+          entry?.data?.projectAssignmentId !== undefined ||
+          entry?.data?.evidenceAssignmentId !== undefined,
+      );
+      let evidence: ResolvedAssignmentSession["evidence"];
+      const identity = sessionAgentIdentity(manager.getEntries(), child.id);
+      const matchingStates = listAgentStates()
+        .map(({ state }) => state)
+        .filter(
+          (state) =>
+            state.piSessionId === child.id ||
+            (state.piSessionFile !== undefined &&
+              samePersistedSessionPath(state.piSessionFile, child.path)),
+        );
+      if (matchingStates.length > 1)
+        fail(
+          "target_ambiguous",
+          "Saved assignment has multiple authoritative managed states",
+          "continue",
+        );
+      const currentState = matchingStates[0];
+      if (hasProjectEvidenceHistory && !currentState)
+        fail(
+          "invalid_request",
+          "Cannot verify the current accepted assignment for saved evidence",
+          "continue",
+        );
+      const exactIdState =
+        selector.kind === "id" &&
+        currentState?.piSessionId === child.id &&
+        !!currentState.activeRequestId;
+      if (
+        currentState &&
+        (!identity ||
+          (!exactIdState &&
+            (currentState.agentLabel !== child.label ||
+              currentState.agentDefinition !== child.definition)) ||
+          currentState.piSessionId !== child.id ||
+          currentState.workspaceId.trim() === "")
+      )
+        fail(
+          "invalid_request",
+          "Saved assignment state does not match the exact owned session",
+          "continue",
+        );
+      const currentRequestId =
+        currentState?.activeRequestId ?? currentState?.completedRequestId;
+      if (hasProjectEvidenceHistory && !currentRequestId)
+        fail(
+          "invalid_request",
+          "Saved assignment has no verifiable accepted task identity",
+          "continue",
+        );
+      if (
+        currentState?.completedRequestId &&
+        (currentState.lastAck?.requestId !== currentState.completedRequestId ||
+          currentState.lastAck.accepted !== true)
+      )
+        fail(
+          "invalid_request",
+          "Saved assignment completion identity is not acknowledged",
+          "continue",
+        );
+      const evidenceEntries = currentRequestId
+        ? requiredEvidenceEntriesForRequest(
+            allEvidenceEntries,
+            currentRequestId,
+          )
+        : [];
+      if (hasProjectEvidenceHistory && !evidenceEntries.length)
+        fail(
+          "invalid_request",
+          "Current accepted assignment is missing its evidence context",
+          "continue",
+        );
+      if (
+        (currentState?.projectAssignmentId || hasProjectEvidenceHistory) &&
+        !evidenceEntries.length
+      )
+        fail(
+          "invalid_request",
+          "Current scoped assignment is missing its accepted evidence context",
+          "continue",
+        );
+      if (evidenceEntries.length) {
+        const record = evidenceEntries.at(-1)?.data;
+        if (
+          !record ||
+          record.version !== 1 ||
+          record.sessionId !== child.id ||
+          !validId(record.requestId) ||
+          !validId(record.runId) ||
+          !validId(record.ownerSessionId) ||
+          typeof record.workspaceId !== "string" ||
+          !record.workspaceId.trim() ||
+          typeof record.agentLabel !== "string" ||
+          !validAgentLabel(record.agentLabel) ||
+          typeof record.paneId !== "string" ||
+          !record.paneId.trim() ||
+          (record.projectAssignmentId !== undefined &&
+            !validId(record.projectAssignmentId)) ||
+          (record.evidenceAssignmentId !== undefined &&
+            !validId(record.evidenceAssignmentId)) ||
+          (record.projectAssignmentId === undefined) !==
+            (record.evidenceAssignmentId === undefined) ||
+          !Array.isArray(record.inheritedEvidence) ||
+          !record.inheritedEvidence.every(isRequiredEvidence) ||
+          !Array.isArray(record.localEvidence) ||
+          !record.localEvidence.every(isRequiredEvidence) ||
+          (record.projectAssignmentId === undefined &&
+            (record.inheritedEvidence.length || record.localEvidence.length)) ||
+          new Set(
+            [...record.inheritedEvidence, ...record.localEvidence].map(
+              (item: RequiredEvidence) => item.id,
+            ),
+          ).size !==
+            record.inheritedEvidence.length + record.localEvidence.length
+        )
+          fail(
+            "invalid_request",
+            "Saved assignment has malformed required-evidence metadata",
+            "continue",
+          );
+        if (
+          !identity ||
+          identity.definition !== child.definition ||
+          identity.label !== record.agentLabel ||
+          record.requestId !== currentRequestId ||
+          record.agentLabel !== currentState?.agentLabel ||
+          record.projectAssignmentId !== currentState?.projectAssignmentId ||
+          record.runId !== currentState?.runId ||
+          record.ownerSessionId !== currentState?.ownerSessionId ||
+          record.workspaceId !== currentState?.workspaceId ||
+          record.paneId !== currentState?.paneId
+        )
+          fail(
+            "invalid_request",
+            "Saved assignment evidence does not match the exact owned session",
+            "continue",
+          );
+        for (const item of [
+          ...record.inheritedEvidence,
+          ...record.localEvidence,
+        ])
+          if ("path" in item) {
+            try {
+              readRequiredEvidenceSnapshot(item.sourceAssignmentId, item);
+            } catch (error) {
+              fail(
+                "invalid_request",
+                `Saved assignment evidence ${item.name} is unavailable: ${String(error)}`,
+                "continue",
+              );
+            }
+          }
+        evidence = {
+          requestId: record.requestId,
+          ...(record.projectAssignmentId
+            ? { projectAssignmentId: record.projectAssignmentId }
+            : {}),
+          ...(record.evidenceAssignmentId
+            ? { evidenceAssignmentId: record.evidenceAssignmentId }
+            : {}),
+          inheritedEvidence: [...record.inheritedEvidence],
+          localEvidence: [...record.localEvidence],
+        };
+      }
       return {
         path: child.path,
         id: child.id,
         definition: child.definition,
         label: child.label,
         cwd: manager.getCwd(),
+        ...(evidence ? { evidence } : {}),
       };
     }
     for (const child of children) {
@@ -1845,6 +2130,8 @@ export type Params =
       label?: string;
       task: string;
       files?: string[];
+      retain?: boolean;
+      retentionPersisted?: boolean;
     }
   | { action: "continue"; session: string; task: string; files?: string[] }
   | {
@@ -2116,6 +2403,11 @@ export function requestRecordBytesFor(
   createdAt: number,
   requestId: string,
   resultBindings: readonly ResultBinding[],
+  evidence?: {
+    projectAssignmentId: string;
+    evidenceAssignmentId: string;
+    requiredEvidence: readonly RequiredEvidence[];
+  },
 ): number {
   return mailboxRecordBytes({
     version: 5,
@@ -2130,6 +2422,9 @@ export function requestRecordBytesFor(
     ...(kind === "reply" ? { askId } : {}),
     text,
     ...(resultBindings.length ? { resultBindings: [...resultBindings] } : {}),
+    ...(evidence
+      ? { ...evidence, requiredEvidence: [...evidence.requiredEvidence] }
+      : {}),
     createdAt,
   });
 }
@@ -2146,6 +2441,11 @@ export function prospectiveAssignmentFits(
   requestId: string,
   mailboxLimitBytes: number,
   resultBindings: readonly ResultBinding[],
+  evidence?: {
+    projectAssignmentId: string;
+    evidenceAssignmentId: string;
+    requiredEvidence: readonly RequiredEvidence[];
+  },
 ): boolean {
   return (
     mailboxRecordBytes({
@@ -2160,6 +2460,9 @@ export function prospectiveAssignmentFits(
       kind: "task",
       text,
       ...(resultBindings.length ? { resultBindings: [...resultBindings] } : {}),
+      ...(evidence
+        ? { ...evidence, requiredEvidence: [...evidence.requiredEvidence] }
+        : {}),
       createdAt,
     }) <= mailboxLimitBytes
   );
@@ -2537,6 +2840,29 @@ export type AgentControllerOptions = {
   rootDelegationPolicy?(): RootDelegationPolicy;
   /** Stable authority/profile generation captured across assignment preflight. */
   rootDelegationGeneration?(): RootDelegationGeneration;
+  projectEvidence?(ctx: ExtensionContext): Promise<
+    | {
+        assignment: import("./supervision.ts").ProjectAssignment;
+        revalidate(operation: () => Promise<void> | void): Promise<void>;
+      }
+    | undefined
+  >;
+  retainProjectEvidence?(
+    ctx: ExtensionContext,
+    assignment: import("./supervision.ts").ProjectAssignment,
+    additions: RequiredEvidence[],
+  ): Promise<import("./supervision.ts").ProjectAssignment>;
+  managedProjectEvidence?(
+    ctx: ExtensionContext,
+    workspaceId: string,
+    projectAssignmentId: string,
+  ): Promise<
+    | {
+        assignment: import("./supervision.ts").ProjectAssignment;
+        revalidate(operation: () => Promise<void> | void): Promise<void>;
+      }
+    | undefined
+  >;
   build: RuntimeBuild;
   extensionPath: string;
   isContextRetired(
@@ -3354,7 +3680,17 @@ export function createAgentController(
     requestId = randomUUID(),
     operation = kind === "task" ? "delegate" : kind,
     resultBindings: readonly ResultBinding[] = [],
-    submitOptions: { waitForLock?: boolean; beforeWrite?: () => void } = {},
+    submitOptions: {
+      waitForLock?: boolean;
+      beforeWrite?: () => Promise<void> | void;
+      evidence?: {
+        projectAssignmentId: string;
+        evidenceAssignmentId: string;
+        requiredEvidence: readonly RequiredEvidence[];
+        inheritedEvidence?: readonly RequiredEvidence[];
+        localEvidence?: readonly RequiredEvidence[];
+      };
+    } = {},
   ): Promise<string> => {
     if (!text.trim())
       fail("invalid_request", "Message must not be empty", operation);
@@ -3373,6 +3709,22 @@ export function createAgentController(
       ...(kind === "reply" ? { askId } : {}),
       text,
       ...(resultBindings.length ? { resultBindings: [...resultBindings] } : {}),
+      ...(submitOptions.evidence
+        ? {
+            ...submitOptions.evidence,
+            requiredEvidence: [...submitOptions.evidence.requiredEvidence],
+            ...(submitOptions.evidence.inheritedEvidence
+              ? {
+                  inheritedEvidence: [
+                    ...submitOptions.evidence.inheritedEvidence,
+                  ],
+                }
+              : {}),
+            ...(submitOptions.evidence.localEvidence
+              ? { localEvidence: [...submitOptions.evidence.localEvidence] }
+              : {}),
+          }
+        : {}),
       createdAt,
     };
     const limits = readConfig();
@@ -3445,7 +3797,7 @@ export function createAgentController(
           fail("internal_failure", message, operation);
         }
       }
-      submitOptions.beforeWrite?.();
+      await submitOptions.beforeWrite?.();
       writeRequest(runtime.mailboxPath, request);
     } catch (error) {
       if (String(error).toLowerCase().includes("too large"))
@@ -5431,6 +5783,7 @@ export function createAgentController(
     p: Params,
     signal?: AbortSignal,
   ): Promise<Record<string, unknown>> => {
+    if (p.action === "delegate") p.retentionPersisted = false;
     const scope = options.scope;
     validateAssignmentRequest(p);
     const rootAssignment =
@@ -5476,6 +5829,12 @@ export function createAgentController(
         : undefined;
     let assignmentInput: ReturnType<typeof prepareMessageInput> | undefined;
     if (p.action === "delegate" || p.action === "continue") {
+      if (p.retain === true && p.action !== "delegate")
+        fail(
+          "invalid_request",
+          "retain is available only on delegate_agent",
+          p.action,
+        );
       if (!scope)
         fail(
           "not_running_inside_herdr",
@@ -5588,15 +5947,35 @@ export function createAgentController(
           .map((agent) => agent.label)
           .filter((agent): agent is string => typeof agent === "string"),
       );
-      if (resumed) {
-        releaseSessionActivation = claimSessionActivationLock(resumed.path);
-        try {
+      let reusableCompletedState: ManagedAgentState | undefined;
+      try {
+        if (resumed) {
+          releaseSessionActivation = claimSessionActivationLock(resumed.path);
           const snapshot = await snapshots(ctx, signal);
-          const states = listAgentStates().filter(
+          const savedStates = listAgentStates().filter(
             ({ state }) =>
               state.piSessionId === resumed.id ||
               (state.piSessionFile !== undefined &&
                 samePersistedSessionPath(state.piSessionFile, resumed.path)),
+          );
+          const exactState =
+            savedStates.length === 1 ? savedStates[0]!.state : undefined;
+          if (savedStates.length > 1)
+            fail(
+              "target_ambiguous",
+              "Saved assignment has multiple authoritative managed states",
+              p.action,
+            );
+          if (
+            exactState &&
+            !exactState.activeRequestId &&
+            exactState.completedRequestId &&
+            exactState.lastAck?.accepted &&
+            exactState.lastAck.requestId === exactState.completedRequestId
+          )
+            reusableCompletedState = exactState;
+          const states = savedStates.filter(
+            ({ state }) => !!state.activeRequestId,
           );
           const representations = new Set(
             states.map(
@@ -5605,13 +5984,19 @@ export function createAgentController(
             ),
           );
           const statePanes = new Set(
-            states.map(({ state }) => `${state.workspaceId}\0${state.paneId}`),
+            savedStates.map(
+              ({ state }) => `${state.workspaceId}\0${state.paneId}`,
+            ),
           );
           for (const agent of snapshot.liveAgents)
             if (
               herdrSessionsMatch(
                 agent,
                 expectedSession(resumed.id, resumed.path),
+              ) &&
+              !savedStates.some(
+                ({ state }) =>
+                  !state.activeRequestId && state.completedRequestId,
               ) &&
               !statePanes.has(
                 `${agent.workspace_id ?? ""}\0${agent.pane_id ?? ""}`,
@@ -5636,687 +6021,1046 @@ export function createAgentController(
                   "Let that assignment finish, or close its exact agent if abandoning it, then retry.",
               },
             );
-        } catch (error) {
-          releaseSessionActivation();
-          releaseSessionActivation = undefined;
-          throw error;
         }
-      }
-      if (requestedLabel && labels.has(requestedLabel))
-        fail(
-          "agent_label_exists",
-          `Agent label already exists: ${requestedLabel}`,
-          p.action,
-        );
-      const workspaceId = assignment!.workspaceId;
-      let label = requestedLabel ?? chooseLabel(agentDefinition, labels);
-      if (!validAgentLabel(label))
-        fail(
-          "invalid_request",
-          'Agent label must start with a lowercase letter, contain only lowercase letters, digits, "_" or "-", and be at most 32 characters',
-          p.action,
-        );
-      const prepareAssignmentInput = (assignmentLabel: string) =>
-        prepareMessageInput(
-          p.task,
-          resolveMessageFiles(ctx, p.files, p.action),
-          ctx.cwd,
-          p.action,
-          "Task",
-          {
-            inlineLimitBytes: limits.inline.bytes,
-            fits: (text, resultBindings) =>
-              prospectiveAssignmentFits(
-                options.build,
-                assignment!.runId,
-                assignment!.ownerSessionId,
-                assignment!.workspaceId,
-                assignmentLabel,
-                text,
-                "",
-                assignment!.createdAt,
-                assignment!.requestId,
-                limits.mailbox.bytes,
-                resultBindings,
-              ),
-          },
-        );
-      // The label is knowable until a mailbox collision changes it; only Herdr's
-      // pane identity remains unknown until startup returns.
-      assignmentInput = prepareAssignmentInput(label);
-      const preparedBody = expandAgentBodyFiles(
-        definition.body,
-        assignmentInput.canonicalPaths,
-        p.action,
-      );
-      const preparedDefinition =
-        preparedBody === definition.body
-          ? definition
-          : { ...definition, body: preparedBody };
-      const effectiveDefinition = projectAgentDefinition(
-        preparedDefinition,
-        scope.kind === "managed-agent" ? "leaf" : "delegating",
-      );
-      const delegationEnabled =
-        agentDefinitionDelegationEnabled(effectiveDefinition);
-      const runId = assignment!.runId;
-      const owner = assignment!.ownerSessionId;
-      const forwardingSession =
-        scope.kind === "managed-agent"
-          ? (process.env.PI_SUBAGENT_PARENT_SESSION ?? owner)
-          : owner;
-      const configuredPlacement = readConfig().spawnPlacement;
-      const placement = await physicalPlacement(
-        ctx,
-        label,
-        configuredPlacement,
-        signal,
-      );
-      const placementRevalidator =
-        scope?.kind !== "managed-agent" && configuredPlacement === "tab"
-          ? async (
-              current: HerdrStartPlacement,
-            ): Promise<HerdrStartPlacement> => {
-              if (current.kind !== "tab") return current;
-              const candidate = await reusableLeadTab(ctx, signal);
-              return {
-                kind: "tab",
-                label: current.label,
-                ...(candidate ? { tabId: candidate } : {}),
-              };
-            }
-          : undefined;
-      let mailbox = agentMailboxPath(workspaceId, label);
-      let releaseClaim: (() => void) | undefined;
-      while (true) {
-        try {
-          releaseClaim = claimAgentMailbox(mailbox);
-        } catch (error) {
-          if (!(error instanceof MailboxClaimOccupiedError)) {
-            releaseSessionActivation?.();
-            releaseSessionActivation = undefined;
-            throw error;
-          }
-          if (requestedLabel) {
-            releaseSessionActivation?.();
-            releaseSessionActivation = undefined;
-            fail(
-              "agent_label_exists",
-              `Agent label already exists: ${label}`,
-              p.action,
-            );
-          }
-          try {
-            labels.add(label);
-            label = chooseLabel(agentDefinition, labels);
-            if (!validAgentLabel(label))
-              fail(
-                "invalid_request",
-                'Agent label must start with a lowercase letter, contain only lowercase letters, digits, "_" or "-", and be at most 32 characters',
-                p.action,
-              );
-            assignmentInput = prepareAssignmentInput(label);
-            mailbox = agentMailboxPath(workspaceId, label);
-            continue;
-          } catch (retryError) {
-            releaseSessionActivation?.();
-            releaseSessionActivation = undefined;
-            throw retryError;
-          }
-        }
-        try {
-          if (
-            !requestedLabel &&
-            guardMailboxOccupancy(mailbox, label, p.action, false)
-          ) {
-            releaseClaim();
-            releaseClaim = undefined;
-            labels.add(label);
-            label = chooseLabel(agentDefinition, labels);
-            if (!validAgentLabel(label))
-              fail(
-                "invalid_request",
-                'Agent label must start with a lowercase letter, contain only lowercase letters, digits, "_" or "-", and be at most 32 characters',
-                p.action,
-              );
-            assignmentInput = prepareAssignmentInput(label);
-            mailbox = agentMailboxPath(workspaceId, label);
-            continue;
-          }
-          if (requestedLabel)
-            guardMailboxOccupancy(mailbox, label, p.action, true);
-          break;
-        } catch (error) {
-          if (releaseClaim) releaseClaim();
-          releaseClaim = undefined;
-          releaseSessionActivation?.();
-          releaseSessionActivation = undefined;
-          throw error;
-        }
-      }
-      const pendingStart: PendingStart = {
-        label,
-        definition: agentDefinition,
-        requestId: assignment!.requestId,
-        ...(p.task !== undefined ? { task: p.task } : {}),
-        startedAt: Date.now(),
-        ...(scope.kind === "managed-agent" && process.env.PI_HERDSMAN_LABEL
-          ? { parentLabel: process.env.PI_HERDSMAN_LABEL }
-          : {}),
-      };
-      pendingStarts.set(label, pendingStart);
-      options.onChanged();
-      let promptPaths: string[] = [];
-      let promptWriteFailed = false;
-      let started: StartedHerdrAgent | undefined;
-      let accepted = false;
-      const preparedBootstrap: Array<{
-        id: string;
-        commit?: () => void | Promise<void>;
-      }> = [];
-      try {
-        try {
-          promptPaths = writePrivatePromptSnapshots([
-            ...(preparedDefinition.body ? [preparedDefinition.body] : []),
-            SHARED_AGENT_INSTRUCTIONS,
-          ]);
-        } catch (error) {
-          promptWriteFailed = true;
-          throw error;
-        }
-        invalidateRuntime(label);
-        const resetRelease = claimAssignmentLock(mailbox, p.action, { label });
-        try {
-          resetAgentMailbox(mailbox);
-        } finally {
-          resetRelease();
-        }
-        let ownerDisplay = "lead";
-        if (scope.kind === "managed-agent") {
-          const definition = process.env.PI_HERDSMAN_AGENT_DEFINITION;
-          const parentLabel = process.env.PI_HERDSMAN_LABEL;
-          if (!definition || !parentLabel)
-            throw new Error(
-              "Managed-Agent launch is missing its definition or label",
-            );
-          ownerDisplay = displayIdentity(definition, parentLabel);
-        }
-        if (p.action === "delegate") {
-          const registrations = new Map<string, ManagedAgentBootstrapPrepare>();
-          let open = true;
-          let registrationError: Error | undefined;
-          pi.events.emit(MANAGED_AGENT_BOOTSTRAP_EVENT, {
-            protocol: 1,
-            phase: "prepare",
-            context: ctx,
-            agent: label,
-            register(id: string, prepare: ManagedAgentBootstrapPrepare) {
-              if (!open)
-                throw new Error(
-                  "Managed-agent bootstrap registration is closed",
-                );
-              if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(id)) {
-                registrationError ??= new Error(
-                  "Invalid managed-agent bootstrap participant ID",
-                );
-                return;
-              }
-              if (registrations.has(id)) {
-                registrationError ??= new Error(
-                  `Duplicate managed-agent bootstrap participant ID: ${id}`,
-                );
-                return;
-              }
-              if (typeof prepare !== "function") {
-                registrationError ??= new Error(
-                  "Invalid managed-agent bootstrap prepare callback",
-                );
-                return;
-              }
-              registrations.set(id, prepare);
-            },
-          });
-          open = false;
-          if (registrationError) throw registrationError;
-          const participants: Array<{ id: string; payload: string }> = [];
-          for (const [id, prepare] of registrations) {
-            const result = await prepare();
-            if (result !== undefined) {
-              if (
-                !result ||
-                typeof result.payload !== "string" ||
-                (result.commit !== undefined &&
-                  typeof result.commit !== "function")
-              )
-                throw new Error(
-                  `Invalid preparation from managed-agent bootstrap participant "${id}"`,
-                );
-              participants.push({ id, payload: result.payload });
-              preparedBootstrap.push({
-                id,
-                ...(result.commit ? { commit: result.commit } : {}),
-              });
-            }
-          }
-          if (participants.length)
-            writeAgentBootstrap(mailbox, {
-              version: 5,
-              build: options.build,
-              runId,
-              ownerSessionId: owner,
-              workspaceId,
-              agentLabel: label,
-              participants,
-            });
-        }
-        const env = [
-          `PI_HERDSMAN_MAILBOX=${mailbox}`,
-          `PI_HERDSMAN_RUN_ID=${runId}`,
-          `PI_HERDSMAN_OWNER_SESSION_ID=${owner}`,
-          `PI_HERDSMAN_OWNER_DISPLAY=${ownerDisplay}`,
-          `PI_SUBAGENT_PARENT_SESSION=${forwardingSession}`,
-          `PI_HERDSMAN_LABEL=${label}`,
-          `PI_HERDSMAN_WORKSPACE_ID=${workspaceId}`,
-          `PI_HERDSMAN_AGENT_DEFINITION=${agentDefinition}`,
-          `PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=${JSON.stringify(
-            delegationEnabled ? effectiveDefinition.frontmatter.agents : [],
-          )}`,
-          ...(process.env.PI_CODING_AGENT_DIR
-            ? [`PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR}`]
-            : []),
-          "PI_OFFLINE=1",
-        ];
-        // Pi reports the providers that extensions registered; a model from one
-        // of them cannot resolve in a child denied extension discovery.
-        // Older registries and test doubles may not expose the list, in which
-        // case nothing counts as extension-provided and the model is inherited
-        // exactly as before this change.
-        const registeredProviderIds = new Set(
-          ctx.modelRegistry?.getRegisteredProviderIds?.() ?? [],
-        );
-        const childModel = resolveChildModel({
-          configured: configuredModel(effectiveDefinition.frontmatter),
-          inherited:
-            !resumed && ctx.model
-              ? { provider: ctx.model.provider, token: modelToken(ctx.model) }
-              : undefined,
-          isForeignProvider: (providerId) =>
-            registeredProviderIds.has(providerId),
-        });
-        const launchArgs = agentLaunchArgs(effectiveDefinition, {
-          ...(effectiveDefinition.body
-            ? { bodyPromptPath: promptPaths[0] }
-            : {}),
-          sharedPromptPath: promptPaths[effectiveDefinition.body ? 1 : 0],
-          cwd: agentCwd,
-          managedAgent: true,
-          approveProject:
-            agentContext.projectTrusted && sameCwd(agentCwd, ctx.cwd),
-          ...(!resumed ? { inheritedThinking: pi.getThinkingLevel() } : {}),
-          modelDecision: childModel,
-        });
-        // Role/profile preflight may have changed while this assignment was prepared.
-        assertRootDelegationAllowed();
-        started = await startHerdrAgent(pi, ctx, {
-          label,
-          runId,
-          cwd: agentCwd,
-          extensionPath: options.extensionPath,
-          placement,
-          ...(placementRevalidator ? { placementRevalidator } : {}),
-          agentArgs: [...launchArgs, ...sessionArgs],
-          env,
-          signal,
-        });
-        const state = await waitForState(
-          mailbox,
-          (s) => s.runId === runId && s.ownerSessionId === owner,
-          { timeoutMs: 30_000, signal },
-        ).catch(() => undefined);
-        if (state)
-          requireCompatibleBuild(
-            options.build,
-            state.build,
-            p.action,
-            `Agent ${label} in pane ${started.paneId}`,
-          );
-        if (!state) {
-          let startupDiagnostic: string | undefined;
-          let startupProcess: Record<string, unknown> | undefined;
-          try {
-            const result = await pi.exec(
-              "herdr",
-              [
-                "pane",
-                "read",
-                started.paneId,
-                "--source",
-                "recent-unwrapped",
-                "--lines",
-                "40",
-              ],
-              { cwd: ctx.cwd, signal, timeout: 5_000 },
-            );
-            if (result.code === 0 && !result.killed) {
-              const bytes = Buffer.from(
-                `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim(),
-                "utf8",
-              );
-              if (bytes.length) {
-                let start = Math.max(0, bytes.length - 4096);
-                while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80)
-                  start++;
-                startupDiagnostic = bytes.subarray(start).toString("utf8");
-              }
-            }
-          } catch {
-            // Startup evidence is advisory; preserve the original failure.
-          }
-          try {
-            const process = await paneProcess(
-              pi,
-              ctx,
-              started.paneId,
-              undefined,
-              undefined,
-              true,
-              2_000,
-            );
-            if (process?.pane_id === started.paneId)
-              startupProcess = {
-                pane_id: process.pane_id,
-                shell_pid: process.shell_pid,
-                foreground_processes: (process.foreground_processes ?? []).map(
-                  ({ argv0, state }) => ({
-                    ...(argv0 ? { argv0 } : {}),
-                    ...(state ? { state } : {}),
-                  }),
-                ),
-              };
-          } catch {
-            // Process evidence is optional; preserve the original failure.
-          }
-          fail(
-            "pane_not_ready",
-            "Agent did not initialize its mailbox",
-            p.action,
-            startupDiagnostic || startupProcess
-              ? {
-                  details: {
-                    ...(startupDiagnostic ? { startupDiagnostic } : {}),
-                    ...(startupProcess ? { startupProcess } : {}),
-                  },
-                }
-              : {},
-          );
-        }
-        const expectedHerdrAgent = herdrAgentAlias(
-          workspaceId,
-          label,
-          state.runId,
-        );
-        if (started.herdrAgent !== expectedHerdrAgent)
-          fail(
-            "target_not_found",
-            "Agent launch returned an unexpected Herdr agent alias",
-            p.action,
-            { ids: { label, paneId: started.paneId } },
-          );
         if (
-          started.agent &&
-          !herdrAliasMatchesIfReported(started.agent, expectedHerdrAgent)
+          requestedLabel &&
+          labels.has(requestedLabel) &&
+          !(resumed && requestedLabel === resumed.label)
         )
           fail(
-            "target_not_found",
-            "Agent launch returned conflicting Herdr agent aliases",
+            "agent_label_exists",
+            `Agent label already exists: ${requestedLabel}`,
             p.action,
-            { ids: { label, paneId: started.paneId } },
           );
-        const runtime: Runtime = {
-          label,
-          herdrAgent: expectedHerdrAgent,
-          workspaceId,
-          paneId: started.paneId,
-          cwd: started.cwd,
-          runId: state.runId,
-          ownerSessionId: owner,
-          mailboxPath: mailbox,
-          piSessionId: state.piSessionId,
-          piSessionFile: state.piSessionFile,
-          agentDefinition,
-          model: started.agent?.model ?? null,
-          thinking: started.agent?.thinking ?? null,
-        };
-        validateIdentity(runtime, state, {
-          workspace_id: workspaceId,
-          label,
-          pane_id: started.paneId,
-          cwd: started.cwd,
-          pi_session_id: state.piSessionId,
-          pi_session_path: state.piSessionFile,
-        });
-        // Herdr chooses the pane only while starting. Re-render now that the
-        // authoritative final envelope identity is known.
-        assignmentInput = prepareMessageInput(
-          p.task,
-          resolveMessageFiles(ctx, p.files, p.action),
-          ctx.cwd,
-          p.action,
-          "Task",
-          {
-            inlineLimitBytes: limits.inline.bytes,
-            mailboxLimitBytes: limits.mailbox.bytes,
-            serializedBytes: (text, resultBindings) =>
-              requestRecordBytesFor(
-                options.build,
-                runtime,
-                "task",
-                text,
-                undefined,
-                assignment!.createdAt,
-                assignment!.requestId,
-                resultBindings,
-              ),
-          },
-        );
-        await validateIntegration(runtime, ctx, {
-          signal,
-          waitForSession: true,
-        });
-        for (const participant of preparedBootstrap)
-          await participant.commit?.();
-        runtimes.set(label, runtime);
-        options.onChanged();
-        const requestId = await submit(
-          runtime,
-          "task",
-          assignmentInput!.text,
-          ctx,
-          signal,
-          undefined,
-          assignment!.createdAt,
-          assignment!.requestId,
-          p.action,
-          assignmentInput!.resultBindings,
-          {
-            waitForLock: true,
-            beforeWrite: assertRootDelegationAllowed,
-          },
-        );
-        accepted = true;
-        options.onChanged();
-        return {
-          ok: true,
-          action: p.action,
-          agent: label,
-          definition: agentDefinition,
-          owner_session_id: runtime.ownerSessionId,
-          pane_id: runtime.paneId,
-          session_id: runtime.piSessionId,
-          session_path: runtime.piSessionFile,
-          request_id: requestId,
-        };
-      } catch (caught) {
-        if (promptWriteFailed) throw caught;
-        const startupFailure =
-          caught instanceof HerdrStartFailure ? caught : undefined;
-        const error = startupFailure?.cause ?? caught;
-        if (startupFailure) {
-          started = startupFailure.attempt;
-          if (error instanceof OperationError)
-            error.detail.details = {
-              ...error.detail.details,
-              stage: startupFailure.stage,
-            };
-          if (startupFailure.retryAttempted && error instanceof OperationError)
-            error.detail.retryAttempted = true;
-        }
-        let rollbackError: unknown;
-        const embeddedDetails =
-          error instanceof OperationError && error.detail.details
-            ? error.detail.details
-            : undefined;
-        const embeddedPrimary = embeddedDetails?.primary as
-          | {
-              category?: string;
-              message?: string;
-              operation?: string;
-            }
-          | undefined;
-        const primaryCause =
-          embeddedPrimary?.category && embeddedPrimary.message
-            ? {
-                category: embeddedPrimary.category as any,
-                message: embeddedPrimary.message,
-                operation: embeddedPrimary.operation ?? p.action,
-              }
-            : error instanceof OperationError
-              ? {
-                  category: error.detail.category,
-                  message: error.detail.message,
-                  operation: error.detail.operation,
-                }
-              : {
-                  category: "internal_failure" as const,
-                  message: String(error),
-                  operation: p.action,
-                };
-        const embeddedIds = embeddedDetails?.ids as
-          { label?: string; paneId?: string; tabId?: string } | undefined;
-        const ids = {
-          label,
-          ...(started?.paneId ? { paneId: started.paneId } : {}),
-          ...(started?.tabId ? { tabId: started.tabId } : {}),
-          ...(embeddedIds?.paneId ? { paneId: embeddedIds.paneId } : {}),
-          ...(embeddedIds?.tabId ? { tabId: embeddedIds.tabId } : {}),
-        };
-        const failedRuntime = runtimes.get(label);
-        if (failedRuntime)
-          for (const requestId of [
-            failedRuntime.activeRequestId,
-            failedRuntime.completedRequestId,
-          ])
-            if (requestId) {
-              const key = resultKey(failedRuntime, requestId);
-              resultDeliveryEvidence.delete(key);
-              resultDeliverySemanticRefs.delete(key);
-            }
-        invalidateRuntime(label);
-        try {
-          if (started) {
-            await rollbackStartedAgent(
-              ctx,
-              started,
-              label,
-              workspaceId,
-              runId,
-              mailbox,
-            );
-          } else {
-            await rollbackUnknownStartedAgent(ctx, label, mailbox);
-          }
-        } catch (rollbackFailure) {
-          rollbackError = rollbackFailure;
-          markRetryAttempted(rollbackFailure);
-          const cleanupCause = {
-            category: "internal_failure" as const,
-            message: String(rollbackFailure),
-            operation: "rollback",
-          };
-          const cleanupDetail = JSON.stringify({
-            primary: primaryCause,
-            cleanup: cleanupCause,
-            ids,
-          });
-          options.appendError(ctx, "pi_herdsman_cleanup_error", cleanupDetail);
-        }
-        if (rollbackError) {
-          options.onChanged();
+        const workspaceId = assignment!.workspaceId;
+        let label = requestedLabel ?? chooseLabel(agentDefinition, labels);
+        if (!validAgentLabel(label))
           fail(
-            "rollback_failure",
-            `Agent launch failed and rollback was incomplete. Primary: ${primaryCause.message}. Cleanup: ${String(rollbackError)}`,
+            "invalid_request",
+            'Agent label must start with a lowercase letter, contain only lowercase letters, digits, "_" or "-", and be at most 32 characters',
             p.action,
+          );
+        const continuationEvidence = resumed?.evidence;
+        let nestedEvidence =
+          scope.kind === "managed-agent"
+            ? currentManagedEvidence(ctx)
+            : undefined;
+        const projectAssignmentId =
+          nestedEvidence?.projectAssignmentId ??
+          continuationEvidence?.projectAssignmentId;
+        let projectEvidence: Awaited<
+          ReturnType<NonNullable<typeof options.projectEvidence>>
+        >;
+        projectEvidence =
+          scope.kind === "root"
+            ? await options.projectEvidence?.(ctx)
+            : nestedEvidence && projectAssignmentId
+              ? await options.managedProjectEvidence?.(
+                  ctx,
+                  nestedEvidence.workspaceId,
+                  projectAssignmentId,
+                )
+              : undefined;
+        if (
+          (scope.kind === "root" &&
+            continuationEvidence?.projectAssignmentId) ||
+          (scope.kind === "managed-agent" && nestedEvidence)
+        ) {
+          if (
+            !projectEvidence ||
+            projectEvidence.assignment.id !== projectAssignmentId
+          )
+            fail(
+              "invalid_request",
+              "Saved project evidence no longer has current assignment authority",
+              "continue",
+            );
+        }
+        const projectAssignment = projectEvidence?.assignment;
+        const evidenceProjectAssignmentId =
+          projectAssignmentId ?? projectAssignment?.id;
+        let requiredEvidence = continuationEvidence
+          ? [
+              ...continuationEvidence.inheritedEvidence,
+              ...continuationEvidence.localEvidence,
+            ]
+          : scope.kind === "managed-agent"
+            ? [
+                ...(nestedEvidence?.inheritedEvidence ?? []),
+                ...(nestedEvidence?.localEvidence ?? []),
+              ]
+            : (projectAssignment?.requiredEvidence ?? []);
+        if (p.retain === true) {
+          if (!p.files?.length)
+            fail(
+              "invalid_request",
+              "retain: true requires at least one file or result reference",
+              p.action,
+            );
+          if (!evidenceProjectAssignmentId)
+            fail(
+              "invalid_request",
+              "Required evidence can be retained only for a verified project assignment",
+              p.action,
+            );
+          const supplied = resolveMessageFiles(ctx, p.files, p.action);
+          const existingPaths = new Set(
+            requiredEvidence
+              .filter(
+                (entry): entry is Extract<RequiredEvidence, { path: string }> =>
+                  "path" in entry,
+              )
+              .map((entry) => resolve(entry.path)),
+          );
+          const existingRefs = new Set(
+            requiredEvidence
+              .filter(
+                (
+                  entry,
+                ): entry is Extract<
+                  RequiredEvidence,
+                  { result: ResultBinding }
+                > => "result" in entry,
+              )
+              .map((entry) => entry.result.ref),
+          );
+          const newFiles = supplied.filter((file) =>
+            typeof file === "string"
+              ? !existingPaths.has(resolve(ctx.cwd, file))
+              : !existingRefs.has(file.ref),
+          );
+          const additions: RequiredEvidence[] = [
+            ...persistRequiredTextFiles(
+              continuationEvidence?.evidenceAssignmentId ??
+                nestedEvidence?.evidenceAssignmentId ??
+                projectAssignment!.id,
+              newFiles.filter(
+                (file): file is string => typeof file === "string",
+              ),
+              ctx.cwd,
+              p.action,
+            ),
+            ...newFiles.flatMap((file) =>
+              typeof file === "string"
+                ? []
+                : [{ id: randomUUID(), name: file.ref, result: file }],
+            ),
+          ];
+          if (scope.kind === "managed-agent") {
+            if (!nestedEvidence)
+              fail(
+                "invalid_request",
+                "Managed-Agent evidence scope is unavailable",
+                p.action,
+              );
+            const state = readAgentState(process.env.PI_HERDSMAN_MAILBOX ?? "");
+            if (
+              !state?.activeRequestId ||
+              state.projectAssignmentId !== nestedEvidence.projectAssignmentId
+            )
+              fail(
+                "invalid_request",
+                "Managed-Agent assignment changed before evidence retention",
+                p.action,
+              );
+            const localEvidence = [...nestedEvidence.localEvidence];
+            for (const addition of additions)
+              if (
+                !localEvidence.some((entry) =>
+                  "result" in entry && "result" in addition
+                    ? entry.result.ref === addition.result.ref
+                    : "path" in entry && "path" in addition
+                      ? entry.path === addition.path ||
+                        (entry.sourceAssignmentId ===
+                          addition.sourceAssignmentId &&
+                          entry.name === addition.name &&
+                          entry.sha256 === addition.sha256)
+                      : false,
+                )
+              )
+                localEvidence.push(addition);
+            pi.appendEntry("pi-herdsman-agent-required-evidence", {
+              version: 1,
+              sessionId: ctx.sessionManager.getSessionId(),
+              requestId: state.activeRequestId,
+              runId: state.runId,
+              ownerSessionId: state.ownerSessionId,
+              workspaceId: state.workspaceId,
+              agentLabel: state.agentLabel,
+              paneId: state.paneId,
+              projectAssignmentId: nestedEvidence.projectAssignmentId,
+              evidenceAssignmentId: nestedEvidence.evidenceAssignmentId,
+              inheritedEvidence: nestedEvidence.inheritedEvidence,
+              localEvidence,
+            });
+            nestedEvidence = { ...nestedEvidence, localEvidence };
+            requiredEvidence = [
+              ...nestedEvidence.inheritedEvidence,
+              ...localEvidence,
+            ];
+            p.retentionPersisted = true;
+          } else {
+            if (!projectAssignment || !options.retainProjectEvidence)
+              fail(
+                "invalid_request",
+                "Assigned Lead cannot persist project evidence",
+                p.action,
+              );
+            const updated = await options.retainProjectEvidence(
+              ctx,
+              projectAssignment,
+              additions,
+            );
+            requiredEvidence = updated.requiredEvidence ?? [];
+            p.retentionPersisted = true;
+          }
+        }
+        if (
+          scope.kind === "managed-agent" &&
+          readAgentState(process.env.PI_HERDSMAN_MAILBOX ?? "")
+            ?.projectAssignmentId &&
+          !nestedEvidence
+        )
+          fail(
+            "invalid_request",
+            "Cannot verify this managed Agent's project evidence assignment",
+            p.action,
+          );
+        const evidenceMetadata = evidenceProjectAssignmentId
+          ? {
+              projectAssignmentId: evidenceProjectAssignmentId,
+              evidenceAssignmentId:
+                continuationEvidence?.evidenceAssignmentId ??
+                assignment!.requestId,
+              requiredEvidence,
+              ...(continuationEvidence
+                ? {
+                    inheritedEvidence: continuationEvidence.inheritedEvidence,
+                    localEvidence: continuationEvidence.localEvidence,
+                  }
+                : {}),
+            }
+          : undefined;
+        const requiredFiles: MessageFileInput[] = requiredEvidence.map(
+          (entry) => {
+            if ("result" in entry) return entry.result;
+            try {
+              readRequiredEvidenceSnapshot(entry.sourceAssignmentId, entry);
+            } catch (error) {
+              fail(
+                "invalid_request",
+                `Required evidence ${entry.name} is unavailable: ${String(error)}`,
+                p.action,
+              );
+            }
+            return entry.path;
+          },
+        );
+        const verifiedEvidence = requiredEvidence.filter(
+          (entry): entry is Extract<RequiredEvidence, { path: string }> =>
+            "path" in entry,
+        );
+        const explicitFiles = (
+          p.retain === true ? [] : resolveMessageFiles(ctx, p.files, p.action)
+        ).filter((file) => {
+          if (typeof file !== "string") return true;
+          try {
+            const [snapshot] = snapshotTextFiles([file], ctx.cwd, p.action, {
+              maxBytes: 1024 * 1024,
+            });
+            const digest = createHash("sha256")
+              .update(snapshot.text, "utf8")
+              .digest("hex");
+            return !verifiedEvidence.some((entry) => entry.sha256 === digest);
+          } catch {
+            return true;
+          }
+        });
+        const assignmentFiles = [...requiredFiles, ...explicitFiles];
+        const prepareAssignmentInput = (assignmentLabel: string) =>
+          prepareMessageInput(
+            p.task,
+            assignmentFiles,
+            ctx.cwd,
+            p.action,
+            "Task",
             {
-              rollbackOccurred: true,
-              retryAttempted: true,
-              ids,
-              primary: primaryCause,
-              cleanup: {
-                category: "internal_failure",
-                message: String(rollbackError),
-                operation: "rollback",
-              },
-              ...(error instanceof OperationError && error.detail.details
-                ? { details: error.detail.details }
-                : startupFailure
-                  ? { details: { stage: startupFailure.stage } }
-                  : {}),
-              nextAction:
-                "Resolve the reported cleanup failure before retrying.",
+              inlineLimitBytes: limits.inline.bytes,
+              verifiedEvidence,
+              fits: (text, resultBindings) =>
+                prospectiveAssignmentFits(
+                  options.build,
+                  assignment!.runId,
+                  assignment!.ownerSessionId,
+                  assignment!.workspaceId,
+                  assignmentLabel,
+                  text,
+                  "",
+                  assignment!.createdAt,
+                  assignment!.requestId,
+                  limits.mailbox.bytes,
+                  resultBindings,
+                  evidenceMetadata,
+                ),
             },
           );
+        // The label is knowable until a mailbox collision changes it; only Herdr's
+        // pane identity remains unknown until startup returns.
+        assignmentInput = prepareAssignmentInput(label);
+        const preparedBody = expandAgentBodyFiles(
+          definition.body,
+          assignmentInput.canonicalPaths,
+          p.action,
+        );
+        const preparedDefinition =
+          preparedBody === definition.body
+            ? definition
+            : { ...definition, body: preparedBody };
+        const effectiveDefinition = projectAgentDefinition(
+          preparedDefinition,
+          scope.kind === "managed-agent" ? "leaf" : "delegating",
+        );
+        const delegationEnabled =
+          agentDefinitionDelegationEnabled(effectiveDefinition);
+        const runId = assignment!.runId;
+        const owner = assignment!.ownerSessionId;
+        const forwardingSession =
+          scope.kind === "managed-agent"
+            ? (process.env.PI_SUBAGENT_PARENT_SESSION ?? owner)
+            : owner;
+        const configuredPlacement = readConfig().spawnPlacement;
+        const placement = await physicalPlacement(
+          ctx,
+          label,
+          configuredPlacement,
+          signal,
+        );
+        const placementRevalidator =
+          scope?.kind !== "managed-agent" && configuredPlacement === "tab"
+            ? async (
+                current: HerdrStartPlacement,
+              ): Promise<HerdrStartPlacement> => {
+                if (current.kind !== "tab") return current;
+                const candidate = await reusableLeadTab(ctx, signal);
+                return {
+                  kind: "tab",
+                  label: current.label,
+                  ...(candidate ? { tabId: candidate } : {}),
+                };
+              }
+            : undefined;
+        let mailbox = agentMailboxPath(workspaceId, label);
+        let releaseClaim: (() => void) | undefined;
+        while (true) {
+          try {
+            releaseClaim = claimAgentMailbox(mailbox);
+          } catch (error) {
+            if (!(error instanceof MailboxClaimOccupiedError)) {
+              throw error;
+            }
+            if (resumed) labels.delete(resumed.label);
+            else labels.add(label);
+            if (requestedLabel) {
+              fail(
+                "agent_label_exists",
+                `Agent label already exists: ${label}`,
+                p.action,
+              );
+            }
+            try {
+              labels.add(label);
+              label = chooseLabel(agentDefinition, labels);
+              if (!validAgentLabel(label))
+                fail(
+                  "invalid_request",
+                  'Agent label must start with a lowercase letter, contain only lowercase letters, digits, "_" or "-", and be at most 32 characters',
+                  p.action,
+                );
+              assignmentInput = prepareAssignmentInput(label);
+              mailbox = agentMailboxPath(workspaceId, label);
+              continue;
+            } catch (retryError) {
+              throw retryError;
+            }
+          }
+          try {
+            if (
+              !requestedLabel &&
+              guardMailboxOccupancy(mailbox, label, p.action, false)
+            ) {
+              releaseClaim();
+              releaseClaim = undefined;
+              labels.add(label);
+              label = chooseLabel(agentDefinition, labels);
+              if (!validAgentLabel(label))
+                fail(
+                  "invalid_request",
+                  'Agent label must start with a lowercase letter, contain only lowercase letters, digits, "_" or "-", and be at most 32 characters',
+                  p.action,
+                );
+              assignmentInput = prepareAssignmentInput(label);
+              mailbox = agentMailboxPath(workspaceId, label);
+              continue;
+            }
+            if (
+              requestedLabel &&
+              !(
+                resumed &&
+                reusableCompletedState &&
+                mailbox ===
+                  agentMailboxPath(
+                    reusableCompletedState.workspaceId,
+                    reusableCompletedState.agentLabel,
+                  ) &&
+                (() => {
+                  const current = readAgentState(mailbox);
+                  return (
+                    !!current &&
+                    current.piSessionId === resumed.id &&
+                    !current.activeRequestId &&
+                    current.completedRequestId ===
+                      reusableCompletedState.completedRequestId &&
+                    current.lastAck?.accepted === true &&
+                    current.lastAck.requestId === current.completedRequestId &&
+                    !unacknowledgedRequestExists(mailbox, current) &&
+                    !readPendingAsk(mailbox, current) &&
+                    !readResult(mailbox, current.completedRequestId!)
+                  );
+                })()
+              )
+            )
+              guardMailboxOccupancy(mailbox, label, p.action, true);
+            break;
+          } catch (error) {
+            if (releaseClaim) releaseClaim();
+            releaseClaim = undefined;
+            throw error;
+          }
         }
+        const pendingStart: PendingStart = {
+          label,
+          definition: agentDefinition,
+          requestId: assignment!.requestId,
+          ...(p.task !== undefined ? { task: p.task } : {}),
+          startedAt: Date.now(),
+          ...(scope.kind === "managed-agent" && process.env.PI_HERDSMAN_LABEL
+            ? { parentLabel: process.env.PI_HERDSMAN_LABEL }
+            : {}),
+        };
+        pendingStarts.set(label, pendingStart);
         options.onChanged();
-        if (embeddedDetails && !rollbackError) {
-          const durableDetail = JSON.stringify({
-            primary: primaryCause,
-            cleanup: embeddedDetails.cleanup,
-            ids,
+        let promptPaths: string[] = [];
+        let promptWriteFailed = false;
+        let started: StartedHerdrAgent | undefined;
+        let accepted = false;
+        const preparedBootstrap: Array<{
+          id: string;
+          commit?: () => void | Promise<void>;
+        }> = [];
+        try {
+          try {
+            promptPaths = writePrivatePromptSnapshots([
+              ...(preparedDefinition.body ? [preparedDefinition.body] : []),
+              SHARED_AGENT_INSTRUCTIONS,
+            ]);
+          } catch (error) {
+            promptWriteFailed = true;
+            throw error;
+          }
+          invalidateRuntime(label);
+          const resetRelease = claimAssignmentLock(mailbox, p.action, {
+            label,
           });
-          options.appendError(ctx, "pi_herdsman_cleanup_error", durableDetail);
-        }
-        if (error instanceof OperationError) {
-          error.detail.rollbackOccurred = true;
-          if (startupFailure?.retryAttempted)
-            error.detail.retryAttempted = true;
-          error.detail.ids = ids;
-          throw error;
-        }
-        fail("internal_failure", String(error), p.action, {
-          rollbackOccurred: true,
-          retryAttempted: startupFailure?.retryAttempted ?? false,
-          ids: {
+          try {
+            resetAgentMailbox(mailbox);
+          } finally {
+            resetRelease();
+          }
+          let ownerDisplay = "lead";
+          if (scope.kind === "managed-agent") {
+            const definition = process.env.PI_HERDSMAN_AGENT_DEFINITION;
+            const parentLabel = process.env.PI_HERDSMAN_LABEL;
+            if (!definition || !parentLabel)
+              throw new Error(
+                "Managed-Agent launch is missing its definition or label",
+              );
+            ownerDisplay = displayIdentity(definition, parentLabel);
+          }
+          if (p.action === "delegate") {
+            const registrations = new Map<
+              string,
+              ManagedAgentBootstrapPrepare
+            >();
+            let open = true;
+            let registrationError: Error | undefined;
+            pi.events.emit(MANAGED_AGENT_BOOTSTRAP_EVENT, {
+              protocol: 1,
+              phase: "prepare",
+              context: ctx,
+              agent: label,
+              register(id: string, prepare: ManagedAgentBootstrapPrepare) {
+                if (!open)
+                  throw new Error(
+                    "Managed-agent bootstrap registration is closed",
+                  );
+                if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(id)) {
+                  registrationError ??= new Error(
+                    "Invalid managed-agent bootstrap participant ID",
+                  );
+                  return;
+                }
+                if (registrations.has(id)) {
+                  registrationError ??= new Error(
+                    `Duplicate managed-agent bootstrap participant ID: ${id}`,
+                  );
+                  return;
+                }
+                if (typeof prepare !== "function") {
+                  registrationError ??= new Error(
+                    "Invalid managed-agent bootstrap prepare callback",
+                  );
+                  return;
+                }
+                registrations.set(id, prepare);
+              },
+            });
+            open = false;
+            if (registrationError) throw registrationError;
+            const participants: Array<{ id: string; payload: string }> = [];
+            for (const [id, prepare] of registrations) {
+              const result = await prepare();
+              if (result !== undefined) {
+                if (
+                  !result ||
+                  typeof result.payload !== "string" ||
+                  (result.commit !== undefined &&
+                    typeof result.commit !== "function")
+                )
+                  throw new Error(
+                    `Invalid preparation from managed-agent bootstrap participant "${id}"`,
+                  );
+                participants.push({ id, payload: result.payload });
+                preparedBootstrap.push({
+                  id,
+                  ...(result.commit ? { commit: result.commit } : {}),
+                });
+              }
+            }
+            if (participants.length)
+              writeAgentBootstrap(mailbox, {
+                version: 5,
+                build: options.build,
+                runId,
+                ownerSessionId: owner,
+                workspaceId,
+                agentLabel: label,
+                participants,
+              });
+          }
+          const env = [
+            `PI_HERDSMAN_MAILBOX=${mailbox}`,
+            `PI_HERDSMAN_RUN_ID=${runId}`,
+            `PI_HERDSMAN_OWNER_SESSION_ID=${owner}`,
+            `PI_HERDSMAN_OWNER_DISPLAY=${ownerDisplay}`,
+            `PI_SUBAGENT_PARENT_SESSION=${forwardingSession}`,
+            `PI_HERDSMAN_LABEL=${label}`,
+            `PI_HERDSMAN_WORKSPACE_ID=${workspaceId}`,
+            `PI_HERDSMAN_AGENT_DEFINITION=${agentDefinition}`,
+            `PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=${JSON.stringify(
+              delegationEnabled ? effectiveDefinition.frontmatter.agents : [],
+            )}`,
+            ...(process.env.PI_CODING_AGENT_DIR
+              ? [`PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR}`]
+              : []),
+            "PI_OFFLINE=1",
+          ];
+          // Pi reports the providers that extensions registered; a model from one
+          // of them cannot resolve in a child denied extension discovery.
+          // Older registries and test doubles may not expose the list, in which
+          // case nothing counts as extension-provided and the model is inherited
+          // exactly as before this change.
+          const registeredProviderIds = new Set(
+            ctx.modelRegistry?.getRegisteredProviderIds?.() ?? [],
+          );
+          const childModel = resolveChildModel({
+            configured: configuredModel(effectiveDefinition.frontmatter),
+            inherited:
+              !resumed && ctx.model
+                ? { provider: ctx.model.provider, token: modelToken(ctx.model) }
+                : undefined,
+            isForeignProvider: (providerId) =>
+              registeredProviderIds.has(providerId),
+          });
+          const launchArgs = agentLaunchArgs(effectiveDefinition, {
+            ...(effectiveDefinition.body
+              ? { bodyPromptPath: promptPaths[0] }
+              : {}),
+            sharedPromptPath: promptPaths[effectiveDefinition.body ? 1 : 0],
+            cwd: agentCwd,
+            managedAgent: true,
+            approveProject:
+              agentContext.projectTrusted && sameCwd(agentCwd, ctx.cwd),
+            ...(!resumed ? { inheritedThinking: pi.getThinkingLevel() } : {}),
+            modelDecision: childModel,
+          });
+          // Role/profile preflight may have changed while this assignment was prepared.
+          assertRootDelegationAllowed();
+          started = await startHerdrAgent(pi, ctx, {
+            label,
+            runId,
+            cwd: agentCwd,
+            extensionPath: options.extensionPath,
+            placement,
+            ...(placementRevalidator ? { placementRevalidator } : {}),
+            agentArgs: [...launchArgs, ...sessionArgs],
+            env,
+            signal,
+          });
+          const state = await waitForState(
+            mailbox,
+            (s) => s.runId === runId && s.ownerSessionId === owner,
+            { timeoutMs: 30_000, signal },
+          ).catch(() => undefined);
+          if (state)
+            requireCompatibleBuild(
+              options.build,
+              state.build,
+              p.action,
+              `Agent ${label} in pane ${started.paneId}`,
+            );
+          if (!state) {
+            let startupDiagnostic: string | undefined;
+            let startupProcess: Record<string, unknown> | undefined;
+            try {
+              const result = await pi.exec(
+                "herdr",
+                [
+                  "pane",
+                  "read",
+                  started.paneId,
+                  "--source",
+                  "recent-unwrapped",
+                  "--lines",
+                  "40",
+                ],
+                { cwd: ctx.cwd, signal, timeout: 5_000 },
+              );
+              if (result.code === 0 && !result.killed) {
+                const bytes = Buffer.from(
+                  `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim(),
+                  "utf8",
+                );
+                if (bytes.length) {
+                  let start = Math.max(0, bytes.length - 4096);
+                  while (
+                    start < bytes.length &&
+                    (bytes[start]! & 0xc0) === 0x80
+                  )
+                    start++;
+                  startupDiagnostic = bytes.subarray(start).toString("utf8");
+                }
+              }
+            } catch {
+              // Startup evidence is advisory; preserve the original failure.
+            }
+            try {
+              const process = await paneProcess(
+                pi,
+                ctx,
+                started.paneId,
+                undefined,
+                undefined,
+                true,
+                2_000,
+              );
+              if (process?.pane_id === started.paneId)
+                startupProcess = {
+                  pane_id: process.pane_id,
+                  shell_pid: process.shell_pid,
+                  foreground_processes: (
+                    process.foreground_processes ?? []
+                  ).map(({ argv0, state }) => ({
+                    ...(argv0 ? { argv0 } : {}),
+                    ...(state ? { state } : {}),
+                  })),
+                };
+            } catch {
+              // Process evidence is optional; preserve the original failure.
+            }
+            fail(
+              "pane_not_ready",
+              "Agent did not initialize its mailbox",
+              p.action,
+              startupDiagnostic || startupProcess
+                ? {
+                    details: {
+                      ...(startupDiagnostic ? { startupDiagnostic } : {}),
+                      ...(startupProcess ? { startupProcess } : {}),
+                    },
+                  }
+                : {},
+            );
+          }
+          const expectedHerdrAgent = herdrAgentAlias(
+            workspaceId,
+            label,
+            state.runId,
+          );
+          if (started.herdrAgent !== expectedHerdrAgent)
+            fail(
+              "target_not_found",
+              "Agent launch returned an unexpected Herdr agent alias",
+              p.action,
+              { ids: { label, paneId: started.paneId } },
+            );
+          if (
+            started.agent &&
+            !herdrAliasMatchesIfReported(started.agent, expectedHerdrAgent)
+          )
+            fail(
+              "target_not_found",
+              "Agent launch returned conflicting Herdr agent aliases",
+              p.action,
+              { ids: { label, paneId: started.paneId } },
+            );
+          const runtime: Runtime = {
+            label,
+            herdrAgent: expectedHerdrAgent,
+            workspaceId,
+            paneId: started.paneId,
+            cwd: started.cwd,
+            runId: state.runId,
+            ownerSessionId: owner,
+            mailboxPath: mailbox,
+            piSessionId: state.piSessionId,
+            piSessionFile: state.piSessionFile,
+            agentDefinition,
+            model: started.agent?.model ?? null,
+            thinking: started.agent?.thinking ?? null,
+          };
+          validateIdentity(runtime, state, {
+            workspace_id: workspaceId,
+            label,
+            pane_id: started.paneId,
+            cwd: started.cwd,
+            pi_session_id: state.piSessionId,
+            pi_session_path: state.piSessionFile,
+          });
+          // Herdr chooses the pane only while starting. Re-render now that the
+          // authoritative final envelope identity is known.
+          assignmentInput = prepareMessageInput(
+            p.task,
+            assignmentFiles,
+            ctx.cwd,
+            p.action,
+            "Task",
+            {
+              inlineLimitBytes: limits.inline.bytes,
+              mailboxLimitBytes: limits.mailbox.bytes,
+              verifiedEvidence,
+              serializedBytes: (text, resultBindings) =>
+                requestRecordBytesFor(
+                  options.build,
+                  runtime,
+                  "task",
+                  text,
+                  undefined,
+                  assignment!.createdAt,
+                  assignment!.requestId,
+                  resultBindings,
+                  evidenceMetadata,
+                ),
+            },
+          );
+          await validateIntegration(runtime, ctx, {
+            signal,
+            waitForSession: true,
+          });
+          for (const participant of preparedBootstrap)
+            await participant.commit?.();
+          runtimes.set(label, runtime);
+          options.onChanged();
+          const requestId = await submit(
+            runtime,
+            "task",
+            assignmentInput!.text,
+            ctx,
+            signal,
+            undefined,
+            assignment!.createdAt,
+            assignment!.requestId,
+            p.action,
+            assignmentInput!.resultBindings,
+            {
+              waitForLock: true,
+              evidence: evidenceMetadata,
+              beforeWrite: async () => {
+                assertRootDelegationAllowed();
+                if (nestedEvidence) {
+                  const current = currentManagedEvidence(ctx);
+                  if (
+                    !current ||
+                    current.projectAssignmentId !==
+                      nestedEvidence.projectAssignmentId ||
+                    current.evidenceAssignmentId !==
+                      nestedEvidence.evidenceAssignmentId ||
+                    JSON.stringify(current.inheritedEvidence) !==
+                      JSON.stringify(nestedEvidence.inheritedEvidence) ||
+                    JSON.stringify(current.localEvidence) !==
+                      JSON.stringify(nestedEvidence.localEvidence)
+                  )
+                    throw new Error(
+                      "Managed-Agent project assignment or required evidence changed during child startup; retry delegation",
+                    );
+                }
+                if (continuationEvidence && resumed) {
+                  const saved = SessionManager.open(resumed.path);
+                  if (saved.getSessionId() !== resumed.id)
+                    throw new Error(
+                      "The exact saved assignment session changed during continuation; retry",
+                    );
+                  const entries = requiredEvidenceEntriesForRequest(
+                    saved.getEntries(),
+                    continuationEvidence.requestId,
+                  );
+                  const record = entries.at(-1)?.data;
+                  if (
+                    !record ||
+                    record.requestId !== continuationEvidence.requestId ||
+                    record.projectAssignmentId !==
+                      continuationEvidence.projectAssignmentId ||
+                    record.evidenceAssignmentId !==
+                      continuationEvidence.evidenceAssignmentId ||
+                    JSON.stringify(record.inheritedEvidence) !==
+                      JSON.stringify(continuationEvidence.inheritedEvidence) ||
+                    JSON.stringify(record.localEvidence) !==
+                      JSON.stringify(continuationEvidence.localEvidence)
+                  )
+                    throw new Error(
+                      "Saved assignment evidence changed during continuation; retry",
+                    );
+                }
+                if (!projectEvidence || !projectAssignment) {
+                  if (
+                    continuationEvidence?.projectAssignmentId ||
+                    nestedEvidence?.projectAssignmentId
+                  )
+                    throw new Error(
+                      "Project assignment authority is no longer current; retry delegation",
+                    );
+                  return;
+                }
+                await projectEvidence.revalidate(async () => {
+                  const current =
+                    scope.kind === "root"
+                      ? await options.projectEvidence?.(ctx)
+                      : nestedEvidence && projectAssignmentId
+                        ? await options.managedProjectEvidence?.(
+                            ctx,
+                            nestedEvidence.workspaceId,
+                            projectAssignmentId,
+                          )
+                        : undefined;
+                  if (
+                    !current ||
+                    current.assignment.id !== projectAssignment.id ||
+                    (!resumed &&
+                      scope.kind === "root" &&
+                      JSON.stringify(
+                        current.assignment.requiredEvidence ?? [],
+                      ) !== JSON.stringify(requiredEvidence))
+                  )
+                    throw new Error(
+                      "Project assignment or required evidence changed during Agent startup; retry delegation",
+                    );
+                });
+              },
+            },
+          );
+          accepted = true;
+          options.onChanged();
+          return {
+            ok: true,
+            action: p.action,
+            agent: label,
+            definition: agentDefinition,
+            owner_session_id: runtime.ownerSessionId,
+            pane_id: runtime.paneId,
+            session_id: runtime.piSessionId,
+            session_path: runtime.piSessionFile,
+            request_id: requestId,
+          };
+        } catch (caught) {
+          if (promptWriteFailed) throw caught;
+          const startupFailure =
+            caught instanceof HerdrStartFailure ? caught : undefined;
+          const error = startupFailure?.cause ?? caught;
+          if (startupFailure) {
+            started = startupFailure.attempt;
+            if (error instanceof OperationError)
+              error.detail.details = {
+                ...error.detail.details,
+                stage: startupFailure.stage,
+              };
+            if (
+              startupFailure.retryAttempted &&
+              error instanceof OperationError
+            )
+              error.detail.retryAttempted = true;
+          }
+          let rollbackError: unknown;
+          const embeddedDetails =
+            error instanceof OperationError && error.detail.details
+              ? error.detail.details
+              : undefined;
+          const embeddedPrimary = embeddedDetails?.primary as
+            | {
+                category?: string;
+                message?: string;
+                operation?: string;
+              }
+            | undefined;
+          const primaryCause =
+            embeddedPrimary?.category && embeddedPrimary.message
+              ? {
+                  category: embeddedPrimary.category as any,
+                  message: embeddedPrimary.message,
+                  operation: embeddedPrimary.operation ?? p.action,
+                }
+              : error instanceof OperationError
+                ? {
+                    category: error.detail.category,
+                    message: error.detail.message,
+                    operation: error.detail.operation,
+                  }
+                : {
+                    category: "internal_failure" as const,
+                    message: String(error),
+                    operation: p.action,
+                  };
+          const embeddedIds = embeddedDetails?.ids as
+            { label?: string; paneId?: string; tabId?: string } | undefined;
+          const ids = {
             label,
             ...(started?.paneId ? { paneId: started.paneId } : {}),
             ...(started?.tabId ? { tabId: started.tabId } : {}),
-          },
-          ...(startupFailure
-            ? { details: { stage: startupFailure.stage } }
-            : {}),
-        });
-      } finally {
-        if (!accepted && pendingStarts.get(label) === pendingStart) {
-          pendingStarts.delete(label);
+            ...(embeddedIds?.paneId ? { paneId: embeddedIds.paneId } : {}),
+            ...(embeddedIds?.tabId ? { tabId: embeddedIds.tabId } : {}),
+          };
+          const failedRuntime = runtimes.get(label);
+          if (failedRuntime)
+            for (const requestId of [
+              failedRuntime.activeRequestId,
+              failedRuntime.completedRequestId,
+            ])
+              if (requestId) {
+                const key = resultKey(failedRuntime, requestId);
+                resultDeliveryEvidence.delete(key);
+                resultDeliverySemanticRefs.delete(key);
+              }
+          invalidateRuntime(label);
+          try {
+            if (started) {
+              await rollbackStartedAgent(
+                ctx,
+                started,
+                label,
+                workspaceId,
+                runId,
+                mailbox,
+              );
+            } else {
+              await rollbackUnknownStartedAgent(ctx, label, mailbox);
+            }
+          } catch (rollbackFailure) {
+            rollbackError = rollbackFailure;
+            markRetryAttempted(rollbackFailure);
+            const cleanupCause = {
+              category: "internal_failure" as const,
+              message: String(rollbackFailure),
+              operation: "rollback",
+            };
+            const cleanupDetail = JSON.stringify({
+              primary: primaryCause,
+              cleanup: cleanupCause,
+              ids,
+            });
+            options.appendError(
+              ctx,
+              "pi_herdsman_cleanup_error",
+              cleanupDetail,
+            );
+          }
+          if (rollbackError) {
+            options.onChanged();
+            fail(
+              "rollback_failure",
+              `Agent launch failed and rollback was incomplete. Primary: ${primaryCause.message}. Cleanup: ${String(rollbackError)}`,
+              p.action,
+              {
+                rollbackOccurred: true,
+                retryAttempted: true,
+                ids,
+                primary: primaryCause,
+                cleanup: {
+                  category: "internal_failure",
+                  message: String(rollbackError),
+                  operation: "rollback",
+                },
+                ...(error instanceof OperationError && error.detail.details
+                  ? { details: error.detail.details }
+                  : startupFailure
+                    ? { details: { stage: startupFailure.stage } }
+                    : {}),
+                nextAction:
+                  "Resolve the reported cleanup failure before retrying.",
+              },
+            );
+          }
           options.onChanged();
-        }
-        for (const promptPath of promptPaths)
-          if (statSync(promptPath, { throwIfNoEntry: false }))
-            unlinkSync(promptPath);
-        try {
-          if (releaseClaim) releaseClaim();
+          if (embeddedDetails && !rollbackError) {
+            const durableDetail = JSON.stringify({
+              primary: primaryCause,
+              cleanup: embeddedDetails.cleanup,
+              ids,
+            });
+            options.appendError(
+              ctx,
+              "pi_herdsman_cleanup_error",
+              durableDetail,
+            );
+          }
+          if (error instanceof OperationError) {
+            error.detail.rollbackOccurred = true;
+            if (startupFailure?.retryAttempted)
+              error.detail.retryAttempted = true;
+            error.detail.ids = ids;
+            throw error;
+          }
+          fail("internal_failure", String(error), p.action, {
+            rollbackOccurred: true,
+            retryAttempted: startupFailure?.retryAttempted ?? false,
+            ids: {
+              label,
+              ...(started?.paneId ? { paneId: started.paneId } : {}),
+              ...(started?.tabId ? { tabId: started.tabId } : {}),
+            },
+            ...(startupFailure
+              ? { details: { stage: startupFailure.stage } }
+              : {}),
+          });
         } finally {
-          if (releaseSessionActivation) releaseSessionActivation();
+          if (!accepted && pendingStarts.get(label) === pendingStart) {
+            pendingStarts.delete(label);
+            options.onChanged();
+          }
+          for (const promptPath of promptPaths)
+            if (statSync(promptPath, { throwIfNoEntry: false }))
+              unlinkSync(promptPath);
+          if (releaseClaim) releaseClaim();
         }
+      } finally {
+        if (releaseSessionActivation) releaseSessionActivation();
       }
     }
     fail(
@@ -6370,6 +7114,12 @@ export function createAgentController(
           }),
         ),
         files: FILES_SCHEMA,
+        retain: Type.Optional(
+          Type.Boolean({
+            description:
+              "Retain these files as required evidence for this assignment and its eligible descendants.",
+          }),
+        ),
       },
       { additionalProperties: false },
     );
@@ -6782,6 +7532,23 @@ export function createAgentController(
     signal?: AbortSignal,
   ): Promise<Record<string, unknown>> => {
     const scope = options.scope;
+    const actionUnsafeWithRetentionOutcome = async () => {
+      try {
+        return await actionUnsafe(ctx, params, signal);
+      } catch (error) {
+        if (
+          params.action === "delegate" &&
+          params.retain === true &&
+          params.retentionPersisted &&
+          error instanceof OperationError &&
+          !error.detail.message.startsWith(
+            "Required evidence was retained, but Agent delegation failed:",
+          )
+        )
+          error.detail.message = `Required evidence was retained, but Agent delegation failed: ${error.detail.message}`;
+        throw error;
+      }
+    };
     if (!scope)
       fail(
         "invalid_request",
@@ -6811,12 +7578,12 @@ export function createAgentController(
           ctx.sessionManager.getSessionId(),
         );
         try {
-          return await actionUnsafe(ctx, params, signal);
+          return await actionUnsafeWithRetentionOutcome();
         } finally {
           release();
         }
       }
-      return actionUnsafe(ctx, params, signal);
+      return actionUnsafeWithRetentionOutcome();
     }
     if (!ready)
       fail(
@@ -6847,7 +7614,7 @@ export function createAgentController(
         params.action === "reply"
       )
         return await controlAction(ctx, params, signal);
-      return await actionUnsafe(ctx, params, signal);
+      return await actionUnsafeWithRetentionOutcome();
     } finally {
       release();
     }

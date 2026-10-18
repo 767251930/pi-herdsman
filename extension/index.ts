@@ -832,6 +832,51 @@ export default function (pi: ExtensionAPI): void {
             ),
       staleAfterMs: STALE_AFTER_MS,
     },
+    managedProjectEvidence: async (ctx, workspaceId, projectAssignmentId) => {
+      const resolve = async () => {
+        const scope = await worktreeGroupScope(
+          pi,
+          ctx,
+          workspaceId,
+          ctx.signal,
+        );
+        const matches = findProjectAssignmentBySession(
+          supervisionRuntime(),
+          scope.repoKey,
+          projectAssignmentId,
+        );
+        if (matches.length > 1)
+          throw new Error(
+            "Multiple project assignments match the Agent session",
+          );
+        return matches[0];
+      };
+      const assignment = await resolve();
+      if (!assignment) return undefined;
+      return {
+        assignment,
+        revalidate: async (operation: () => Promise<void> | void) => {
+          const lease = acquireProcessLock(
+            `${projectAssignmentPath(
+              supervisionRuntime(),
+              assignment.repoKey,
+              assignment.branch,
+            )}.lock`,
+            { name: "project assignment lock" },
+          );
+          try {
+            const current = await resolve();
+            if (!current || current.id !== assignment.id)
+              throw new Error(
+                "Project assignment changed during Agent startup; retry delegation",
+              );
+            await operation();
+          } finally {
+            lease.release();
+          }
+        },
+      };
+    },
     persistedTranscriptReady: (state) =>
       controllerPersistedTranscriptReady(state, (path) => {
         const file = statSync(path, { throwIfNoEntry: false });
@@ -937,6 +982,12 @@ export default function (pi: ExtensionAPI): void {
       }),
       message: Type.String({ minLength: 1 }),
       files: FILES_SCHEMA,
+      retain: Type.Optional(
+        Type.Boolean({
+          description:
+            "For Manager messages to assigned project Leads: retain both message text and files as required evidence for future Agents. Use for lasting requirements and accepted reviews; omit for temporary communication.",
+        }),
+      ),
     },
     { additionalProperties: false },
   );
@@ -1864,7 +1915,7 @@ export default function (pi: ExtensionAPI): void {
           name: "message_staff",
           label: "message staff",
           description:
-            "Send a durable supervisor message to a direct report; active work is steered cooperatively.",
+            "Send a message to a direct report; active work is steered cooperatively.",
           parameters: staffMessageParameters,
           promptSnippet: undefined,
           promptGuidelines: [FILE_HANDOFF_GUIDANCE],

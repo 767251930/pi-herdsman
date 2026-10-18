@@ -85,7 +85,8 @@ are excluded; the internal session-file path is not returned.
 {
   "session": "<exact full Pi session ID>",
   "message": "Please revise the error handling.",
-  "files": ["/tmp/review.md", "result:implementation#1"]
+  "files": ["/tmp/review.md", "result:implementation#1"],
+  "retain": true
 }
 ```
 
@@ -99,6 +100,29 @@ steering behavior, whether the Lead is active or idle.
 result refs already supplied as evidence. Attachments are prepared at
 submission; the coordination record carries the prepared text and any hidden
 semantic-result bindings needed for the recipient to forward them.
+`retain` is optional and defaults to `false`. Set it to `true` only when the
+message text and supplied files should become continuing required evidence
+for the target's verified project assignment. The target must be an assigned
+project Lead; ordinary supervised Leads have no project evidence scope.
+Retention validates authority and evidence and fails explicitly when either is
+unavailable; it is never silently treated as an ordinary message. Retention
+and message delivery are one logical operation, but if persistence succeeds
+and delivery fails, the outcome reports that partial success rather than
+claiming the handoff completed. Initial `delegate_project.files` are required
+as well. See [Handoffs and files](../guides/handoffs.md#required-assignment-evidence).
+
+### Manage project required evidence
+
+In the Manager project-assignment action menu, choose **Required evidence**
+to inspect the assignment's required entries, including each exact ID, name,
+and origin. Select an entry to review its details, then choose **Remove** and
+confirm. This Manager-only action removes that exact project-owned requirement
+record. Inherited baseline requirements are shown as protected and cannot be
+removed there. Removal does not delete snapshots or source files and does not
+change evidence already accepted by Agents. The project menu does not remove
+managed-Agent-local additions; local-addition removal is an internal
+capability, not a separate model-facing tool or UI. Assigned Leads can retain
+project evidence through delegation but have no separate evidence-removal UI.
 
 ## `delegate_project`
 
@@ -116,8 +140,12 @@ writer.
 
 For new work, `files` uses the same configured attachment sizing policy as
 Agent delegation: `inlineAttachmentLimitBytes` controls per-file embedding and
-`mailboxPayloadLimitBytes` bounds the durable project assignment. Non-text or
-non-fitting files remain canonical references.
+`mailboxPayloadLimitBytes` bounds the durable project assignment. Explicitly
+supplied files are registered as required evidence for the assignment. Durable
+registration requires supported UTF-8 text no larger than 1 MiB; unsupported,
+binary, or oversized files fail instead of becoming required evidence. A
+supported snapshot that does not fit inline is delivered by reference to the
+preserved snapshot.
 
 Manager-created Leads inherit the Manager session's effective project-trust
 decision for that run; this does not modify Pi's persistent trust store.

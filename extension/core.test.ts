@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { mock, test } from "node:test";
@@ -27,6 +28,8 @@ let candidateReadContents: Buffer | undefined;
 let candidateReadOpenCount = 0;
 let candidateReadMissingOnSecondOpen = false;
 let candidateReadIsFile = true;
+let snapshotReadHook: (() => void) | undefined;
+let snapshotReadRequests: number[] = [];
 const syntheticCanonicalPaths = new Map<string, string>();
 mock.module("@earendil-works/pi-coding-agent", {
   namedExports: {
@@ -56,6 +59,7 @@ mock.module("node:fs", {
     },
     fsyncSync: realFs.fsyncSync,
     mkdirSync: realFs.mkdirSync,
+    lstatSync: realFs.lstatSync,
     openSync: (...args: any[]) => {
       openCallCount++;
       if (expectedCanonicalOpenPath && args[0] !== expectedCanonicalOpenPath)
@@ -92,6 +96,8 @@ mock.module("node:fs", {
     },
     readSync: (...args: any[]) => {
       if (countMessageReads) messageReadCount++;
+      snapshotReadHook?.();
+      if (snapshotReadHook) snapshotReadRequests.push(args[3] as number);
       if (
         candidateReadFd !== undefined &&
         args[0] === candidateReadFd &&
@@ -136,6 +142,7 @@ mock.module("node:fs", {
 
 const {
   prepareMessageInput,
+  persistRequiredTextFiles,
   snapshotTextFiles,
   agentControlState,
   displayIdentity,
@@ -265,6 +272,45 @@ test("snapshots strict text once and deduplicates canonical paths", () => {
   );
 });
 
+test("persists per-file snapshots independently and deduplicates canonical paths", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-herdsman-required-evidence-"));
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-herdsman-agent-dir-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const assignmentId = "11111111-1111-4111-8111-111111111111";
+  writeFileSync(join(cwd, "first.txt"), "a".repeat(600 * 1024));
+  writeFileSync(join(cwd, "second.txt"), "b".repeat(600 * 1024));
+  writeFileSync(join(cwd, "too-large.txt"), "c".repeat(1024 * 1024 + 1));
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    const evidence = persistRequiredTextFiles(
+      assignmentId,
+      ["first.txt", "./first.txt", "second.txt"],
+      cwd,
+      "assign",
+    );
+    assert.equal(evidence.length, 2);
+    assert.deepEqual(
+      evidence.map(({ name }) => name),
+      ["first.txt", "second.txt"],
+    );
+    assert.throws(
+      () =>
+        persistRequiredTextFiles(
+          "22222222-2222-4222-8222-222222222222",
+          ["too-large.txt"],
+          cwd,
+          "assign",
+        ),
+      /Request exceeds the mailbox size limit/,
+    );
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
 test("reads the canonical target for symlinked snapshots", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-herdsman-snapshot-link-"));
   const target = join(cwd, "target.txt");
@@ -357,6 +403,34 @@ test("snapshots reject NUL, invalid UTF-8, and byte limits", () => {
     snapshotTextFiles(["at-limit.txt"], cwd, "assign", { maxBytes: 3 })[0].text,
     "123",
   );
+});
+
+test("caps snapshot reads when a file grows after its size check", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-herdsman-snapshot-growth-"));
+  const path = join(cwd, "source.txt");
+  const maxBytes = 3;
+  writeFileSync(path, "123");
+  let grew = false;
+  snapshotReadRequests = [];
+  snapshotReadHook = () => {
+    if (!grew) {
+      grew = true;
+      realFs.appendFileSync(path, "456");
+    }
+  };
+  try {
+    assert.throws(
+      () => snapshotTextFiles([path], cwd, "assign", { maxBytes }),
+      /Request exceeds the mailbox size limit/,
+    );
+    assert.ok(grew);
+    assert.ok(snapshotReadRequests.length > 0);
+    assert.ok(snapshotReadRequests.every((count) => count <= maxBytes + 1));
+  } finally {
+    snapshotReadHook = undefined;
+    snapshotReadRequests = [];
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("prepares mixed message files as complete text or references", () => {
@@ -677,6 +751,46 @@ test("keeps a reference when the candidate descriptor has a different identity",
   }
 });
 
+test("rejects required evidence when its identity changes before preparation", () => {
+  const cwd = mkdtempSync(
+    join(tmpdir(), "pi-herdsman-required-evidence-identity-"),
+  );
+  const path = join(cwd, "plan.md");
+  writeFileSync(path, "approved plan");
+  const canonicalPath = realpathSync(path);
+  const initial = realFs.statSync(path);
+  candidateReadPath = canonicalPath;
+  candidateReadFd = undefined;
+  candidateReadSize = initial.size;
+  candidateReadDev = initial.dev + 1;
+  candidateReadIno = initial.ino + 1;
+  candidateReadOpenCount = 0;
+  try {
+    assert.throws(
+      () =>
+        prepareMessageInput("implement", [path], cwd, "assign", "Task", {
+          verifiedEvidence: [
+            {
+              path: canonicalPath,
+              sha256: createHash("sha256")
+                .update("approved plan")
+                .digest("hex"),
+            },
+          ],
+        }),
+      /Required evidence identity check failed/,
+    );
+  } finally {
+    candidateReadPath = undefined;
+    candidateReadFd = undefined;
+    candidateReadSize = undefined;
+    candidateReadDev = undefined;
+    candidateReadIno = undefined;
+    candidateReadOpenCount = 0;
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("keeps a candidate reference when its descriptor no longer fits", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-herdsman-message-resize-"));
   const path = join(cwd, "candidate");
@@ -705,6 +819,28 @@ test("keeps a candidate reference when its descriptor no longer fits", () => {
     candidateReadIsFile = true;
     candidateReadOpenCount = 0;
     countMessageReads = false;
+  }
+});
+
+test("rejects required evidence changed after its initial integrity check", () => {
+  const cwd = mkdtempSync(
+    join(tmpdir(), "pi-herdsman-required-evidence-toctou-"),
+  );
+  const path = join(cwd, "plan.md");
+  writeFileSync(path, "approved plan");
+  const expected = createHash("sha256").update("approved plan").digest("hex");
+  // Simulate a same-size replacement after assignment evidence was first read.
+  writeFileSync(path, "altered plan!");
+  try {
+    assert.throws(
+      () =>
+        prepareMessageInput("implement", [path], cwd, "assign", "Task", {
+          verifiedEvidence: [{ path: realpathSync(path), sha256: expected }],
+        }),
+      /Required evidence integrity check failed/,
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });
 

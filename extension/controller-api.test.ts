@@ -14,7 +14,11 @@ import type {
 } from "./mailbox.ts";
 import { OperationError } from "./errors.ts";
 import type { AgentDefinition } from "./agent-definitions.ts";
-import { resultPath, resultRef } from "./storage.ts";
+import {
+  readRequiredEvidenceSnapshot,
+  resultPath,
+  resultRef,
+} from "./storage.ts";
 import { acquireProcessLock, claimProcessLock } from "./lock.ts";
 import support, {
   CHILD_SESSION_ID,
@@ -1825,9 +1829,18 @@ for (const reachable of [true, false]) {
       tab_id: "root-tab",
       workspace_id: WORKSPACE,
     };
+    let pauseThirdWorktreeList = false;
+    let worktreeListsSincePause = 0;
+    let worktreeListPaused!: () => void;
+    let resumeWorktreeList!: () => void;
+    let worktreeListGate: Promise<void> | undefined;
     const exec = async (_command: string, args: string[]) => {
       let result: unknown = {};
-      if (args[0] === "worktree" && args[1] === "list")
+      if (args[0] === "worktree" && args[1] === "list") {
+        if (pauseThirdWorktreeList && ++worktreeListsSincePause === 3) {
+          worktreeListPaused();
+          await worktreeListGate;
+        }
         result = {
           source: {
             repo_key: "repo-key",
@@ -1836,7 +1849,7 @@ for (const reachable of [true, false]) {
           },
           worktrees: [],
         };
-      else if (isAgentList(args))
+      } else if (isAgentList(args))
         result = { agents: reachable ? [managerAgent] : [] };
       else if (args[0] === "agent" && args[1] === "get")
         result = { agent: reachable ? managerAgent : undefined };
@@ -2867,6 +2880,14 @@ async function runManagerStartupScenario(
   const childPath = existingGitWorktree;
   const reconciliationBranch = "smoke/orphan";
   const attachmentPath = join(tmpdir(), `assignment-${randomUUID()}.md`);
+  const mutationSourcePath = join(tmpdir(), `mutation-${randomUUID()}.md`);
+  const sameNameAttachmentDir = realFs.mkdtempSync(
+    join(tmpdir(), "caller-assignment-note-"),
+  );
+  const sameNameAttachmentPath = join(
+    sameNameAttachmentDir,
+    "assignment-note.txt",
+  );
   if (largeEvidence) writeFileSync(attachmentPath, "evidence\n".repeat(4096));
   let recipientIdle = true;
   let created = false;
@@ -3425,6 +3446,7 @@ async function runManagerStartupScenario(
           ? ["piSessionFile"]
           : []),
         "repoKey",
+        ...(starting.requiredEvidence ? ["requiredEvidence"] : []),
         "text",
         "version",
       ]);
@@ -4860,6 +4882,7 @@ async function runManagerStartupScenario(
         "branch",
         "id",
         "repoKey",
+        ...(assignment.requiredEvidence ? ["requiredEvidence"] : []),
         "text",
         "version",
       ]);
@@ -4933,6 +4956,7 @@ async function runManagerStartupScenario(
         "branch",
         "id",
         "repoKey",
+        ...(assignment.requiredEvidence ? ["requiredEvidence"] : []),
         "text",
         "version",
       ]);
@@ -5047,6 +5071,7 @@ async function runManagerStartupScenario(
         ? ["piSessionFile"]
         : []),
       "repoKey",
+      ...(assignment.requiredEvidence ? ["requiredEvidence"] : []),
       "text",
       "version",
     ]);
@@ -5054,6 +5079,15 @@ async function runManagerStartupScenario(
       assert.equal(
         assignment.piSessionFile,
         realFs.realpathSync(childSessionPath),
+      );
+    assert.equal(
+      assignment.requiredEvidence?.length ?? 0,
+      largeEvidence ? 2 : 1,
+    );
+    if (largeEvidence)
+      assert.match(
+        assignment.requiredEvidence?.[0]?.sha256 ?? "",
+        /^[a-f0-9]{64}$/,
       );
     assert.equal(createCalls, 1);
     assert.equal(startCalls, mode === "recovery" ? 0 : 1);
@@ -5068,31 +5102,74 @@ async function runManagerStartupScenario(
         supervisionRuntime(),
         childSession,
       )!;
+      const staffMessage = pi.tools.find(
+        (tool) => tool.name === "message_staff",
+      )!;
+      const invalidPath = `${attachmentPath}.missing`;
+      await assert.rejects(
+        staffMessage.execute(
+          "message",
+          {
+            session: childSession,
+            message: "INVALID_EVIDENCE_MUST_NOT_PUBLISH",
+            files: [invalidPath],
+            retain: true,
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+        /not readable|ENOENT|Required evidence/i,
+      );
+      assert.equal(
+        listChiefMessagePaths(supervisionRuntime(), childSession)
+          .map((path) => readChiefMessage(path))
+          .some(
+            (message) => message.text === "INVALID_EVIDENCE_MUST_NOT_PUBLISH",
+          ),
+        false,
+      );
+      assert.equal(
+        listProjectAssignments(supervisionRuntime(), repoKey).find(
+          (item) => item.branch === assignment.branch,
+        )?.requiredEvidence?.length ?? 0,
+        1,
+      );
+
+      realFs.writeFileSync(attachmentPath, "external review finding");
       writeLeadCoordinationState(supervisionRuntime(), {
         ...state,
         build: OTHER_HERDSMAN_BUILD,
         updatedAt: Date.now(),
       });
-      const staffMessage = pi.tools.find(
-        (tool) => tool.name === "message_staff",
-      )!;
       await assert.rejects(
         staffMessage.execute(
           "message",
-          { session: childSession, message: "MISMATCH_MUST_NOT_PUBLISH" },
+          {
+            session: childSession,
+            message: "MISMATCH_MUST_NOT_PUBLISH",
+            files: [attachmentPath],
+            retain: true,
+          },
           undefined,
           undefined,
           ctx,
         ),
-        (
-          error: Error & { category?: string; detail?: { category?: string } },
-        ) => {
-          assert.equal(
-            error.category ?? error.detail?.category,
-            "incompatible_build",
-          );
-          return true;
-        },
+        /Required evidence was retained, but the staff handoff failed:.*mismatch/i,
+      );
+      const afterFailure = listProjectAssignments(
+        supervisionRuntime(),
+        repoKey,
+      ).find((item) => item.branch === assignment.branch)!;
+      assert.deepEqual(
+        afterFailure.requiredEvidence?.map((entry) =>
+          readRequiredEvidenceSnapshot(afterFailure.id, entry),
+        ),
+        [
+          "deliver the fresh assignment",
+          "external review finding",
+          "MISMATCH_MUST_NOT_PUBLISH",
+        ],
       );
       assert.equal(
         listChiefMessagePaths(supervisionRuntime(), childSession)
@@ -5100,6 +5177,161 @@ async function runManagerStartupScenario(
           .some((message) => message.text === "MISMATCH_MUST_NOT_PUBLISH"),
         false,
       );
+
+      writeLeadCoordinationState(supervisionRuntime(), {
+        ...state,
+        build: HERDSMAN_BUILD,
+        updatedAt: Date.now(),
+      });
+      await staffMessage.execute(
+        "message",
+        {
+          session: childSession,
+          message: "MISMATCH_MUST_NOT_PUBLISH",
+          files: [attachmentPath],
+          retain: true,
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const afterRetry = listProjectAssignments(
+        supervisionRuntime(),
+        repoKey,
+      ).find((item) => item.branch === assignment.branch)!;
+      assert.deepEqual(
+        afterRetry.requiredEvidence?.map((entry) =>
+          readRequiredEvidenceSnapshot(afterRetry.id, entry),
+        ),
+        [
+          "deliver the fresh assignment",
+          "external review finding",
+          "MISMATCH_MUST_NOT_PUBLISH",
+        ],
+      );
+      assert.equal(
+        listChiefMessagePaths(supervisionRuntime(), childSession)
+          .map((path) => readChiefMessage(path))
+          .filter((message) =>
+            message.text.includes("MISMATCH_MUST_NOT_PUBLISH"),
+          ).length,
+        1,
+      );
+      const originalSource = "retained source version A";
+      const changedSource = "retained source version B";
+      realFs.writeFileSync(mutationSourcePath, originalSource);
+      const beforeMutation = listProjectAssignments(
+        supervisionRuntime(),
+        repoKey,
+      ).find((item) => item.branch === assignment.branch)!;
+      const priorEvidenceIds = new Set(
+        beforeMutation.requiredEvidence?.map((entry) => entry.id) ?? [],
+      );
+      let sourceChanged = false;
+      const mutateOnSnapshotRead = (path: unknown) => {
+        support.fileReadHook = undefined;
+        let currentAssignment;
+        try {
+          currentAssignment = listProjectAssignments(
+            supervisionRuntime(),
+            repoKey,
+          ).find((item) => item.branch === assignment.branch)!;
+        } finally {
+          support.fileReadHook = mutateOnSnapshotRead;
+        }
+        const snapshotPath = currentAssignment.requiredEvidence?.find(
+          (entry) => !priorEvidenceIds.has(entry.id) && "path" in entry,
+        );
+        if (!sourceChanged && snapshotPath && "path" in snapshotPath) {
+          // Read the retained snapshot through the real filesystem before changing its source.
+          realFs.readFileSync(snapshotPath.path);
+          sourceChanged = true;
+          realFs.writeFileSync(mutationSourcePath, changedSource);
+        }
+      };
+      support.fileReadHook = mutateOnSnapshotRead;
+      try {
+        await staffMessage.execute(
+          "retain-source-mutation",
+          {
+            session: childSession,
+            message: "retain this exact source version",
+            files: [mutationSourcePath],
+            retain: true,
+          },
+          undefined,
+          undefined,
+          ctx,
+        );
+      } finally {
+        support.fileReadHook = undefined;
+      }
+      assert.equal(sourceChanged, true, "the snapshot read triggers mutation");
+      const afterMutation = listProjectAssignments(
+        supervisionRuntime(),
+        repoKey,
+      ).find((item) => item.branch === assignment.branch)!;
+      const retainedSnapshot = afterMutation.requiredEvidence?.find(
+        (entry) => !priorEvidenceIds.has(entry.id) && "path" in entry,
+      );
+      assert.ok(retainedSnapshot && "path" in retainedSnapshot);
+      assert.equal(
+        readRequiredEvidenceSnapshot(afterMutation.id, retainedSnapshot),
+        originalSource,
+      );
+      const mutationDelivery = listChiefMessagePaths(
+        supervisionRuntime(),
+        childSession,
+      )
+        .map((path) => readChiefMessage(path))
+        .find((message) => message.text.includes(originalSource));
+      assert.ok(mutationDelivery);
+      const mutationInlineFiles = [
+        ...mutationDelivery.text.matchAll(/<file\b[^>]*>([\s\S]*?)<\/file>/g),
+      ].map((match) => match[1]);
+      assert.ok(
+        mutationInlineFiles.some((content) => content.includes(originalSource)),
+      );
+      assert.ok(
+        mutationInlineFiles.every(
+          (content) => !content.includes(changedSource),
+        ),
+      );
+
+      const callerFileContent = "caller supplied same-name attachment";
+      const generatedNote = "generated assignment note must not be attached";
+      realFs.writeFileSync(sameNameAttachmentPath, callerFileContent);
+      await staffMessage.execute(
+        "retain-same-name-attachment",
+        {
+          session: childSession,
+          message: generatedNote,
+          files: [sameNameAttachmentPath],
+          retain: true,
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const delivered = listChiefMessagePaths(
+        supervisionRuntime(),
+        childSession,
+      )
+        .map((path) => readChiefMessage(path))
+        .find((message) => message.text.includes(callerFileContent));
+      assert.ok(delivered);
+      assert.equal(delivered.kind, "manager_message");
+      const inlineFiles = [
+        ...delivered.text.matchAll(/<file\b[^>]*>([\s\S]*?)<\/file>/g),
+      ].map((match) => match[1]);
+      assert.ok(
+        inlineFiles.some((content) => content.includes(callerFileContent)),
+      );
+      assert.ok(
+        inlineFiles.every((content) => !content.includes(generatedNote)),
+        "the generated assignment note is handoff text, not an attachment",
+      );
+      assert.match(delivered.text, new RegExp(generatedNote));
       return;
     }
     if (mode === "success") {
@@ -5195,6 +5427,8 @@ async function runManagerStartupScenario(
       resetAgentMailbox(agentMailboxPath(state.workspaceId, state.agentLabel));
     releaseAssignmentLock?.();
     realFs.rmSync(attachmentPath, { force: true });
+    realFs.rmSync(mutationSourcePath, { force: true });
+    realFs.rmSync(sameNameAttachmentDir, { recursive: true, force: true });
     if (previousConfig !== undefined)
       realFs.writeFileSync(configPath, previousConfig);
     else realFs.rmSync(configPath, { force: true });

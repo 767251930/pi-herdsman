@@ -31,12 +31,14 @@ delegation is disabled.
 {
   "definition": "implementer",
   "label": "approved-change",
-  "task": "Implement the approved change"
+  "task": "Implement the approved change",
+  "files": ["result:reviewer#2"],
+  "retain": true
 }
 ```
 
-Call `delegate_agent` with `definition`, `task`, and optional `label` and
-`files`. The optional `label` must match `^[a-z][a-z0-9_-]{0,31}$` and sets
+Call `delegate_agent` with `definition`, `task`, and optional `label`, `files`,
+and `retain`. The optional `label` must match `^[a-z][a-z0-9_-]{0,31}$` and sets
 the requested logical agent label; an existing live-label collision fails.
 Fresh delegation runs in the calling controller's cwd.
 The definition is resolved from the effective roster and delegating agent
@@ -45,6 +47,17 @@ still require trusted project approval. A fresh delegation starts a new Pi
 session.
 Each accepted definition delegation creates one agent generation for one
 assignment. The terminal result is delivered once and the agent is cleaned up.
+`retain` defaults to `false`; omitted or false means `files` apply only to this
+handoff. With `retain: true`, the supplied files become required evidence for
+future descendants only when the caller has verified assignment authority:
+an assigned Lead adds them to the project assignment, while an eligible
+managed Agent adds them only to its local assignment. Task text is not retained
+by this operation. Inherited requirements remain project-owned and cannot be
+removed or changed by a managed Agent. Retention validates authority and
+evidence and fails explicitly rather than falling back to an ordinary
+delegation; if retention is persisted but delivery fails, the result reports
+that partial outcome. A result or file is retained only when explicitly
+included in `files` with `retain: true`.
 
 ## Managed-agent bootstrap extension contract
 
@@ -351,9 +364,21 @@ through a hidden binding; canonical `result:<request-id>` refs remain logical
 result references when explicitly supplied as evidence. `files` remains a
 `string[]` for all three forms.
 
-`files` is explicit per-message evidence. A fresh delegated session does not
-implicitly receive the caller's conversation or caller-side attachments.
-`continue_agent` resumes the exact saved managed-agent Pi history.
+`files` remains explicit per-message evidence; arbitrary caller conversation
+and attachments are not inherited. A fresh managed Agent in a verified project
+assignment also receives that assignment's required evidence automatically.
+That received set is fixed for the accepted assignment: later parent changes do
+not silently rewrite it. For an eligible project-scoped managed Agent,
+`delegate_agent` with `retain: true` adds only local requirements for its
+descendants; inherited evidence remains owned by the project assignment.
+`continue_agent` resumes the
+exact saved managed-agent Pi history and its verified assignment evidence.
+The Manager's project-assignment **Required evidence** menu is limited to
+project-owned requirements; it does not remove an Agent's local additions.
+Assigned Leads can retain project evidence through delegation but have no
+separate evidence-removal UI. Managed Agents likewise have no separate
+model-facing evidence-removal tool or UI; local-addition removal remains an
+internal capability.
 
 Startup uses Herdsman's default timeout budget; it is unrelated to managed-agent
 Pi shell execution. Direct calls from a managed agent to the Pi built-in

@@ -17,6 +17,15 @@ successful Herdr worktree removal, or authoritative verification that its
 checkout no longer exists. Failed or ambiguous verification preserves the
 assignment.
 
+The initial task and files supplied to `delegate_project` become required
+evidence for that project and its descendants. When forwarding accepted review findings, project requirements,
+or decisions that future Agents must follow, use `message_staff(..., retain:
+true)` and phrase retained messages as lasting requirements. The immediate
+handoff uses the same retained file snapshots. This retains both the message text and supplied files as required project evidence. Use ordinary messages for temporary instructions, questions, and status updates.
+Without `retain: true`, message files are for that handoff only. Use the project
+assignment menu's **Required evidence** section to inspect and remove
+project-owned evidence; inherited baseline entries are protected.
+
 Use `remove_worktree` only when the user explicitly requests removal of a
 project checkout. Do not infer removal from task completion, review, or
 inactivity. The user must confirm removal interactively.
