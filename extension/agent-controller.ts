@@ -117,6 +117,7 @@ import {
   type RemovedHerdrWorktree,
 } from "./herdr.ts";
 import { fileURLToPath } from "node:url";
+import { readEffectiveConfig } from "./config.ts";
 import {
   contextAgentDefinitions,
   agentLaunchArgs,
@@ -1638,7 +1639,10 @@ export function resolveAssignmentSession(
   ctx: ExtensionContext,
   raw: string,
   options: {
-    contextRetirement?: boolean;
+    contextRetirementForSession?: (
+      ctx: ExtensionContext,
+      manager: SessionManager,
+    ) => boolean | undefined;
     isContextRetired?: (manager: SessionManager) => boolean;
   } = {},
 ): ResolvedAssignmentSession {
@@ -1703,13 +1707,18 @@ export function resolveAssignmentSession(
           `Saved assignment session has no non-empty cwd in its session header: ${child.path}`,
           "continue",
         );
-      if (options.contextRetirement && options.isContextRetired?.(manager))
-        fail(
-          "invalid_request",
-          `Managed agent session ${child.id} is retired after context pressure. ` +
-            "Delegate a fresh agent and pass the previous result/handoff and relevant files.",
-          "continue",
-        );
+      const retired = options.isContextRetired?.(manager) ?? false;
+      if (retired) {
+        const enabled = options.contextRetirementForSession?.(ctx, manager);
+        if (enabled !== false)
+          fail(
+            "invalid_request",
+            enabled === true
+              ? `Managed agent session ${child.id} is retired after context pressure. Delegate a fresh agent and pass the previous result/handoff and relevant files.`
+              : `Cannot verify the retirement policy for saved agent session ${child.id}. Continue from the original trusted project context or create a fresh Agent.`,
+            "continue",
+          );
+      }
       return {
         path: child.path,
         id: child.id,
@@ -2549,7 +2558,7 @@ export type AgentControllerOptions = {
     details: Record<string, unknown>,
   ): void;
   sendAskMessage(ctx: ExtensionContext, ask: AskRecord): void;
-  sessionRetired(runtime: Runtime): boolean;
+  sessionRetired(ctx: ExtensionContext, runtime: Runtime): boolean | undefined;
   appendError(ctx: ExtensionContext, kind: string, error: unknown): void;
   onChanged(): void;
   onWorkChanged(ctx: ExtensionContext): void;
@@ -5278,10 +5287,13 @@ export function createAgentController(
             "pi_herdsman_result_error",
             completion.persistenceError,
           );
-        const sessionRetired = options.sessionRetired(runtime);
-        const retirement = sessionRetired
-          ? "Session retired after context pressure. Do not continue this session. For follow-up, delegate a fresh agent and pass this result/handoff plus the relevant files."
-          : undefined;
+        const sessionRetired = options.sessionRetired(context, runtime);
+        const retirement =
+          sessionRetired === true
+            ? "Session retired after context pressure. Do not continue this session. For follow-up, delegate a fresh agent and pass this result/handoff plus the relevant files."
+            : sessionRetired === undefined
+              ? "The saved session's retirement policy could not be verified. Continue only from its original trusted project context or create a fresh Agent."
+              : undefined;
         const status = resultStatus(runtime, result.requestId, entries);
         const header = [
           "Agent result",
@@ -5313,7 +5325,7 @@ export function createAgentController(
             : {}),
           agentDefinition: runtime.agentDefinition,
           status: result.status,
-          sessionRetired,
+          sessionRetired: sessionRetired ?? null,
           ...(elapsedMs !== undefined ? { elapsedMs } : {}),
           contextUsage: result.contextUsage,
           truncated: completion.truncated,
@@ -5473,8 +5485,11 @@ export function createAgentController(
       const resumed =
         p.action === "continue"
           ? resolveAssignmentSession(ctx, p.session, {
-              contextRetirement: readConfig().contextRetirement,
               isContextRetired: options.isContextRetired,
+              contextRetirementForSession: (context, manager) =>
+                sameCwd(context.cwd, manager.getCwd())
+                  ? readEffectiveConfig(context).contextRetirement
+                  : undefined,
             })
           : undefined;
       await herdrVersion(pi, ctx, signal);
