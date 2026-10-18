@@ -15,10 +15,10 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
-import { PI_AGENT_ROOT, realFs } from "./support.ts";
+import support, { PI_AGENT_ROOT, realFs } from "./support.ts";
 import { acquireProcessLock } from "./lock.ts";
 import { test } from "node:test";
-import {
+const {
   chiefMessagePath,
   chiefMessageBytes,
   COORDINATION_INBOX_SCAN_LIMIT,
@@ -39,6 +39,9 @@ import {
   listProjectAssignments,
   removeProjectAssignment,
   retireProjectAssignment,
+  releaseProjectAssignment,
+  listPendingRetirements,
+  removePendingRetirement,
   removeProjectMessagesForAssignment,
   recoverStaleProjectMessages,
   projectAssignmentPath,
@@ -83,11 +86,13 @@ import {
   writePeerLeadRecord,
   removeChiefMessage,
   writeLeadCoordinationState,
-  type LeadCoordinationState,
-  type OpenProjectWorkspace,
-  type PeerLeadRecord,
-  type ProjectMessage,
-  type ChiefMessageRecord,
+} = await import("./supervision.ts");
+import type {
+  LeadCoordinationState,
+  OpenProjectWorkspace,
+  PeerLeadRecord,
+  ProjectMessage,
+  ChiefMessageRecord,
 } from "./supervision.ts";
 
 const socket = () =>
@@ -3431,6 +3436,251 @@ test("project retirement storage failure preserves pending messages", () => {
   );
 });
 
+test("pending retirements preserve exact generations and reject conflicting storage", () => {
+  const runtime = supervisionRuntime(socket());
+  const a = {
+    version: 2 as const,
+    id: id(),
+    repoKey: "pending",
+    branch: "feature",
+    text: "private task",
+  };
+  writeProjectAssignment(runtime, a);
+  assert.equal(retireProjectAssignment(runtime, a), true);
+  assert.deepEqual(listPendingRetirements(runtime, a.repoKey), [a]);
+  assert.equal(retireProjectAssignment(runtime, a), false);
+  const b = { ...a, id: id() };
+  writeProjectAssignment(runtime, b);
+  assert.equal(retireProjectAssignment(runtime, b), true);
+  removePendingRetirement(runtime, a);
+  removePendingRetirement(runtime, a);
+  assert.deepEqual(listPendingRetirements(runtime, a.repoKey), [b]);
+  writeProjectAssignment(runtime, b);
+  assert.throws(() => retireProjectAssignment(runtime, b), /already exists/);
+  assert.deepEqual(readProjectAssignment(runtime, b.repoKey, b.branch), b);
+  assert.equal(releaseProjectAssignment(runtime, b), true);
+  assert.deepEqual(listPendingRetirements(runtime, b.repoKey), [b]);
+});
+
+test("pending retirement validation fails closed without deleting evidence", () => {
+  for (const scenario of [
+    "JSON",
+    "schema",
+    "identity",
+    "oversized",
+    "symlink",
+    "directory",
+    "parent symlink",
+  ] as const) {
+    const runtime = supervisionRuntime(socket());
+    const a = {
+      version: 2 as const,
+      id: id(),
+      repoKey: "invalid-pending",
+      branch: "feature",
+      text: "task",
+    };
+    writeProjectAssignment(runtime, a);
+    retireProjectAssignment(runtime, a);
+    const directory = join(
+      runtime.root,
+      "retirements",
+      basename(dirname(projectAssignmentPath(runtime, a.repoKey, a.branch))),
+    );
+    const path = join(directory, readdirSync(directory)[0]!);
+    if (scenario === "JSON") writeFileSync(path, "{");
+    if (scenario === "schema") writeFileSync(path, "{}");
+    if (scenario === "identity")
+      writeFileSync(path, JSON.stringify({ ...a, id: id() }));
+    if (scenario === "oversized")
+      writeFileSync(path, "x".repeat(PROJECT_ASSIGNMENT_MAX_BYTES * 2 + 1));
+    if (scenario === "symlink") {
+      unlinkSync(path);
+      realFs.symlinkSync(
+        projectAssignmentPath(runtime, a.repoKey, a.branch),
+        path,
+      );
+    }
+    if (scenario === "directory") {
+      unlinkSync(path);
+      mkdirSync(path);
+    }
+    if (scenario === "parent symlink") {
+      const moved = `${directory}.saved`;
+      realFs.renameSync(directory, moved);
+      realFs.symlinkSync(moved, directory, "dir");
+    }
+    const readErrors: Error[] = [];
+    if (scenario === "parent symlink")
+      assert.throws(() => listPendingRetirements(runtime, a.repoKey));
+    else {
+      assert.throws(
+        () => listPendingRetirements(runtime, a.repoKey),
+        /Unable to read project assignment/,
+        scenario,
+      );
+      assert.deepEqual(
+        listPendingRetirements(runtime, a.repoKey, {
+          onReadError: (error) => readErrors.push(error),
+        }),
+        [],
+        scenario,
+      );
+    }
+    if (scenario !== "parent symlink") assert.equal(readErrors.length, 1);
+    assert.throws(
+      () => removePendingRetirement(runtime, a),
+      undefined,
+      scenario,
+    );
+    assert.ok(realFs.lstatSync(path), scenario);
+  }
+});
+
+test("pending retirement scan is bounded and advances fairly through records", () => {
+  const runtime = supervisionRuntime(socket());
+  const records = Array.from(
+    { length: COORDINATION_INBOX_SCAN_LIMIT + 3 },
+    (_, i) => ({
+      version: 2 as const,
+      id: id(),
+      repoKey: "pending-scan",
+      branch: `feature-${i}`,
+      text: "task",
+    }),
+  );
+  for (const record of records) {
+    writeProjectAssignment(runtime, record);
+    assert.equal(retireProjectAssignment(runtime, record), true);
+  }
+  let after: string | undefined;
+  const found = new Set<string>();
+  for (let pass = 0; pass < records.length; pass++) {
+    let attempts = 0;
+    const batch = listPendingRetirements(runtime, "pending-scan", {
+      after,
+      recordLimit: 1,
+      onScanned: (entry) => {
+        attempts++;
+        after = entry;
+      },
+    });
+    assert.ok(attempts <= COORDINATION_INBOX_SCAN_LIMIT);
+    assert.equal(batch.length, 1);
+    found.add(batch[0]!.id);
+  }
+  assert.equal(found.size, records.length);
+  const directory = join(
+    runtime.root,
+    "retirements",
+    basename(dirname(projectAssignmentPath(runtime, "pending-scan", "lookup"))),
+  );
+  for (const entry of readdirSync(directory))
+    writeFileSync(join(directory, entry), "{");
+  after = undefined;
+  for (const expectedAttempts of [
+    COORDINATION_INBOX_SCAN_LIMIT,
+    COORDINATION_INBOX_SCAN_LIMIT,
+    COORDINATION_INBOX_SCAN_LIMIT,
+  ]) {
+    let attempts = 0;
+    assert.deepEqual(
+      listPendingRetirements(runtime, "pending-scan", {
+        after,
+        onScanned: (entry) => {
+          attempts++;
+          after = entry;
+        },
+        onReadError: () => {},
+      }),
+      [],
+    );
+    assert.equal(attempts, expectedAttempts);
+  }
+});
+
+test("pending retirement consumption reads only its exact path", () => {
+  const runtime = supervisionRuntime(socket());
+  const a = {
+    version: 2 as const,
+    id: id(),
+    repoKey: "pending-exact-remove",
+    branch: "corrupt",
+    text: "task",
+  };
+  const b = { ...a, id: id(), branch: "valid" };
+  for (const assignment of [a, b]) {
+    writeProjectAssignment(runtime, assignment);
+    assert.equal(retireProjectAssignment(runtime, assignment), true);
+  }
+  const directory = join(
+    runtime.root,
+    "retirements",
+    basename(dirname(projectAssignmentPath(runtime, a.repoKey, a.branch))),
+  );
+  const corruptPath = join(
+    directory,
+    `${createHash("sha256").update(a.branch).digest("hex")}.${a.id}.json`,
+  );
+  writeFileSync(corruptPath, "{");
+  removePendingRetirement(runtime, b);
+  assert.ok(realFs.lstatSync(corruptPath));
+  assert.throws(
+    () => listPendingRetirements(runtime, a.repoKey),
+    /Unable to read project assignment/,
+  );
+});
+
+test("retirement rename and post-commit sync failures preserve recoverable state", () => {
+  for (const failure of ["rename", "sync"] as const) {
+    if (failure === "sync" && process.platform === "win32") continue;
+    const runtime = supervisionRuntime(socket());
+    const a = {
+      version: 2 as const,
+      id: id(),
+      repoKey: "failure-boundary",
+      branch: "feature",
+      text: "task",
+    };
+    const handoff = {
+      version: 2 as const,
+      id: id(),
+      repoKey: a.repoKey,
+      branch: a.branch,
+      fromSessionId: a.id,
+      text: "handoff",
+      createdAt: 1,
+    };
+    writeProjectAssignment(runtime, a);
+    writeProjectMessage(handoff, runtime);
+    support.retirementFailure = failure;
+    try {
+      assert.throws(
+        () => retireProjectAssignment(runtime, a),
+        /injected retirement/,
+      );
+    } finally {
+      support.retirementFailure = undefined;
+    }
+    assert.deepEqual(
+      readProjectAssignment(runtime, a.repoKey, a.branch),
+      failure === "rename" ? a : undefined,
+    );
+    assert.deepEqual(
+      listPendingRetirements(runtime, a.repoKey),
+      failure === "rename" ? [] : [a],
+    );
+    assert.deepEqual(listProjectMessages(runtime, a.repoKey, a.branch), [
+      handoff,
+    ]);
+    if (failure === "sync") {
+      assert.equal(retireProjectAssignment(runtime, a), false);
+      removeProjectMessagesForAssignment(runtime, a);
+      removePendingRetirement(runtime, a);
+      assert.deepEqual(listPendingRetirements(runtime, a.repoKey), []);
+    }
+  }
+});
 test("project message recovery rejects symlinked ancestors without touching external records", () => {
   for (const ancestor of ["root", "assignments", "repository"] as const) {
     const runtime = supervisionRuntime(socket());
