@@ -81,6 +81,7 @@ import {
   configuredToolPolicy,
   configuredModel,
   discoverRoleDefinition,
+  isRuntimeRoleDefinition,
   isReservedRoleDefinition,
   matchesToolPattern,
   expandAgentBodyFiles,
@@ -148,6 +149,18 @@ type LeadTransitionHost = {
   managerTools: readonly string[];
   executionTools?(): string[];
   restoreLeadExecution?(ctx: ExtensionContext): Promise<void>;
+  applyRuntimeExecutionSettings(
+    ctx: ExtensionContext,
+    definition: AgentDefinition,
+  ): Promise<RuntimeExecutionSnapshot | undefined>;
+  applyActiveRuntimeSettings(
+    ctx: ExtensionContext,
+    isCurrent?: () => boolean,
+  ): Promise<void>;
+  restoreRuntimeExecutionSettings(
+    ctx: ExtensionContext,
+    snapshot: RuntimeExecutionSnapshot | undefined,
+  ): Promise<void>;
   invalidateLeadCoordinationState: typeof import("./supervision.ts").invalidateLeadCoordinationState;
   enterChief(
     ctx: ExtensionContext,
@@ -236,6 +249,32 @@ type SupervisoryProfile = {
   tools: string[];
   sessionId: string;
   valid: boolean;
+};
+
+type RuntimeExecutionSnapshot = {
+  sessionId: string;
+  branchGeneration: number;
+  model: Model | undefined;
+  thinking: string;
+};
+
+const modelToken = (model: { provider: string; id: string }): string =>
+  `${model.provider}/${model.id}`;
+
+const resolveConfiguredModel = (
+  ctx: ExtensionContext,
+  configured: string,
+): Model | undefined => {
+  const models = ctx.modelRegistry.getAll();
+  const canonical = models.find(
+    (candidate: Model) => modelToken(candidate) === configured,
+  );
+  if (canonical) return canonical;
+  const compactMatches = models.filter(
+    (candidate: Model) =>
+      compactModelToken(modelToken(candidate)) === configured,
+  );
+  return compactMatches.length === 1 ? compactMatches[0] : undefined;
 };
 
 type LeadRuntimeOptions = {
@@ -964,41 +1003,77 @@ export function createLeadSessionTreeRuntime(host: {
   failClosedBranchExecution(ctx: ExtensionContext): void;
   isRoot(): boolean;
   appendRoleError(ctx: ExtensionContext, error: unknown): void;
+  applyActiveRuntimeSettings(
+    ctx: ExtensionContext,
+    isCurrent?: () => boolean,
+  ): Promise<void>;
+  branchChanged(): number;
+  currentBranchGeneration(): number;
+  waitForModelWrites(): Promise<void>;
 }) {
   const isRoot = () => host.isRoot();
+  let reconciliation = Promise.resolve();
   return {
-    async sessionTree(ctx: ExtensionContext): Promise<void> {
-      if (!host.controller.sessionActive()) return;
-      const watchActiveAsks = (): void => {
-        host.controller.sessionTreeChanged(
-          ctx,
-          host.controller.sessionSignal(),
-        );
-      };
-      // Ordinary Lead tree changes need synchronous ask watching before reconciliation.
-      const roleAtTreeChange = host.roleTransitions.branchRoleObservation();
-      if (roleAtTreeChange.watchBeforeReconcile) watchActiveAsks();
-      if (isRoot()) {
-        try {
-          await host.reconcileBranchExecution(ctx);
-        } catch (error) {
-          host.appendRoleError(ctx, error);
+    sessionTree(ctx: ExtensionContext): Promise<void> {
+      const generation = host.branchChanged();
+      const reconcile = async (): Promise<void> => {
+        if (
+          generation !== host.currentBranchGeneration() ||
+          !host.controller.sessionActive()
+        )
+          return;
+        const sessionId = ctx.sessionManager.getSessionId();
+        const watchActiveAsks = (): void => {
+          host.controller.sessionTreeChanged(
+            ctx,
+            host.controller.sessionSignal(),
+          );
+        };
+        // Ordinary Lead tree changes need synchronous ask watching before reconciliation.
+        const roleAtTreeChange = host.roleTransitions.branchRoleObservation();
+        if (roleAtTreeChange.watchBeforeReconcile) watchActiveAsks();
+        if (isRoot()) {
+          try {
+            await host.reconcileBranchExecution(ctx);
+          } catch (error) {
+            host.appendRoleError(ctx, error);
+            try {
+              await host.roleTransitions.reconcileBranchRole(ctx);
+            } catch (roleError) {
+              host.appendRoleError(ctx, roleError);
+            }
+            host.failClosedBranchExecution(ctx);
+            if (roleAtTreeChange.wasChief) watchActiveAsks();
+            return;
+          }
           try {
             await host.roleTransitions.reconcileBranchRole(ctx);
-          } catch (roleError) {
-            host.appendRoleError(ctx, roleError);
+          } catch (error) {
+            host.appendRoleError(ctx, error);
           }
-          host.failClosedBranchExecution(ctx);
-          if (roleAtTreeChange.wasChief) watchActiveAsks();
-          return;
+          if (
+            ctx.sessionManager.getSessionId() === sessionId &&
+            generation === host.currentBranchGeneration()
+          ) {
+            try {
+              await host.applyActiveRuntimeSettings(
+                ctx,
+                () => generation === host.currentBranchGeneration(),
+              );
+            } catch (error) {
+              if (generation === host.currentBranchGeneration())
+                host.appendRoleError(ctx, error);
+            }
+          }
         }
-        try {
-          await host.roleTransitions.reconcileBranchRole(ctx);
-        } catch (error) {
-          host.appendRoleError(ctx, error);
-        }
-      }
-      if (roleAtTreeChange.wasChief) watchActiveAsks();
+        if (roleAtTreeChange.wasChief) watchActiveAsks();
+      };
+      const next = reconciliation.then(reconcile, reconcile);
+      reconciliation = next.catch(() => {});
+      return next;
+    },
+    beforeTree(): Promise<void> {
+      return host.waitForModelWrites();
     },
   };
 }
@@ -1072,6 +1147,7 @@ export function createLeadSessionStartRuntime(host: {
   ): Promise<Record<string, unknown>[]>;
   rootDelegationPolicy?(): RootDelegationPolicy;
   appendDefinitionError(ctx: ExtensionContext, error: unknown): void;
+  applyActiveRuntimeSettings(ctx: ExtensionContext): Promise<void>;
 }) {
   const isRoot = () => host.isRoot();
   return {
@@ -1276,6 +1352,13 @@ export function createLeadSessionStartRuntime(host: {
             }
           }
         }
+        if (!sessionSignal.aborted) {
+          try {
+            await host.applyActiveRuntimeSettings(ctx);
+          } catch (error) {
+            host.appendDefinitionError(ctx, error);
+          }
+        }
       }
       if (sessionSignal.aborted) return;
       if (isRoot() && host.roleTransitions.chiefModeInactive())
@@ -1454,8 +1537,6 @@ export function createLeadAgentEventRuntime(host: {
 }
 
 export function createLeadCommandRuntime(host: LeadCommandHost) {
-  const modelToken = (model: { provider: string; id: string }): string =>
-    `${model.provider}/${model.id}`;
   return {
     async openPlacementMenu(ctx: ExtensionCommandContext): Promise<void> {
       const current = await host.placementSettings(ctx);
@@ -1580,21 +1661,7 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
               : `inherit · ${host.getThinkingLevel()}`,
       };
     },
-    resolveConfiguredModel(
-      ctx: ExtensionContext,
-      configured: string,
-    ): Model | undefined {
-      const models = ctx.modelRegistry.getAll();
-      const canonical = models.find(
-        (candidate: Model) => modelToken(candidate) === configured,
-      );
-      if (canonical) return canonical;
-      const compactMatches = models.filter(
-        (candidate: Model) =>
-          compactModelToken(modelToken(candidate)) === configured,
-      );
-      return compactMatches.length === 1 ? compactMatches[0] : undefined;
-    },
+    resolveConfiguredModel,
     async openDefinitionsMenu(ctx: ExtensionCommandContext): Promise<void> {
       let selectedDefinition: string | undefined;
       const loadDefinitions = async () => {
@@ -1643,13 +1710,10 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
             .filter(Boolean)
             .join(" + ");
           const reservedLead = isReservedRoleDefinition(definition.name);
-          const runtimeProfile =
-            definition.name === FLEXIBLE_LEAD_DEFINITION_NAME ||
-            definition.name === ORCHESTRATOR_LEAD_DEFINITION_NAME ||
-            definition.name === MANAGER_DEFINITION_NAME ||
-            definition.name === CHIEF_DEFINITION_NAME;
+          const runtimeProfile = isRuntimeRoleDefinition(definition.name);
           const description = [
-            ...(!runtimeProfile ? [model, thinking] : []),
+            model,
+            thinking,
             sources,
             ...(!reservedLead && !host.agentDefinitionEnabled(definition)
               ? ["disabled"]
@@ -1686,39 +1750,31 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
           const { model, thinking } = this.executionSettings(ctx, definition);
           const managedDefinition =
             definition.name === MANAGED_LEAD_DEFINITION_NAME;
-          const runtimeProfile =
-            definition.name === FLEXIBLE_LEAD_DEFINITION_NAME ||
-            definition.name === ORCHESTRATOR_LEAD_DEFINITION_NAME ||
-            definition.name === MANAGER_DEFINITION_NAME ||
-            definition.name === CHIEF_DEFINITION_NAME;
+          const runtimeProfile = isRuntimeRoleDefinition(definition.name);
           const action = await host.selectMenu(
             ctx,
             definition.name,
             [
-              ...(!runtimeProfile
-                ? [
-                    {
-                      value: "model",
-                      label: "Model",
-                      description: model,
-                      help: managedDefinition
-                        ? "Model for future managed Lead launches. Changes do not affect a running Lead."
-                        : "Model for future Agent generations. When unset, fresh delegation inherits the spawning controller and continuation restores the saved session model.",
-                    },
-                  ]
-                : []),
-              ...(!runtimeProfile
-                ? [
-                    {
-                      value: "thinking",
-                      label: "Thinking",
-                      description: thinking,
-                      help: managedDefinition
-                        ? "Thinking level for future managed Lead launches. Changes do not affect a running Lead."
-                        : "Thinking level for future Agent generations. When unset, fresh delegation inherits the spawning controller and continuation restores the saved session level.",
-                    },
-                  ]
-                : []),
+              {
+                value: "model",
+                label: "Model",
+                description: model,
+                help: runtimeProfile
+                  ? "Applies when this role is entered, restored, or refreshed. Editing does not change the current session immediately; removing this override may reveal a project or bundled value, and only an effectively omitted field inherits the current selection."
+                  : managedDefinition
+                    ? "Model for future managed Lead launches. Changes do not affect a running Lead. Removing this override may reveal a project or bundled value."
+                    : "Model for future Agent generations. When unset, fresh delegation inherits the spawning controller and continuation restores the saved session model. Removing this override may reveal a project or bundled value.",
+              },
+              {
+                value: "thinking",
+                label: "Thinking",
+                description: thinking,
+                help: runtimeProfile
+                  ? "Applies when this role is entered, restored, or refreshed. Editing does not change the current session immediately; removing this override may reveal a project or bundled value, and only an effectively omitted field inherits the current selection."
+                  : managedDefinition
+                    ? "Thinking level for future managed Lead launches. Changes do not affect a running Lead. Removing this override may reveal a project or bundled value."
+                    : "Thinking level for future Agent generations. When unset, fresh delegation inherits the spawning controller and continuation restores the saved session level. Removing this override may reveal a project or bundled value.",
+              },
               ...(!isReservedRoleDefinition(definition.name)
                 ? [
                     {
@@ -2387,6 +2443,89 @@ export function registerLeadRuntime(
     | undefined;
   let leadExecutionPending = false;
   let supervisoryProfile: SupervisoryProfile | undefined;
+  let branchGeneration = 0;
+  const modelWrites = new Set<Promise<boolean>>();
+  const setRuntimeModel = (model: Model): Promise<boolean> => {
+    const write = pi.setModel(model);
+    modelWrites.add(write);
+    void write.finally(() => modelWrites.delete(write)).catch(() => {});
+    return write;
+  };
+  const waitForModelWrites = async (): Promise<void> => {
+    while (modelWrites.size) await Promise.all([...modelWrites]);
+  };
+  const applyRuntimeExecutionSettings = async (
+    ctx: ExtensionContext,
+    definition: AgentDefinition,
+    isCurrent: () => boolean = () => true,
+  ): Promise<RuntimeExecutionSnapshot | undefined> => {
+    const requestedModel = configuredModel(definition.frontmatter);
+    const configuredThinking = definition.frontmatter.thinking;
+    const requestedThinking =
+      configuredThinking === false ? "off" : configuredThinking;
+    if (!requestedModel && requestedThinking === undefined) return undefined;
+
+    const targetModel = requestedModel
+      ? resolveConfiguredModel(ctx, requestedModel)
+      : undefined;
+    if (requestedModel && !targetModel)
+      throw new Error(
+        `${definition.name}: configured model ${requestedModel} is unavailable`,
+      );
+
+    const snapshot: RuntimeExecutionSnapshot = {
+      sessionId: ctx.sessionManager.getSessionId(),
+      branchGeneration,
+      model: ctx.model,
+      thinking: pi.getThinkingLevel(),
+    };
+    const switchingModel =
+      !!targetModel &&
+      (!ctx.model || modelToken(ctx.model) !== modelToken(targetModel));
+    if (!isCurrent())
+      throw new Error(`${definition.name}: profile application was superseded`);
+    if (switchingModel && targetModel) {
+      if (!(await setRuntimeModel(targetModel)))
+        throw new Error(
+          `${definition.name}: model authentication unavailable for ${modelToken(targetModel)}`,
+        );
+    }
+    if (
+      ctx.sessionManager.getSessionId() !== snapshot.sessionId ||
+      branchGeneration !== snapshot.branchGeneration ||
+      !isCurrent()
+    )
+      throw new Error(
+        `${definition.name}: session or branch changed during model selection`,
+      );
+    if (requestedThinking !== undefined || switchingModel)
+      pi.setThinkingLevel(requestedThinking ?? snapshot.thinking);
+    return snapshot;
+  };
+  const restoreRuntimeExecutionSettings = async (
+    ctx: ExtensionContext,
+    snapshot: RuntimeExecutionSnapshot | undefined,
+  ): Promise<void> => {
+    if (
+      !snapshot ||
+      ctx.sessionManager.getSessionId() !== snapshot.sessionId ||
+      branchGeneration !== snapshot.branchGeneration
+    )
+      return;
+    if (
+      snapshot.model &&
+      (!ctx.model || modelToken(ctx.model) !== modelToken(snapshot.model))
+    ) {
+      if (!(await setRuntimeModel(snapshot.model)))
+        throw new Error("Could not restore the previous session model");
+    }
+    if (
+      ctx.sessionManager.getSessionId() !== snapshot.sessionId ||
+      branchGeneration !== snapshot.branchGeneration
+    )
+      return;
+    pi.setThinkingLevel(snapshot.thinking);
+  };
   const prepareSupervisoryProfile = (
     ctx: ExtensionContext,
     role: "manager" | "chief",
@@ -3083,6 +3222,22 @@ export function registerLeadRuntime(
     if (!coordinationRuntime.coordinationHealthy())
       throw new Error("Lead coordination state is unavailable");
   };
+  const applyActiveRuntimeSettings = async (
+    ctx: ExtensionContext,
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> => {
+    const role = activeLeadRole(leadRuntime);
+    const definition =
+      (role === "manager" || role === "chief") &&
+      supervisoryProfile?.role === role &&
+      supervisoryProfile.sessionId === ctx.sessionManager.getSessionId()
+        ? supervisoryProfile.definition
+        : role === "lead" && leadExecution?.valid && !leadExecution.managed
+          ? leadExecution.definition
+          : undefined;
+    if (definition)
+      await applyRuntimeExecutionSettings(ctx, definition, isCurrent);
+  };
   const roleTransitionServices = {
     ...roleHost,
     prepareSupervisoryProfile,
@@ -3109,6 +3264,9 @@ export function registerLeadRuntime(
     normalizeLeadTools: leadToolState.normalizeLeadTools,
     executionTools,
     restoreLeadExecution: (ctx: ExtensionContext) => restoreLeadExecution(ctx),
+    applyRuntimeExecutionSettings,
+    restoreRuntimeExecutionSettings,
+    applyActiveRuntimeSettings,
     ownedTools: () => leadToolState.ownedTools,
     getLeadTools: () => leadToolState.getLeadTools(),
     setLeadTools: (tools: string[] | undefined) =>
@@ -3812,6 +3970,9 @@ export function registerLeadRuntime(
     ctx: ExtensionCommandContext,
     mode: LeadExecutionMode,
   ): Promise<void> => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const role = activeLeadRole(leadRuntime);
+    const generation = leadRuntime.chiefModeGeneration;
     const assignment = await currentProjectAssignment(ctx);
     if (assignment)
       throw new Error(
@@ -3819,6 +3980,12 @@ export function registerLeadRuntime(
       );
     if (leadExecution?.managed) await restoreLeadExecution(ctx);
     await ctx.waitForIdle();
+    if (
+      ctx.sessionManager.getSessionId() !== sessionId ||
+      activeLeadRole(leadRuntime) !== role ||
+      leadRuntime.chiefModeGeneration !== generation
+    )
+      throw new Error("Lead execution changed during profile transition");
     const definition = resolveExecutionDefinition(ctx, mode);
     const saved =
       leadToolState.getLeadTools() ??
@@ -3835,9 +4002,18 @@ export function registerLeadRuntime(
     const targetTools = leadToolState.projectLeadTools(baseline, definition);
     const previousExecution = leadExecution;
     const previousTools = pi.getActiveTools();
+    let settingsSnapshot: RuntimeExecutionSnapshot | undefined;
     const shouldActivate =
       activeLeadRole(leadRuntime) === "lead" && !leadRuntime.roleSuspended;
     try {
+      if (shouldActivate)
+        settingsSnapshot = await applyRuntimeExecutionSettings(ctx, definition);
+      if (
+        ctx.sessionManager.getSessionId() !== sessionId ||
+        activeLeadRole(leadRuntime) !== role ||
+        leadRuntime.chiefModeGeneration !== generation
+      )
+        throw new Error("Lead execution changed during profile transition");
       if (shouldActivate) pi.setActiveTools(targetTools);
       persistLeadExecution(mode, baseline);
       leadToolState.setLeadTools(baseline);
@@ -3856,6 +4032,11 @@ export function registerLeadRuntime(
         }
       }
       try {
+        await restoreRuntimeExecutionSettings(ctx, settingsSnapshot);
+      } catch (restoreError) {
+        options.sessionStartOptions.appendRoleError(ctx, restoreError);
+      }
+      try {
         options.sessionStartOptions.appendDefinitionError(ctx, error);
       } catch {
         // Preserve the original transition failure.
@@ -3864,16 +4045,24 @@ export function registerLeadRuntime(
     }
   };
   const takeover = async (ctx: ExtensionCommandContext): Promise<boolean> => {
+    const sessionId = ctx.sessionManager.getSessionId();
     const assignment = await currentProjectAssignment(ctx);
     if (!assignment) return roleTransitions.takeover(ctx);
     const definition = resolveExecutionDefinition(ctx, "orchestrate");
+    const requestedModel = configuredModel(definition.frontmatter);
+    if (requestedModel && !resolveConfiguredModel(ctx, requestedModel))
+      throw new Error(
+        `${definition.name}: configured model ${requestedModel} is unavailable`,
+      );
     const baseline =
       leadToolState.getLeadTools() ??
       leadToolState.normalizeBaseTools(pi.getActiveTools());
     const targetTools = leadToolState.projectLeadTools(baseline, definition);
     if (!(await roleTransitions.takeover(ctx))) return false;
+    if (ctx.sessionManager.getSessionId() !== sessionId) return true;
     publishLeadRole(ctx, "inactive", leadRuntime.chiefModeGeneration);
     try {
+      await applyRuntimeExecutionSettings(ctx, definition);
       persistLeadExecution("orchestrate", baseline);
       leadToolState.setLeadTools(baseline);
       leadExecution = {
@@ -3953,6 +4142,7 @@ export function registerLeadRuntime(
     prepareLeadExecution,
     discoverSessionDefinitions: (ctx: ExtensionContext) =>
       options.commandHost.contextAgentDefinitions(ctx),
+    applyActiveRuntimeSettings,
     clearLeadExecution: () => {
       leadExecution = undefined;
     },
@@ -3972,6 +4162,10 @@ export function registerLeadRuntime(
     isRoot: () => options.roleTransitionHost.processRole === "lead",
     roleTransitions,
     reconcileBranchExecution,
+    applyActiveRuntimeSettings,
+    branchChanged: () => ++branchGeneration,
+    currentBranchGeneration: () => branchGeneration,
+    waitForModelWrites,
     failClosedBranchExecution: () => {
       leadExecution = {
         mode:
@@ -4036,6 +4230,7 @@ export function registerLeadRuntime(
   pi.on("session_tree", (_event: unknown, ctx: ExtensionContext) =>
     sessionTree.sessionTree(ctx),
   );
+  pi.on("session_before_tree", () => sessionTree.beforeTree());
   pi.on("session_shutdown", (_event: unknown, ctx: ExtensionContext) =>
     shutdown.shutdown(ctx),
   );
@@ -11520,6 +11715,7 @@ export function createLeadRoleTransitions(
       const replacement = host.prepareSupervisoryProfile(ctx, "chief");
       const previous = host.currentSupervisoryProfile(ctx, "chief");
       const previousTools = host.pi.getActiveTools();
+      let settingsSnapshot: RuntimeExecutionSnapshot | undefined;
       const stillCurrent = () =>
         ctx.sessionManager.getSessionId() === sessionId &&
         state.chiefMode === "active" &&
@@ -11528,6 +11724,12 @@ export function createLeadRoleTransitions(
         state.chiefModeGeneration === generation &&
         host.isCurrentChief(ctx);
       try {
+        settingsSnapshot = await host.applyRuntimeExecutionSettings(
+          ctx,
+          replacement.definition,
+        );
+        if (!stillCurrent())
+          throw new Error("Chief mode changed during profile refresh");
         host.commitSupervisoryProfile(replacement);
         host.reconcileRoleTools();
       } catch (error) {
@@ -11536,6 +11738,16 @@ export function createLeadRoleTransitions(
           try {
             host.pi.setActiveTools(previousTools);
           } catch {}
+          try {
+            await host.restoreRuntimeExecutionSettings(ctx, settingsSnapshot);
+          } catch (restoreError) {
+            host.appendDurableError(
+              host.pi,
+              ctx,
+              "pi_herdsman_role_error",
+              restoreError,
+            );
+          }
         }
         throw error;
       }
@@ -11606,7 +11818,18 @@ export function createLeadRoleTransitions(
       return "Chief activation cancelled.";
     }
     let enteredChief = false;
+    let settingsSnapshot: RuntimeExecutionSnapshot | undefined;
     try {
+      if (!resumed)
+        settingsSnapshot = await host.applyRuntimeExecutionSettings(
+          ctx,
+          profile.definition,
+        );
+      if (
+        ctx.sessionManager.getSessionId() !== sessionId ||
+        state.chiefModeGeneration !== generation
+      )
+        throw new Error("Chief mode changed during activation");
       if (!resumed && !host.getLeadTools())
         host.setLeadTools(host.normalizeLeadTools(host.pi.getActiveTools()));
       try {
@@ -11634,6 +11857,16 @@ export function createLeadRoleTransitions(
       state.chiefMode = "inactive";
       state.chiefLease = undefined;
       host.commitSupervisoryProfile(undefined);
+      try {
+        await host.restoreRuntimeExecutionSettings(ctx, settingsSnapshot);
+      } catch (restoreError) {
+        host.appendDurableError(
+          host.pi,
+          ctx,
+          "pi_herdsman_role_error",
+          restoreError,
+        );
+      }
       host.clearChiefStartPreflight();
       try {
         host.reconcileRoleTools();
@@ -11699,12 +11932,19 @@ export function createLeadRoleTransitions(
       const replacement = host.prepareSupervisoryProfile(ctx, "manager");
       const previous = host.currentSupervisoryProfile(ctx, "manager");
       const previousTools = host.pi.getActiveTools();
+      let settingsSnapshot: RuntimeExecutionSnapshot | undefined;
       const stillCurrent = () =>
         ctx.sessionManager.getSessionId() === sessionId &&
         state.controllerRole === "manager" &&
         !state.roleSuspended &&
         state.managerLease === lease;
       try {
+        settingsSnapshot = await host.applyRuntimeExecutionSettings(
+          ctx,
+          replacement.definition,
+        );
+        if (!stillCurrent())
+          throw new Error("Manager mode changed during profile refresh");
         host.commitSupervisoryProfile(replacement);
         host.reconcileRoleTools();
       } catch (error) {
@@ -11713,6 +11953,16 @@ export function createLeadRoleTransitions(
           try {
             host.pi.setActiveTools(previousTools);
           } catch {}
+          try {
+            await host.restoreRuntimeExecutionSettings(ctx, settingsSnapshot);
+          } catch (restoreError) {
+            host.appendDurableError(
+              host.pi,
+              ctx,
+              "pi_herdsman_role_error",
+              restoreError,
+            );
+          }
         }
         throw error;
       }
@@ -11752,7 +12002,14 @@ export function createLeadRoleTransitions(
     }
     const previousTools =
       host.getLeadTools() ?? host.normalizeLeadTools(host.pi.getActiveTools());
+    let settingsSnapshot: RuntimeExecutionSnapshot | undefined;
     try {
+      settingsSnapshot = await host.applyRuntimeExecutionSettings(
+        ctx,
+        profile.definition,
+      );
+      if (ctx.sessionManager.getSessionId() !== lease.descriptor.piSessionId)
+        throw new Error("Manager session changed during activation");
       state.managerLease = lease;
       state.controllerRole = "manager";
       host.commitSupervisoryProfile(profile);
@@ -11779,6 +12036,16 @@ export function createLeadRoleTransitions(
       state.controllerRole = "lead";
       state.managerLease = undefined;
       host.commitSupervisoryProfile(undefined);
+      try {
+        await host.restoreRuntimeExecutionSettings(ctx, settingsSnapshot);
+      } catch (restoreError) {
+        host.appendDurableError(
+          host.pi,
+          ctx,
+          "pi_herdsman_role_error",
+          restoreError,
+        );
+      }
       host.setLeadTools(previousTools);
       try {
         lease.release();
@@ -11798,6 +12065,7 @@ export function createLeadRoleTransitions(
   ): Promise<string> => {
     if (state.controllerRole !== "manager" || !state.managerLease)
       throw new Error("Manager mode is not active");
+    const sessionId = ctx.sessionManager.getSessionId();
     state.controllerRole = "lead";
     try {
       host.persistRole("lead");
@@ -11840,6 +12108,20 @@ export function createLeadRoleTransitions(
     host.startNormalUI(ctx);
     if (host.coordinationHealthy()) await host.schedulePeerPresence(ctx);
     await host.publishLeadRole(ctx, "inactive", state.chiefModeGeneration);
+    if (ctx.sessionManager.getSessionId() !== sessionId)
+      return "Manager mode left.";
+    try {
+      await host.restoreLeadExecution?.(ctx);
+      await host.applyActiveRuntimeSettings(ctx);
+    } catch (error) {
+      host.appendDurableError(
+        host.pi,
+        ctx,
+        "pi_herdsman_definition_error",
+        error,
+      );
+      throw error;
+    }
     return "Manager mode left.";
   };
   const deactivateChief = async (ctx: ExtensionContext): Promise<void> => {
@@ -11870,7 +12152,21 @@ export function createLeadRoleTransitions(
       )
         return "Chief leave cancelled.";
     }
+    const sessionId = ctx?.sessionManager.getSessionId();
     if (ctx) await deactivateChief(ctx);
+    if (ctx && sessionId === ctx.sessionManager.getSessionId()) {
+      try {
+        await host.applyActiveRuntimeSettings(ctx);
+      } catch (error) {
+        host.appendDurableError(
+          host.pi,
+          ctx,
+          "pi_herdsman_definition_error",
+          error,
+        );
+        throw error;
+      }
+    }
     return "Chief mode left.";
   };
   const failClosedRole = async (

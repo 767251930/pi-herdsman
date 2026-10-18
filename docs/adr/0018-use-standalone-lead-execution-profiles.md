@@ -19,10 +19,13 @@ role/authority state. A session's ordinary tool baseline is retained
 independently of the currently projected profile so a restrictive profile
 does not replace that baseline.
 
-Execution profiles own only runtime execution instructions and ordinary tool
-projection. Lead invariants remain runtime-owned. Pi's native active-tool and
-structured-prompt-section APIs project the selected profile into the running
-Lead session.
+Runtime profiles configure execution instructions, ordinary tool selection,
+and optional session-local model/thinking preferences. They do not change role
+authority or launch-only capabilities. Explicit model and thinking preferences
+apply when the role is entered, restored, or deliberately refreshed; omitted
+fields leave the current Pi selection unchanged. Lead invariants remain
+runtime-owned. Pi's native session APIs project the selected profile into the
+running session.
 
 `ProjectAssignment` remains the sole source of Manager authority, and Agent
 ownership remains governed by the existing durable ownership model. Confirmed
@@ -51,9 +54,9 @@ Manager authority.
 
 - Bundled Orchestrate and managed Leads have no ordinary tools by default;
   project/global definition overlays may explicitly enable them.
-- Runtime profiles may change execution instructions and ordinary active-tool
-  selection, but not launch-time model, thinking, extensions, skills, or
-  context inheritance.
+- Runtime profiles may change execution instructions, ordinary active-tool
+  selection, and explicitly configured session-local model/thinking
+  preferences, but not launch-only extensions, skills, or context inheritance.
 - Manager-assigned Leads remain governed by `managed-lead`, irrespective of an
   ordinary execution preference.
 - A confirmed takeover releases Manager authority and applies ordinary

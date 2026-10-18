@@ -103,16 +103,15 @@ project trusted. Each definition shows its contributing source or sources as
 All five reserved role definitions are not Agents and remain excluded as
 delegation targets. Manager/Chief profiles may nevertheless list ordinary
 Agent definitions in `agents` to authorize their own direct delegation.
-Runtime profiles support `Details` only;
-`managed-lead` supports `Model`, `Thinking`, and `Details`, but has no `Enabled`
-action. Repeating `/manager` or `/chief` refreshes the active profile after
+Runtime profiles support `Model`, `Thinking`, and `Details`; `managed-lead`
+supports the same actions but has no `Enabled` action. Repeating `/manager` or `/chief` refreshes the active profile after
 successful validation. Definition files are not watched while a profile is
 active.
 
 The details view shows applicable effective metadata:
 
 - name and description;
-- configured or inherited model and thinking for launch definitions;
+- configured or inherited model and thinking;
 - declared tool policy and expanded instructions;
 - named skills and declared direct delegation when supported by the definition;
 - overridden/custom state;
@@ -143,10 +142,8 @@ thinking rows display `inherit · <current session value>` when the current
 value is available. Thinking uses Pi's supported levels when the selected
 model is known.
 
-Selecting the managed Lead opens the same Model, Thinking, and Details actions,
-without `Enabled`.
-
-Selecting any runtime profile, including Manager and Chief, opens `Details` only.
+Selecting `managed-lead` or any runtime profile, including Manager and Chief,
+opens the Model, Thinking, and Details actions, without `Enabled`.
 
 When Pi provides an explicit scoped-model list, that scope is used. Otherwise
 available models are offered.
@@ -155,22 +152,34 @@ Thinking options use the effective model's supported levels when resolvable,
 or Pi Herdsman's validated vocabulary when not.
 
 The command edits only the selected supported top-level `model`, `thinking`,
-or `enabled` line in the global Markdown override. Runtime profiles have no
-editable frontmatter action. Edits preserve unrelated frontmatter and the
-complete body.
+or `enabled` line in the global Markdown override. Runtime profiles do not have
+an `Enabled` action. Edits preserve unrelated frontmatter and the complete
+body.
 
 Details re-resolves the selected definition when opened, so it reflects current
 overlays and body references even if the menu remained open while configuration
 changed.
 
-Model, thinking, and enabled changes apply to future assignments, not
-already-running agents or the lead Pi session. Fresh `delegate` assignments inherit the spawning controller's
+For runtime profiles, explicitly configured model and thinking preferences
+apply when the profile is entered, restored, or deliberately refreshed.
+Omitted effective fields leave the current Pi selection unchanged. Model and
+thinking are independent; a model change preserves the current thinking level
+where supported, and Pi clamps unsupported levels. Manual Pi changes remain
+allowed until a profile is applied again. Editing a definition does not
+immediately reconfigure an active session. Removing a global override can
+expose a project or bundled value, so the effective layered definition—not
+just the global file—determines whether a preference is omitted.
+
+For launch definitions, model, thinking, and enabled changes apply to future
+assignments, not already-running agents. Fresh `delegate` assignments inherit the spawning controller's
 current settings when fields are unset; `continue` restores the saved
 session's settings.
 
 Standalone global definitions are editable too. Removing a model or thinking
-field selects `Inherit current session`; removing any other field inherits its
-lower-precedence value.
+field selects `Inherit current session`; for launch definitions this means
+inheriting the spawning controller or saved session, while for runtime profiles
+an effectively omitted field leaves the current selection unchanged. Removing
+any other field inherits its lower-precedence value.
 
 ## `/herdsman` → Agents → Running
 

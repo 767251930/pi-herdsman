@@ -56,12 +56,19 @@ this skill does not define a second schema or management API.
      enforce its contents itself.
    - Before editing a reserved role definition, read the canonical schema for
      its restrictions and authority boundaries.
-   - Lead, Manager, and Chief runtime profiles are not launch definitions. They
-     support only `name`, `description`, `body`, `bodyMode` on overlays,
-     `tools`, and `excludeTools`. Do not configure
-     model, thinking, prompt launch mode, enabled/permission/agent policy,
-     tools-default switches, skills, extensions, or context inheritance on
-     these profiles. Their tool policy affects registered ordinary tools;
+   - Lead, Manager, and Chief runtime profiles are not launch definitions.
+     They support `model` and `thinking` as optional session-local preferences
+     in addition to `name`, `description`, `body`, `bodyMode` on overlays,
+     `tools`, and `excludeTools`. Do not configure prompt launch mode,
+     enabled/permission/agent policy, tools-default switches, skills,
+     extensions, or context inheritance on these profiles. Explicit model and
+     thinking settings apply when the profile is entered, restored, or
+     deliberately refreshed; an effectively omitted field leaves the current
+     Pi selection unchanged. The two settings are independent, Pi clamps
+     thinking to model capability, and manual Pi selections remain allowed
+     until the next profile application. Editing a definition alone does not
+     reconfigure an active session. Their tool policy affects registered
+     ordinary tools;
      Herdsman-owned tools cannot be activated through a profile and mandatory
      required coordination tools remain available. Manager defaults to no
      ordinary tools (`tools: []`); explicit overlays can select registered
@@ -87,5 +94,7 @@ this skill does not define a second schema or management API.
    mutate an active Agent. Lead execution profiles resolve at session start,
    resume, or `/lead`. Manager and Chief profiles resolve at role activation or
    restoration; repeating `/manager` or `/chief` refreshes the active profile.
+   Runtime model/thinking preferences apply at those profile-application
+   boundaries, not when a definition is edited.
    `managed-lead` is launch policy: changes do not hot-reconfigure an assigned
    Lead, and taking effect requires a later managed Lead process start.

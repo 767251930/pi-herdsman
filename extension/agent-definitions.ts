@@ -104,6 +104,8 @@ export function isRuntimeRoleDefinition(name: string): boolean {
 const RUNTIME_LEAD_FIELDS = new Set([
   "name",
   "description",
+  "model",
+  "thinking",
   "bodyMode",
   "tools",
   "excludeTools",

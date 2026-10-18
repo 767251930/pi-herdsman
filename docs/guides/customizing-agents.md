@@ -15,11 +15,11 @@ ordinary, unassigned Lead sessions. The session's persisted execution mode
 selects exactly one: `flexible` uses `flexible-lead`; `orchestrate` uses
 `orchestrator-lead`. These are standalone runtime profiles, not Agents or
 launch definitions, and they never inherit from or compose with one another.
-They can customize instructions and ordinary tool selection only. Their
-frontmatter supports `name`, `description`, `body`, `tools`, and
-`excludeTools`; `bodyMode` is supported on matching overlays. Fields affecting
-model, thinking, system-prompt launch mode, skills, extensions, context
-inheritance, or Agent/permission policy are not supported.
+They customize instructions, ordinary tool selection, and optional session-local
+model/thinking preferences. Their frontmatter supports `name`, `description`,
+`model`, `thinking`, `body`, `tools`, and `excludeTools`; `bodyMode` is
+supported on matching overlays. System-prompt launch mode, skills, extensions,
+context inheritance, and Agent/permission policy are not supported.
 
 The bundled `flexible-lead` leaves `tools` unspecified, preserving Pi's normal
 ordinary tool baseline, and supplies flexible direct/delegated-work guidance.
@@ -44,9 +44,28 @@ Overlays that omit `tools` still inherit the bundled `[]`. Herdsman-owned
 tools cannot be enabled through a profile, and required Lead coordination
 tools are retained. A configured tool that is not registered
 is simply unavailable. Profile resolution respects project trust. Definition
-changes take effect when the profile is next resolved: at session start/resume,
-or when a user explicitly selects an execution mode with `/lead` (including
-reselecting the current mode).
+changes do not immediately reconfigure a running session. The effective profile
+is resolved at session start/resume or when a user explicitly selects an
+execution mode with `/lead` (including reselecting the current mode). At those
+application points, explicit model and thinking values apply; an effectively
+omitted value leaves the current Pi selection unchanged. The two settings are
+independent, and a model change preserves the current thinking level where
+supported; Pi clamps unsupported levels. Manual Pi selections are not
+continuously overridden.
+
+For example, a global or trusted project overlay can set either preference or
+both:
+
+```yaml
+---
+name: flexible-lead
+model: provider/model-id
+thinking: low
+---
+```
+
+Removing a value from a higher-precedence layer can expose a lower-precedence
+value; only an effectively omitted field leaves the current selection alone.
 
 Ordinary Leads persist their execution mode separately from role/authority
 state and retain their ordinary tool baseline while a restrictive profile is
@@ -95,7 +114,11 @@ Manager accepts trusted project overlays at `<project>/.pi/agents/manager.md`
 and global overlays at `$PI_CODING_AGENT_DIR/agents/manager.md` (or
 `~/.pi/agent/agents/manager.md`). Chief accepts only global overlays because it
 is workspace-neutral; a project-local `chief.md` is an error. Both resolve
-when the role activates or is restored. Repeating `/manager` or `/chief`
+when the role activates or is restored. Explicit model and thinking preferences
+apply on activation, restoration, and deliberate refresh; omitted effective
+fields do not override the current Pi selection. Editing definitions alone
+does not change an active session, and manual Pi selections remain allowed
+until the next profile application. Repeating `/manager` or `/chief`
 refreshes an active profile after validating it; a failed refresh keeps the
 previous effective profile. A `bodyMode: replace` overlay replaces customizable
 role guidance only. Runtime-owned authority and role contracts remain active.
@@ -365,13 +388,13 @@ Lead Pi sessions with UI can use:
 /agents definitions
 ```
 
-The native Definitions menu is a flat list, with `flexible-lead`,
-`orchestrator-lead`, and `managed-lead` first in that order. Each
+The native Definitions menu is a flat list, with the five reserved roles first
+in schema order. Each
 definition identifies its contributing source or sources as `bundled`,
 `project`, and/or `global`. Select a definition to open:
 
 ```text
-flexible-lead / orchestrator-lead: Details…
+flexible-lead / orchestrator-lead / manager / chief: Model / Thinking / Details…
 managed-lead: Model / Thinking / Details…
 ordinary Agent: Model / Thinking / Enabled / Details…
 ```
@@ -396,18 +419,23 @@ edited through the same flow.
 It changes only the selected top-level line in the global Markdown override and
 preserves unrelated frontmatter, line endings, and body content.
 
-Removing a saved model or thinking field inherits the spawning controller for a
-fresh delegation, or the saved session for a continuation. The override file
-is not deleted.
+Removing a saved model or thinking field removes that global layer's value; a
+project or bundled value may still be effective. For launch definitions, an
+effectively unset field inherits the spawning controller for a fresh
+delegation, or the saved session for a continuation. For runtime profiles, an
+effectively unset field leaves the current Pi selection unchanged when applied.
+The override file is not deleted.
 
 Enable and disable write the scalar `enabled` field in the same global override.
 Removing that field inherits the bundled value, or `true` when no source
 declares it.
 
-Changes affect future assignments. Fresh `delegate` assignments inherit unset
-execution fields from their spawning controller; `continue` restores saved
-session settings. They do not mutate an already-running agent or the lead Pi
-session.
+Launch-definition changes affect future assignments, not an already-running
+agent. Fresh `delegate` assignments inherit unset execution fields from their
+spawning controller; `continue` restores saved session settings. Runtime
+profile settings instead apply when that profile is entered, restored, or
+deliberately refreshed; editing its definition alone does not reconfigure the
+active lead Pi session.
 
 ## See also
 

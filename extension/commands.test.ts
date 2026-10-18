@@ -409,6 +409,72 @@ test("session tree navigation restores each branch's execution mode, baseline, a
   }
 });
 
+test("session-tree navigation waits for in-flight runtime model selection", async () => {
+  const { createLeadSessionTreeRuntime } = await import("./lead-runtime.ts");
+  let branch = "old";
+  const writes = new Set<Promise<void>>();
+  const appendedBranches: string[] = [];
+  let releaseAuth!: () => void;
+  const auth = new Promise<void>((resolve) => {
+    releaseAuth = resolve;
+  });
+  let resolveStarted!: () => void;
+  const writeStarted = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const pendingModelWrite = (async () => {
+    resolveStarted();
+    await auth;
+    appendedBranches.push(branch);
+  })();
+  writes.add(pendingModelWrite);
+  void pendingModelWrite.finally(() => writes.delete(pendingModelWrite));
+  let generation = 0;
+  const runtime = createLeadSessionTreeRuntime({
+    controller: {
+      sessionActive: () => true,
+      sessionTreeChanged: () => undefined,
+      sessionSignal: () => new AbortController().signal,
+    },
+    roleTransitions: {
+      branchRoleObservation: () => ({
+        watchBeforeReconcile: false,
+        wasChief: false,
+      }),
+      reconcileBranchRole: async () => undefined,
+    },
+    reconcileBranchExecution: async () => undefined,
+    failClosedBranchExecution: () => undefined,
+    isRoot: () => true,
+    appendRoleError: (_ctx, error) => {
+      throw error;
+    },
+    applyActiveRuntimeSettings: async () => undefined,
+    branchChanged: () => ++generation,
+    currentBranchGeneration: () => generation,
+    waitForModelWrites: async () => {
+      while (writes.size) await Promise.all([...writes]);
+    },
+  });
+  const context = fakeContext() as any;
+  await writeStarted;
+  const navigation = (async () => {
+    await runtime.beforeTree();
+    branch = "new";
+    await runtime.sessionTree(context);
+  })();
+  await Promise.resolve();
+  assert.equal(
+    branch,
+    "old",
+    "tree mutation waits for the pending setModel auth",
+  );
+  releaseAuth();
+  await navigation;
+  assert.deepEqual(appendedBranches, ["old"]);
+  assert.equal(branch, "new");
+});
+
 test("Manager transitions and mode changes preserve the ordinary Lead baseline", async () => {
   setLeadEnvironment();
   const managerOverride = join(PI_AGENTS_DIR, "manager.md");
@@ -1845,6 +1911,15 @@ test("root Lead explicitly enters Manager; a competing root session stays Lead",
   const previousManagerOverride = realFs.existsSync(managerOverride)
     ? readFileSync(managerOverride, "utf8")
     : undefined;
+  const runtimeModel = {
+    provider: "runtime-provider",
+    id: "runtime-model",
+    reasoning: true,
+  };
+  writeFileSync(
+    managerOverride,
+    "---\nname: manager\nmodel: runtime-provider/runtime-model\nthinking: low\n---\n",
+  );
   let persistedManager: ReturnType<typeof fakeChiefPi> | undefined;
   let persistedManagerContext: any;
   let persistedManagerSessionId = "";
@@ -1985,6 +2060,9 @@ test("root Lead explicitly enters Manager; a competing root session stays Lead",
   });
   const second = fakeChiefPi({ activeTools: ["read"], exec });
   const ctx1 = fakeContext(first.entries) as any;
+  ctx1.modelRegistry = {
+    getAll: () => [runtimeModel],
+  };
   const managerNotices: string[] = [];
   ctx1.ui.notify = (message: string, level?: string) => {
     if (level === "error") managerNotices.push(message);
@@ -2057,6 +2135,8 @@ test("root Lead explicitly enters Manager; a competing root session stays Lead",
     failManagerRename = true;
     await first.commandOptions.get("manager").handler("", ctx1);
     assert.deepEqual(first.pi.getActiveTools(), managerTools);
+    assert.equal(first.modelSelections[0]?.id, "runtime-model");
+    assert.equal(first.pi.getThinkingLevel(), "low");
     await t.waitFor(() =>
       assert.deepEqual(
         tabCommands.find((args) => args[3] === "Manager"),
@@ -10927,6 +11007,53 @@ test("Definitions exposes managed Lead settings without Agent discovery", async 
   } finally {
     await pi.events.get("session_shutdown")?.[0]();
     realFs.rmSync(overridePath, { force: true });
+  }
+});
+
+test("Definitions exposes runtime role model and thinking preferences", async () => {
+  setLeadEnvironment();
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const command = pi.commandOptions.get("agents");
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "rpc";
+  const visited = new Set<string>();
+  const menus = new Map<string, string[]>();
+  context.ui.select = async (label: string, options: string[]) => {
+    if (label !== "Definitions") {
+      menus.set(label, options);
+      return undefined;
+    }
+    const next = [
+      "flexible-lead",
+      "orchestrator-lead",
+      "manager",
+      "chief",
+    ].find((name) => !visited.has(name));
+    if (!next) return undefined;
+    visited.add(next);
+    return options.find((option) => option.includes(next));
+  };
+  try {
+    await command.handler("definitions", context);
+    assert.deepEqual(
+      [...visited],
+      ["flexible-lead", "orchestrator-lead", "manager", "chief"],
+    );
+    for (const name of visited) {
+      const options = menus.get(name) ?? [];
+      assert.ok(
+        options.some((option) => option.startsWith("Model")),
+        name,
+      );
+      assert.ok(
+        options.some((option) => option.startsWith("Thinking")),
+        name,
+      );
+    }
+  } finally {
+    await pi.events.get("session_shutdown")?.[0]();
   }
 });
 

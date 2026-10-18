@@ -65,11 +65,13 @@ overlays when changing them; never infer identity from filenames.
 `flexible-lead`, `orchestrator-lead`, `managed-lead`, `manager`, and `chief`
 are reserved role definitions. They use the layered definition engine but are
 not Agents available through discovery or delegation. The first two configure
-ordinary Lead runtime instructions and ordinary tools; `managed-lead` configures
-launch policy for Manager-assigned project Leads; `manager` and `chief`
-customize supervisory role instructions and ordinary tools. They appear first in
-the flat Definitions list in that order. Runtime profiles offer Details only;
-`managed-lead` offers Model, Thinking, and Details. See
+ordinary Lead runtime instructions, ordinary tools, and optional session-local
+model/thinking preferences; `managed-lead` configures launch policy for
+Manager-assigned project Leads; `manager` and `chief` customize supervisory
+role instructions, ordinary tools, and optional session-local model/thinking
+preferences. They appear first in
+the flat Definitions list in that order. Runtime profiles and `managed-lead`
+offer Model, Thinking, and Details; none offers Enabled. See
 [customizing role profiles](customizing-agents.md#manager-and-chief-profiles).
 
 ### Permission-aware extensions
@@ -296,13 +298,18 @@ a separate configuration interface.
 
 The human `Definitions` menu is a flat list of actionable definitions, with
 reserved `flexible-lead`, `orchestrator-lead`, `managed-lead`, `manager`, and
-`chief` first in that order. Runtime profiles provide Details only. Each row identifies its contributing source or
-sources as `bundled`, `project`, and/or `global`. Model, thinking, and enabled
-settings can be changed through the menu, but edits always write global
-overrides. `Inherit current session` removes only that field. Unset model and
-thinking fields inherit the spawning controller for fresh delegation, while
-continuation restores the saved session's settings. Contextual help updates for
-the selected row.
+`chief` first in that order. Runtime profiles and `managed-lead` expose Model,
+Thinking, and Details; ordinary Agents also expose Enabled. Each row identifies
+its contributing source or sources as `bundled`, `project`, and/or `global`.
+Edits always write global overrides. `Inherit current session` removes only
+that global field; a lower-precedence project or bundled value may remain
+effective. For runtime profiles, explicit model/thinking settings apply when
+the profile is entered, restored, or deliberately refreshed. An effectively
+omitted field leaves the current Pi selection unchanged. Editing a definition
+does not immediately change the active session. Launch-definition fields
+instead apply to future assignments; unset model and thinking inherit the
+spawning controller for fresh delegation, while continuation restores the
+saved session's settings. Contextual help updates for the selected row.
 
 ## Override an existing bundled role
 

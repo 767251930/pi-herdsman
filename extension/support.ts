@@ -823,6 +823,10 @@ export function fakePi(
     persistMessages?: boolean;
     sessionName?: string;
     thinkingLevel?: string;
+    setModel?: (model: {
+      provider: string;
+      id: string;
+    }) => boolean | Promise<boolean>;
     status?: ExecResult;
     allTools?: unknown[] | (() => unknown[]);
   } = {},
@@ -838,6 +842,8 @@ export function fakePi(
     [];
   const execOptions: { timeout?: number; signal?: AbortSignal }[] = [];
   const entries = options.entries ?? [];
+  let thinkingLevel = options.thinkingLevel ?? "medium";
+  const modelSelections: { provider: string; id: string }[] = [];
   let sessionName = options.sessionName;
   const sent: unknown[] = [];
   const sentMessageCalls: { message: unknown; options?: unknown }[] = [];
@@ -898,7 +904,14 @@ export function fakePi(
       entries.push({ type: "session_info", name });
     },
     getThinkingLevel() {
-      return options.thinkingLevel ?? "medium";
+      return thinkingLevel;
+    },
+    setThinkingLevel(level: string) {
+      thinkingLevel = level;
+    },
+    async setModel(model: { provider: string; id: string }) {
+      modelSelections.push(model);
+      return (await options.setModel?.(model)) ?? true;
     },
     async exec(
       command: string,
@@ -972,6 +985,7 @@ export function fakePi(
     sentMessageCalls,
     sentUsers,
     sentUserCalls,
+    modelSelections,
   };
 }
 

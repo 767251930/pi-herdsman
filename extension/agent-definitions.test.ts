@@ -676,9 +676,42 @@ test("reserves independent runtime role profiles with narrow fields", () => {
       /dependent\s+assignments only after their prerequisites resolve/,
     );
   }
+  for (const name of [
+    FLEXIBLE_LEAD_DEFINITION_NAME,
+    ORCHESTRATOR_LEAD_DEFINITION_NAME,
+    MANAGER_DEFINITION_NAME,
+    CHIEF_DEFINITION_NAME,
+  ] as const) {
+    writeFileSync(
+      join(agents, `${name}.md`),
+      `---\nname: ${name}\nmodel: provider/model-id\nthinking: low\n---\n`,
+    );
+    const definition = withPiAgentDir(global, () =>
+      discoverRoleDefinition(name),
+    );
+    assert.equal(definition.frontmatter.model, "provider/model-id");
+    assert.equal(definition.frontmatter.thinking, "low");
+  }
+  writeFileSync(
+    join(agents, `${FLEXIBLE_LEAD_DEFINITION_NAME}.md`),
+    `---\nname: ${FLEXIBLE_LEAD_DEFINITION_NAME}\nmodel: provider/model-id\n---\n`,
+  );
+  writeFileSync(
+    join(agents, `${ORCHESTRATOR_LEAD_DEFINITION_NAME}.md`),
+    `---\nname: ${ORCHESTRATOR_LEAD_DEFINITION_NAME}\nthinking: low\n---\n`,
+  );
+  const independent = withPiAgentDir(global, () => discoverRoleDefinitions());
+  assert.equal(
+    independent.find(({ name }) => name === FLEXIBLE_LEAD_DEFINITION_NAME)
+      ?.frontmatter.thinking,
+    undefined,
+  );
+  assert.equal(
+    independent.find(({ name }) => name === ORCHESTRATOR_LEAD_DEFINITION_NAME)
+      ?.frontmatter.model,
+    undefined,
+  );
   for (const [field, value] of [
-    ["model", '"provider/model"'],
-    ["thinking", '"low"'],
     ["systemPromptMode", '"append"'],
     ["noTools", "false"],
     ["extensions", '["custom"]'],
@@ -708,11 +741,11 @@ test("Manager and Chief overlays use reserved runtime-profile scope", () => {
   const chiefGlobal = join(globalAgents, "chief.md");
   writeFileSync(
     managerProject,
-    "---\nname: manager\nbodyMode: append\n---\nProject manager guidance",
+    "---\nname: manager\nbodyMode: append\nmodel: project/model\nthinking: low\n---\nProject manager guidance",
   );
   writeFileSync(
     managerGlobal,
-    "---\nname: manager\nbodyMode: append\n---\nGlobal manager guidance",
+    "---\nname: manager\nbodyMode: append\nmodel: global/model\nthinking: high\n---\nGlobal manager guidance",
   );
   writeFileSync(
     chiefGlobal,
@@ -722,6 +755,8 @@ test("Manager and Chief overlays use reserved runtime-profile scope", () => {
     discoverRoleDefinition("manager", { projectRoot: project }),
   );
   assert.deepEqual(manager.frontmatter.tools, []);
+  assert.equal(manager.frontmatter.model, "global/model");
+  assert.equal(manager.frontmatter.thinking, "high");
   assert.match(manager.body, /Project manager guidance/);
   assert.match(manager.body, /Global manager guidance/);
   const chief = withPiAgentDir(global, () => discoverRoleDefinition("chief"));
@@ -738,7 +773,7 @@ test("Manager and Chief overlays use reserved runtime-profile scope", () => {
     /chief definition: project overrides are not supported; configure chief globally instead/,
   );
   for (const name of ["manager", "chief"] as const)
-    for (const field of ["model", "thinking", "systemPromptMode", "skills"]) {
+    for (const field of ["systemPromptMode", "skills"]) {
       writeFileSync(
         join(globalAgents, `${name}.md`),
         `---\nname: ${name}\n${field}: ${field === "skills" || field === "agents" ? '["scout"]' : field === "systemPromptMode" ? '"append"' : '"low"'}\n---\n`,
