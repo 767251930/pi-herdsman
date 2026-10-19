@@ -257,6 +257,7 @@ import {
   readConfig,
   readEffectiveConfig,
   readProjectOverrides,
+  updateProjectOverride,
   updateConfig,
   validByteLimit,
 } from "./config.ts";
@@ -1653,6 +1654,7 @@ export default function (pi: ExtensionAPI): void {
       readConfig,
       readEffectiveConfig,
       readProjectOverrides,
+      updateProjectOverride,
       contextAgentDefinitions,
       discoverRoleDefinition,
       setLeadExecutionMode: (
