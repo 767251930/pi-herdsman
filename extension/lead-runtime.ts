@@ -190,6 +190,14 @@ type LeadTransitionHost = {
   supervisionRuntime: typeof import("./supervision.ts").supervisionRuntime;
   findProjectAssignmentBySession: typeof import("./supervision.ts").findProjectAssignmentBySession;
   acquireProcessLock: typeof import("./lock.ts").acquireProcessLock;
+  afterProjectAssignmentLockAcquired?(
+    repoKey: string,
+    branch: string,
+  ): Promise<void>;
+  afterProjectAssignmentLockOccupied?(
+    repoKey: string,
+    branch: string,
+  ): Promise<void>;
   projectAssignmentPath: typeof import("./supervision.ts").projectAssignmentPath;
   readProjectAssignment: typeof import("./supervision.ts").readProjectAssignment;
   readManagerDescriptorStatus: typeof import("./supervision.ts").readManagerDescriptorStatus;
@@ -467,6 +475,7 @@ type LeadHerdRunHost = {
     operation?: string,
     reportId?: string,
     kind?: ProjectMessage["kind"],
+    signal?: AbortSignal,
   ): Promise<ProjectMessage | undefined>;
   publishChiefFailure(
     ctx: ExtensionContext,
@@ -527,6 +536,7 @@ type LeadProjectHost = {
     repoKey: string,
     branch: string,
     operation: () => Promise<T> | T,
+    signal?: AbortSignal,
   ): Promise<T>;
   stopOwnedAgentsForSession(
     ctx: ExtensionContext,
@@ -2804,7 +2814,14 @@ export function registerLeadRuntime(
       repoKey: string,
       branch: string,
       operation: () => Promise<T> | T,
-    ) => roleTransitions.withProjectAssignmentLock(repoKey, branch, operation),
+      signal?: AbortSignal,
+    ) =>
+      roleTransitions.withProjectAssignmentLock(
+        repoKey,
+        branch,
+        operation,
+        signal,
+      ),
     ...options.coordinationHost,
     workspaceId: () => options.roleTransitionHost.workspaceId(),
     currentManager: (
@@ -3466,6 +3483,7 @@ export function registerLeadRuntime(
                 );
               await operation();
             },
+            ctx.signal,
           ),
       };
     },
@@ -6583,6 +6601,7 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
           manager.repoKey,
           assignment.branch,
           close,
+          signal,
         ),
     );
   };
@@ -6970,6 +6989,7 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
                 };
               }
             },
+            operationSignal,
           )
           .catch((error) => {
             if (!leadStopped && !reopened) throw error;
@@ -7091,6 +7111,7 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
   const persistLeadSessionFile = async (
     assignment: ProjectAssignment,
     piSessionFile: string,
+    signal?: AbortSignal,
   ): Promise<ProjectAssignment> =>
     host.withProjectAssignmentLock(
       assignment.repoKey,
@@ -7114,14 +7135,16 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
         host.writeProjectAssignment(host.supervisionRuntime(), bound);
         return bound;
       },
+      signal,
     );
   const bindLeadSessionFile = async (
     assignment: ProjectAssignment,
     lead: HerdrRecord,
+    signal?: AbortSignal,
   ): Promise<ProjectAssignment> => {
     const piSessionFile = supervisedSessionFile(lead, assignment.id);
     return piSessionFile
-      ? persistLeadSessionFile(assignment, piSessionFile)
+      ? persistLeadSessionFile(assignment, piSessionFile, signal)
       : assignment;
   };
   type ProjectLeadActivation =
@@ -7567,6 +7590,7 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
               );
             writeProjectAssignment(runtime, assignment);
           },
+          signal,
         );
       }
       await assertUnoccupied(workspaceId!);
@@ -7805,7 +7829,7 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
         operationName,
         `Lead ${assignment.id}`,
       );
-      assignment = await bindLeadSessionFile(assignment, lead);
+      assignment = await bindLeadSessionFile(assignment, lead, signal);
       writeChiefMessage({
         version: 2,
         build: HERDSMAN_BUILD,
@@ -7869,7 +7893,7 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
         );
       }
       await assertManagerCurrent();
-      await bindLeadSessionFile(assignment, rediscovered);
+      await bindLeadSessionFile(assignment, rediscovered, signal);
       return {
         content: [
           {
@@ -8515,6 +8539,7 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
         host.writeProjectAssignment(runtime, written);
         return written;
       },
+      ctx.signal,
     );
     onPersisted?.(suppliedAdditions);
     return {
@@ -9462,7 +9487,7 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
   const executeSupervisorMessage = async (
     _id: string,
     raw: unknown,
-    _signal: AbortSignal | undefined,
+    signal: AbortSignal | undefined,
     _update: unknown,
     ctx: ExtensionContext,
   ) => {
@@ -9481,11 +9506,19 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
         activeRole() === "lead" ? await currentWorktreeScope(ctx) : undefined;
       const assignment = scope && projectAssignmentForScope(scope, sessionId);
       if (assignment) {
+        const publishSignal =
+          signal && ctx.signal
+            ? AbortSignal.any([signal, ctx.signal])
+            : (signal ?? ctx.signal);
         const published = await publishProjectMessage(
           ctx,
           assignment,
           params.message,
           resolveMessageFiles(ctx, params.files, "message_supervisor"),
+          undefined,
+          undefined,
+          undefined,
+          publishSignal,
         );
         if (!published)
           throw new Error(
@@ -9839,6 +9872,7 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
               reportedRetirementErrors.delete(errorKey);
               return 1;
             },
+            ctx.signal,
           );
         } catch (error) {
           if (!reportedRetirementErrors.has(retired.id)) {
@@ -11466,6 +11500,7 @@ export function createLeadRoleTransitions(
               );
             await operation();
           },
+          ctx.signal,
         ),
     };
   };
@@ -11473,12 +11508,37 @@ export function createLeadRoleTransitions(
     repoKey: string,
     branch: string,
     operation: () => Promise<T> | T,
+    signal?: AbortSignal,
   ): Promise<T> => {
-    const lease = host.acquireProcessLock(
-      `${host.projectAssignmentPath(host.supervisionRuntime(), repoKey, branch)}.lock`,
-      { name: "project assignment lock" },
-    );
+    const path = `${host.projectAssignmentPath(host.supervisionRuntime(), repoKey, branch)}.lock`;
+    const deadline = Date.now() + 2_000;
+    let lease: ReturnType<typeof host.acquireProcessLock>;
+    while (true) {
+      signal?.throwIfAborted();
+      if (Date.now() >= deadline)
+        throw new ProcessLockOccupiedError(
+          "Project assignment lock is in progress",
+        );
+      try {
+        lease = host.acquireProcessLock(path, {
+          name: "project assignment lock",
+        });
+        break;
+      } catch (error) {
+        if (
+          !(error instanceof ProcessLockOccupiedError) ||
+          Date.now() >= deadline
+        )
+          throw error;
+        await host.afterProjectAssignmentLockOccupied?.(repoKey, branch);
+        await host.delay(Math.min(25, deadline - Date.now()), undefined, {
+          signal,
+        });
+      }
+    }
     try {
+      if (host.afterProjectAssignmentLockAcquired)
+        await host.afterProjectAssignmentLockAcquired(repoKey, branch);
       return await operation();
     } finally {
       lease.release();
@@ -11492,6 +11552,7 @@ export function createLeadRoleTransitions(
     operation = "message_supervisor",
     reportId?: string,
     kind?: ProjectMessage["kind"],
+    signal?: AbortSignal,
   ): Promise<ProjectMessage | undefined> => {
     const sessionId = ctx.sessionManager.getSessionId();
     const runtime = host.supervisionRuntime();
@@ -11576,6 +11637,7 @@ export function createLeadRoleTransitions(
         host.writeProjectMessage(record, runtime);
         return record;
       },
+      signal ?? ctx.signal,
     );
   };
   const managerForScope = (
@@ -11970,6 +12032,7 @@ export function createLeadRoleTransitions(
               repoKey,
               observed.branch,
               retireUnderAssignmentLock,
+              ctx.signal,
             );
             return;
           } catch (error) {
@@ -12075,6 +12138,7 @@ export function createLeadRoleTransitions(
             )
               throw new Error("Project assignment changed during takeover");
           },
+          ctx.signal,
         ),
     );
     ctx.ui.notify(
