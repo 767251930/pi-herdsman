@@ -2203,6 +2203,303 @@ export function rootDelegationDiagnostics(contents) {
   };
 }
 
+function coreDelegationEdge(contents, label, ownerSessionId) {
+  const entries = sessionEntries(contents);
+  const calls = entries.flatMap((entry, index) =>
+    entry.type === "message" && entry.message?.role === "assistant"
+      ? (entry.message.content ?? [])
+          .filter(
+            (part) =>
+              part.type === "toolCall" &&
+              part.name === "delegate_agent" &&
+              part.arguments?.label === label,
+          )
+          .map((call) => ({ call, index }))
+      : [],
+  );
+  if (calls.length !== 1)
+    return {
+      delegation: calls.length ? "ambiguous" : "not_observed",
+      session: "unknown",
+      terminalResult: "unknown",
+      terminalStatus: "unknown",
+      resultDelivered: "unknown",
+      identity: null,
+    };
+  const { call, index } = calls[0];
+  const matches = entries.filter(
+    (entry, i) =>
+      i > index &&
+      entry.type === "message" &&
+      entry.message?.role === "toolResult" &&
+      entry.message.toolName === "delegate_agent" &&
+      entry.message.toolCallId === call.id,
+  );
+  if (matches.length !== 1)
+    return {
+      delegation: matches.length ? "ambiguous" : "unknown",
+      session: "unknown",
+      terminalResult: "unknown",
+      resultDelivered: "unknown",
+      identity: null,
+    };
+  const result = matches[0].message;
+  if (result.isError !== false || result.details?.ok === false)
+    return {
+      delegation:
+        result.isError === true || result.details?.ok === false
+          ? "rejected"
+          : "unknown",
+      session: "unknown",
+      terminalResult: "unknown",
+      resultDelivered: "unknown",
+      identity: null,
+    };
+  const text = messageText(result.content);
+  const piSessionId = text.match(/^Session: ([^\r\n]+)$/m)?.[1];
+  const requestId = text.match(/^Request: ([^\r\n]+)$/m)?.[1];
+  if (!piSessionId || !requestId)
+    return {
+      delegation: "accepted",
+      session: "unknown",
+      terminalResult: "unknown",
+      resultDelivered: "unknown",
+      identity: null,
+    };
+  return {
+    delegation: "accepted",
+    session: "identified",
+    terminalResult: "unknown",
+    terminalStatus: "unknown",
+    resultDelivered: "unknown",
+    identity: { piSessionId, requestId },
+  };
+}
+
+async function coreNestedDelegationDiagnostics(ctx, rootContents) {
+  const ownerId = sessionEntries(rootContents).find(
+    (entry) => entry.type === "session",
+  )?.id;
+  const inspect = async (contents, label, ownerSessionId) => {
+    const edge = coreDelegationEdge(contents, label, ownerSessionId);
+    if (!edge.identity) return { edge, child: null };
+    let child;
+    try {
+      child = await exactIsolatedSession(ctx, edge.identity.piSessionId);
+    } catch {
+      return {
+        edge: { ...edge, session: "observation_failed" },
+        child: null,
+      };
+    }
+    edge.session = child ? "observed" : "not_observed";
+    edge.terminalResult = "unknown";
+    edge.terminalStatus = "unknown";
+    try {
+      const root = join(
+        ctx.paths.piAgent,
+        "pi-herdsman",
+        "runtime",
+        "mailboxes-v5",
+      );
+      if (
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+          edge.identity.requestId,
+        )
+      ) {
+        edge.terminalResult = "observation_failed";
+        return { edge, child };
+      }
+      const dirs = await readdir(root, { withFileTypes: true });
+      if (dirs.length > 256) throw new Error("mailbox scan exceeded its bound");
+      const matches = [];
+      const mailboxIdentities = [];
+      for (const dir of dirs.slice(0, 256)) {
+        if (!dir.isDirectory() || !/^[0-9a-f]{32}$/.test(dir.name)) continue;
+        const mailbox = join(root, dir.name);
+        let state;
+        try {
+          const path = join(mailbox, "state.json");
+          const stat = await lstat(path);
+          if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536)
+            continue;
+          state = JSON.parse(await readFile(path, "utf8"));
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+          continue;
+        }
+        if (
+          state.piSessionId !== edge.identity.piSessionId ||
+          state.ownerSessionId !== ownerSessionId ||
+          state.agentLabel !== label
+        )
+          continue;
+        mailboxIdentities.push(state);
+        const path = join(mailbox, `result-${edge.identity.requestId}.json`);
+        try {
+          const stat = await lstat(path);
+          if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536)
+            throw new Error("invalid mailbox result");
+          const result = JSON.parse(await readFile(path, "utf8"));
+          if (
+            result.requestId === edge.identity.requestId &&
+            result.runId === state.runId &&
+            result.workspaceId === state.workspaceId &&
+            result.ownerSessionId === ownerSessionId &&
+            result.agentLabel === label &&
+            result.paneId === state.paneId
+          )
+            matches.push(result);
+          else matches.push(null);
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+      }
+      if (matches.length === 1 && matches[0]) {
+        edge.terminalResult = "published";
+        if (["completed", "failed"].includes(matches[0].status))
+          edge.terminalStatus = matches[0].status;
+      } else if (matches.length > 1 || matches.includes(null))
+        edge.terminalResult = "ambiguous";
+      else edge.terminalResult = "not_observed";
+      if (mailboxIdentities.length === 1) {
+        const [state] = mailboxIdentities;
+        edge.identity = {
+          ...edge.identity,
+          runId: state.runId,
+          workspaceId: state.workspaceId,
+          agentLabel: state.agentLabel,
+          paneId: state.paneId,
+          agentDefinition: state.agentDefinition,
+        };
+      } else if (mailboxIdentities.length > 1) {
+        edge.terminalResult = "ambiguous";
+        edge.terminalStatus = "unknown";
+      }
+    } catch {
+      edge.terminalResult = "observation_failed";
+    }
+    return { edge, child };
+  };
+  const implementer = await inspect(
+    rootContents,
+    "smoke-core-implementer",
+    ownerId,
+  );
+  const scout = implementer.child
+    ? await inspect(
+        implementer.child.contents,
+        "smoke-core-scout",
+        implementer.child.id,
+      )
+    : { edge: null, child: null };
+  const deliver = (parentContents, edge) => {
+    if (!edge?.identity) return { state: "unknown", terminalStatus: "unknown" };
+    const entries = sessionEntries(parentContents);
+    const ownerSessionId = entries.find(
+      (entry) => entry.type === "session",
+    )?.id;
+    const receipts = entries.filter(
+      (entry) =>
+        entry.type === "custom_message" &&
+        entry.customType === "pi-herdsman-agent-result" &&
+        entry.details?.requestId === edge.identity.requestId &&
+        entry.details?.piSessionId === edge.identity.piSessionId &&
+        entry.details?.ownerSessionId === ownerSessionId &&
+        (!edge.identity.runId ||
+          entry.details?.runId === edge.identity.runId) &&
+        (!edge.identity.workspaceId ||
+          entry.details?.workspaceId === edge.identity.workspaceId) &&
+        (!edge.identity.agentLabel ||
+          entry.details?.agentLabel === edge.identity.agentLabel) &&
+        (!edge.identity.paneId ||
+          entry.details?.paneId === edge.identity.paneId) &&
+        (!edge.identity.agentDefinition ||
+          entry.details?.agentDefinition === edge.identity.agentDefinition),
+    );
+    return {
+      state:
+        receipts.length === 1
+          ? "observed"
+          : receipts.length
+            ? "ambiguous"
+            : "not_observed",
+      terminalStatus:
+        edge.terminalStatus !== "unknown"
+          ? edge.terminalStatus
+          : receipts.length === 1 &&
+              ["completed", "failed"].includes(receipts[0].details?.status)
+            ? receipts[0].details.status
+            : "unknown",
+    };
+  };
+  const rootReceipt = deliver(rootContents, implementer.edge);
+  const implementerReceipt = implementer.child
+    ? deliver(implementer.child.contents, scout.edge)
+    : { state: "unknown", terminalStatus: "unknown" };
+  const completionMarker = Boolean(
+    assistantResultForSession(
+      { contents: rootContents },
+      ctx.initialPrompt,
+      `PI_HERDSMAN_SMOKE_OK ${ctx.expectedPackage}`,
+    ),
+  );
+  let firstUnverifiedBoundary = "none_observed";
+  if (implementer.edge.delegation !== "accepted")
+    firstUnverifiedBoundary = "root_to_implementer";
+  else if (rootReceipt.state === "observed") {
+    if (!completionMarker) firstUnverifiedBoundary = "root_completion";
+  } else if (implementer.edge.terminalResult === "published")
+    firstUnverifiedBoundary = "implementer_result_delivery";
+  else if (implementer.edge.session !== "observed")
+    firstUnverifiedBoundary = "implementer_session";
+  else if (scout.edge?.delegation !== "accepted")
+    firstUnverifiedBoundary = "implementer_to_scout";
+  else if (implementerReceipt.state === "observed")
+    firstUnverifiedBoundary = "implementer_result_delivery";
+  else if (scout.edge.terminalResult === "published")
+    firstUnverifiedBoundary = "scout_result_delivery";
+  else if (scout.edge.session !== "observed")
+    firstUnverifiedBoundary = "scout_session";
+  else if (implementerReceipt.state !== "observed")
+    firstUnverifiedBoundary = "scout_result_delivery";
+  else firstUnverifiedBoundary = "implementer_result_delivery";
+  return {
+    rootToImplementer: {
+      delegation: implementer.edge.delegation,
+      session: implementer.edge.session,
+      terminalResult:
+        rootReceipt.state === "observed"
+          ? "delivered"
+          : implementer.edge.terminalResult,
+      terminalStatus:
+        rootReceipt.terminalStatus ?? implementer.edge.terminalStatus,
+      resultDelivered: rootReceipt.state,
+    },
+    rootCompletionMarker: completionMarker,
+    implementerToScout: scout.edge
+      ? {
+          delegation: scout.edge.delegation,
+          session: scout.edge.session,
+          terminalResult:
+            implementerReceipt.state === "observed"
+              ? "delivered"
+              : scout.edge.terminalResult,
+          terminalStatus:
+            implementerReceipt.terminalStatus ?? scout.edge.terminalStatus,
+          resultDelivered: implementerReceipt.state,
+        }
+      : {
+          delegation: "unknown",
+          session: "unknown",
+          terminalResult: "unknown",
+          terminalStatus: "unknown",
+          resultDelivered: "unknown",
+        },
+    firstUnverifiedBoundary,
+  };
+}
+
 function summarizeSession(contents) {
   const entries = sessionEntries(contents);
   const header = entries.find((entry) => entry.type === "session");
@@ -7821,6 +8118,21 @@ export async function collectDiagnostics(
   } catch (error) {
     diagnostics.rootSession = { error: error.message };
   }
+  if (ctx.scenario === "core") {
+    try {
+      diagnostics.coreDelegation =
+        rootSession.status === "fulfilled" && rootSession.value
+          ? await coreNestedDelegationDiagnostics(
+              ctx,
+              rootSession.value.contents,
+            )
+          : { firstUnverifiedBoundary: "root_session_unavailable" };
+    } catch {
+      diagnostics.coreDelegation = {
+        firstUnverifiedBoundary: "observation_failed",
+      };
+    }
+  }
   if (ctx.scenario === "supervisor-agent") {
     const session =
       rootSession.status === "fulfilled" ? rootSession.value : null;
@@ -8116,6 +8428,11 @@ export async function collectDiagnostics(
         ? diagnostics.processes.filter((record) => record.processMatch).length
         : null,
       rootSessionObserved: !diagnostics.rootSession?.error,
+      ...(diagnostics.coreDelegation
+        ? {
+            coreDelegation: sanitizedCoreDelegation(diagnostics.coreDelegation),
+          }
+        : {}),
     });
     console.error(`diagnostics: ${serialized}`);
   } catch {
@@ -8138,6 +8455,11 @@ export async function collectDiagnostics(
             rootSession.status === "fulfilled" && rootSession.value
               ? rootDelegationDiagnostics(rootSession.value.contents)
               : null,
+        }
+      : {}),
+    ...(diagnostics.coreDelegation
+      ? {
+          coreDelegation: sanitizedCoreDelegation(diagnostics.coreDelegation),
         }
       : {}),
     candidateProcessesObserved: Array.isArray(diagnostics.processes)
@@ -8447,7 +8769,147 @@ export async function cleanup(
   return failures.length ? failures.join("\n") : null;
 }
 
-export function sanitizedFailureEvidence(ctx, failure, outcome, cleanup) {
+const CORE_DIAGNOSTIC_ENUMS = {
+  delegation: ["accepted", "rejected", "unknown", "not_observed", "ambiguous"],
+  session: [
+    "observed",
+    "not_observed",
+    "unknown",
+    "ambiguous",
+    "observation_failed",
+  ],
+  terminalResult: [
+    "published",
+    "delivered",
+    "not_observed",
+    "unknown",
+    "ambiguous",
+    "observation_failed",
+  ],
+  terminalStatus: ["completed", "failed", "unknown"],
+  resultDelivered: ["observed", "not_observed", "unknown", "ambiguous"],
+  firstUnverifiedBoundary: [
+    "none_observed",
+    "root_to_implementer",
+    "implementer_session",
+    "implementer_result_delivery",
+    "implementer_to_scout",
+    "scout_session",
+    "scout_result_delivery",
+    "root_completion",
+    "root_session_unavailable",
+    "observation_failed",
+  ],
+};
+
+function sanitizedCoreDelegation(value) {
+  const state = (object, field) =>
+    CORE_DIAGNOSTIC_ENUMS[field].includes(object?.[field])
+      ? object[field]
+      : "unknown";
+  const edge = (object) => ({
+    delegation: state(object, "delegation"),
+    session: state(object, "session"),
+    terminalResult: state(object, "terminalResult"),
+    terminalStatus: state(object, "terminalStatus"),
+    resultDelivered: state(object, "resultDelivered"),
+  });
+  return {
+    rootToImplementer: edge(value?.rootToImplementer),
+    implementerToScout: edge(value?.implementerToScout),
+    rootCompletionMarker:
+      typeof value?.rootCompletionMarker === "boolean"
+        ? value.rootCompletionMarker
+        : null,
+    firstUnverifiedBoundary:
+      CORE_DIAGNOSTIC_ENUMS.firstUnverifiedBoundary.includes(
+        value?.firstUnverifiedBoundary,
+      )
+        ? value.firstUnverifiedBoundary
+        : "observation_failed",
+  };
+}
+
+function sanitizedFailureDiagnostics(value) {
+  if (!value || typeof value !== "object") return null;
+  const count = (input) =>
+    Number.isSafeInteger(input) && input >= 0 ? Math.min(input, 256) : null;
+  const root = value.rootDelegation;
+  const supervisor = value.supervisorAgent;
+  return {
+    ...(typeof value.stage === "string" &&
+    /^[a-z0-9-]{1,80}$/u.test(value.stage)
+      ? { stage: value.stage }
+      : {}),
+    agentsObserved: count(value.agentsObserved),
+    panesObserved: count(value.panesObserved),
+    rootSessionObserved:
+      typeof value.rootSessionObserved === "boolean"
+        ? value.rootSessionObserved
+        : false,
+    ...(root && typeof root === "object"
+      ? {
+          rootDelegation: {
+            delegationCallObserved:
+              typeof root.delegationCallObserved === "boolean"
+                ? root.delegationCallObserved
+                : false,
+            matchingResult: [
+              "absent",
+              "pending",
+              "error",
+              "success",
+              "unknown",
+            ].includes(root.matchingResult)
+              ? root.matchingResult
+              : "unknown",
+            assistantObserved:
+              typeof root.assistantObserved === "boolean"
+                ? root.assistantObserved
+                : false,
+            assistantStopReason: [
+              "stop",
+              "length",
+              "toolUse",
+              "error",
+              "aborted",
+              "unknown",
+            ].includes(root.assistantStopReason)
+              ? root.assistantStopReason
+              : "unknown",
+            assistantErrorObserved:
+              typeof root.assistantErrorObserved === "boolean"
+                ? root.assistantErrorObserved
+                : false,
+          },
+        }
+      : {}),
+    ...(supervisor && typeof supervisor === "object"
+      ? {
+          supervisorAgent: {
+            assignmentsObserved: count(supervisor.assignmentsObserved),
+            childSessionObserved:
+              typeof supervisor.childSessionObserved === "boolean"
+                ? supervisor.childSessionObserved
+                : false,
+            matchingMailboxes: count(supervisor.matchingMailboxes),
+          },
+        }
+      : {}),
+    candidateProcessesObserved: count(value.candidateProcessesObserved),
+    ...(value.coreDelegation
+      ? { coreDelegation: sanitizedCoreDelegation(value.coreDelegation) }
+      : {}),
+  };
+}
+
+export function sanitizedFailureEvidence(
+  ctx,
+  failure,
+  outcome,
+  cleanup,
+  diagnostics,
+) {
   const parent = ctx.owned?.parent;
   const progress =
     failure?.error?.smoke?.stage === "terminal-failure-report"
@@ -8666,6 +9128,12 @@ export function sanitizedFailureEvidence(ctx, failure, outcome, cleanup) {
         : undefined,
     ...(terminalFailureProgress ? { terminalFailureProgress } : {}),
     ...(managerHandoffProgress ? { managerHandoffProgress } : {}),
+    ...(diagnostics
+      ? { diagnostics: sanitizedFailureDiagnostics(diagnostics) }
+      : {}),
+    ...(ctx.scenario === "core" && diagnostics?.coreDelegation
+      ? { coreDelegation: sanitizedCoreDelegation(diagnostics.coreDelegation) }
+      : {}),
     lastVerified: ctx.lastVerified ?? null,
     processesVerified: ctx.coreProcessEvidence?.length ?? 0,
     sessionStartObserved: ctx.sessionStartObserved ?? false,
@@ -9036,12 +9504,6 @@ async function main() {
             collectDiagnostics(ctx, owned, failure),
           )
         : null;
-      evidence = sanitizedFailureEvidence(
-        ctx,
-        failure,
-        classifySmokeFailure(phase, error),
-        "PENDING",
-      );
       const markerPath = join(
         paths.piAgent,
         "pi-herdsman",
@@ -9067,10 +9529,13 @@ async function main() {
         );
         ctx.firstRequestObserved = provenance.trim().length > 0;
       } catch {}
-      evidence.sessionStartObserved = ctx.sessionStartObserved;
-      evidence.firstRequestObserved = ctx.firstRequestObserved ?? false;
-      evidence.firstRequestVerified = ctx.firstRequestVerified ?? false;
-      evidence.diagnostics = diagnosticProjection;
+      evidence = sanitizedFailureEvidence(
+        ctx,
+        failure,
+        classifySmokeFailure(phase, error),
+        "PENDING",
+        diagnosticProjection,
+      );
       const artifact = await preserveFailureEvidence(evidence);
       ctx.failureArtifact = artifact;
       console.error(`failure evidence: ${artifact}`);

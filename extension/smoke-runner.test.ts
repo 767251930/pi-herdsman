@@ -308,11 +308,457 @@ test("continuation failure diagnostics retain sanitized root delegation state", 
     assistantStopReason: "error",
     assistantErrorObserved: true,
   });
-  const artifact = await preserveFailureEvidence({ diagnostics: projection });
+  const evidence = sanitizedFailureEvidence(
+    {
+      scenario: "continuation",
+      simulated: true,
+      stage: "continuation-first-generation",
+    },
+    { error: new Error("PRIVATE_ERROR") },
+    "STALLED",
+    "PASS",
+    {
+      ...projection,
+      path: "PRIVATE_PATH",
+      rootSession: { summary: "PRIVATE_TRANSCRIPT" },
+      rootDelegation: {
+        ...projection.rootDelegation,
+        task: "PRIVATE_TASK",
+        message: "PRIVATE_MESSAGE",
+      },
+    },
+  );
+  assert.equal(evidence.diagnostics.rootDelegation.matchingResult, "absent");
+  const artifact = await preserveFailureEvidence(evidence);
   try {
-    assert.doesNotMatch(await readFile(artifact, "utf8"), /PRIVATE/u);
+    const saved = JSON.parse(await readFile(artifact, "utf8"));
+    assert.equal(saved.diagnostics.rootDelegation.matchingResult, "absent");
+    assert.doesNotMatch(JSON.stringify(saved), /PRIVATE/u);
   } finally {
     await rm(dirname(artifact), { recursive: true, force: true });
+  }
+});
+
+test("core failure diagnostics correlate accepted delegation without exposing identities", async () => {
+  const root = await mkdtemp(join(tmpdir(), "smoke-core-diagnostics-"));
+  const piSessions = join(root, "sessions");
+  const piAgent = join(root, "agent");
+  await Promise.all([mkdir(piSessions), mkdir(piAgent)]);
+  await mkdir(join(piAgent, "pi-herdsman", "runtime", "mailboxes-v5"), {
+    recursive: true,
+  });
+  const entries = [
+    { type: "session", id: "private-owner-session" },
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            name: "delegate_agent",
+            id: "private-call-id",
+            arguments: {
+              label: "smoke-core-implementer",
+              task: "PRIVATE_TASK",
+            },
+          },
+        ],
+      },
+    },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "delegate_agent",
+        toolCallId: "private-call-id",
+        isError: false,
+        content:
+          "Session: private-child-session\nRequest: 00000000-0000-4000-8000-000000000001",
+      },
+    },
+  ];
+  try {
+    for (const [receipt, expectedDelivery] of [
+      [null, "not_observed"],
+      [
+        {
+          type: "custom_message",
+          customType: "pi-herdsman-agent-result",
+          details: {
+            requestId: "00000000-0000-4000-8000-000000000001",
+            piSessionId: "private-child-session",
+            ownerSessionId: "private-owner-session",
+          },
+          content: "PRIVATE_RESULT",
+        },
+        "observed",
+      ],
+      [
+        {
+          type: "custom_message",
+          customType: "pi-herdsman-agent-result",
+          details: {
+            requestId: "foreign-request-id",
+            piSessionId: "private-child-session",
+            ownerSessionId: "private-owner-session",
+          },
+          content: "PRIVATE_RESULT",
+        },
+        "not_observed",
+      ],
+    ]) {
+      const projection = await collectDiagnostics(
+        {
+          scenario: "core",
+          stage: "core-delegation",
+          paths: { piSessions, piAgent },
+          sessionName: "isolated",
+          rootPaneId: "root",
+        },
+        { hostPaneId: "host" },
+        null,
+        {
+          execute: async () => ({ stdout: "" }),
+          observe: async () => ({ ok: true, value: { agents: [], panes: [] } }),
+          snapshot: async () => ({
+            path: "private-path",
+            status: "saved",
+            contents: [
+              ...entries.map((entry) => JSON.stringify(entry)),
+              ...(receipt ? [JSON.stringify(receipt)] : []),
+            ].join("\n"),
+          }),
+        },
+      );
+      assert.deepEqual(projection.coreDelegation, {
+        rootToImplementer: {
+          delegation: "accepted",
+          session: "not_observed",
+          terminalResult:
+            expectedDelivery === "observed" ? "delivered" : "not_observed",
+          terminalStatus: "unknown",
+          resultDelivered: expectedDelivery,
+        },
+        implementerToScout: {
+          delegation: "unknown",
+          session: "unknown",
+          terminalResult: "unknown",
+          terminalStatus: "unknown",
+          resultDelivered: "unknown",
+        },
+        rootCompletionMarker: false,
+        firstUnverifiedBoundary:
+          expectedDelivery === "observed"
+            ? "root_completion"
+            : "implementer_session",
+      });
+      assert.doesNotMatch(JSON.stringify(projection), /private|PRIVATE/u);
+      const failureEvidence = sanitizedFailureEvidence(
+        { scenario: "core", simulated: true },
+        { error: new Error("PRIVATE_ERROR") },
+        "STALLED",
+        "PASS",
+        {
+          ...projection,
+          private: "PRIVATE_PATH",
+          rootSession: {
+            path: "PRIVATE_SESSION_PATH",
+            summary: "PRIVATE_TRANSCRIPT_SUMMARY",
+          },
+          panes: { output: "PRIVATE_PANE_OUTPUT" },
+          mailbox: "PRIVATE_MAILBOX_CONTENT",
+          coreDelegation: {
+            ...projection.coreDelegation,
+            private: "PRIVATE_TASK",
+          },
+        },
+      );
+      assert.deepEqual(
+        failureEvidence.coreDelegation,
+        projection.coreDelegation,
+      );
+      assert.deepEqual(
+        failureEvidence.diagnostics.coreDelegation,
+        projection.coreDelegation,
+      );
+      const artifact = await preserveFailureEvidence(failureEvidence);
+      try {
+        const saved = await readFile(artifact, "utf8");
+        assert.deepEqual(
+          JSON.parse(saved).coreDelegation,
+          projection.coreDelegation,
+        );
+        assert.doesNotMatch(saved, /private|PRIVATE/u);
+      } finally {
+        await rm(dirname(artifact), { recursive: true, force: true });
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("core failure diagnostics distinguish nested result publication from delivery", async () => {
+  const root = await mkdtemp(join(tmpdir(), "smoke-core-nested-diagnostics-"));
+  const piSessions = join(root, "sessions");
+  const mailboxRoot = join(
+    root,
+    "agent",
+    "pi-herdsman",
+    "runtime",
+    "mailboxes-v5",
+  );
+  await Promise.all([
+    mkdir(piSessions),
+    mkdir(mailboxRoot, { recursive: true }),
+  ]);
+  const requestId = "00000000-0000-4000-8000-000000000002";
+  const entries = (owner, label, child, request) => [
+    { type: "session", id: owner },
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            name: "delegate_agent",
+            id: `call-${label}`,
+            arguments: { label, task: "PRIVATE_TASK" },
+          },
+        ],
+      },
+    },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "delegate_agent",
+        toolCallId: `call-${label}`,
+        isError: false,
+        content: `Session: ${child}\nRequest: ${request}`,
+      },
+    },
+  ];
+  try {
+    const rootEntries = entries(
+      "private-root",
+      "smoke-core-implementer",
+      "private-implementer",
+      "00000000-0000-4000-8000-000000000003",
+    );
+    const implementerEntries = entries(
+      "private-implementer",
+      "smoke-core-scout",
+      "private-scout",
+      requestId,
+    );
+    const scoutEntries = [{ type: "session", id: "private-scout" }];
+    await Promise.all([
+      writeFile(
+        join(piSessions, "scout.jsonl"),
+        scoutEntries.map((entry) => JSON.stringify(entry)).join("\n"),
+      ),
+    ]);
+    const mailbox = join(mailboxRoot, "a".repeat(32));
+    await mkdir(mailbox);
+    await writeFile(
+      join(mailbox, "state.json"),
+      JSON.stringify({
+        piSessionId: "private-scout",
+        ownerSessionId: "private-implementer",
+        agentLabel: "smoke-core-scout",
+        runId: "private-run-id",
+        workspaceId: "private-workspace-id",
+        paneId: "private-pane-id",
+        agentDefinition: "scout",
+      }),
+    );
+    await writeFile(
+      join(mailbox, `result-${requestId}.json`),
+      JSON.stringify({
+        requestId,
+        runId: "private-run-id",
+        ownerSessionId: "private-implementer",
+        workspaceId: "private-workspace-id",
+        agentLabel: "smoke-core-scout",
+        paneId: "private-pane-id",
+        status: "completed",
+      }),
+    );
+    for (const [receipt, expectedReceipt] of [
+      [null, "not_observed"],
+      [
+        {
+          type: "custom_message",
+          customType: "pi-herdsman-agent-result",
+          details: {
+            requestId,
+            piSessionId: "private-scout",
+            ownerSessionId: "private-implementer",
+            runId: "private-run-id",
+            workspaceId: "private-workspace-id",
+            agentLabel: "smoke-core-scout",
+            paneId: "private-pane-id",
+            agentDefinition: "scout",
+          },
+          content: "PRIVATE_RESULT",
+        },
+        "observed",
+      ],
+      [
+        {
+          type: "custom_message",
+          customType: "pi-herdsman-agent-result",
+          details: {
+            requestId: "00000000-0000-4000-8000-000000000004",
+            piSessionId: "private-scout",
+            ownerSessionId: "private-implementer",
+            runId: "private-run-id",
+            workspaceId: "private-workspace-id",
+            agentLabel: "smoke-core-scout",
+            paneId: "private-pane-id",
+            agentDefinition: "scout",
+          },
+          content: "PRIVATE_RESULT",
+        },
+        "not_observed",
+      ],
+      [
+        {
+          type: "custom_message",
+          customType: "pi-herdsman-agent-result",
+          details: {
+            requestId,
+            piSessionId: "foreign-session",
+            ownerSessionId: "private-implementer",
+            runId: "private-run-id",
+            workspaceId: "private-workspace-id",
+            agentLabel: "smoke-core-scout",
+            paneId: "private-pane-id",
+            agentDefinition: "scout",
+          },
+          content: "PRIVATE_RESULT",
+        },
+        "not_observed",
+      ],
+    ]) {
+      await writeFile(
+        join(piSessions, "implementer.jsonl"),
+        [...implementerEntries, ...(receipt ? [receipt] : [])]
+          .map((entry) => JSON.stringify(entry))
+          .join("\n"),
+      );
+      const projection = await collectDiagnostics(
+        {
+          scenario: "core",
+          stage: "core-delegation",
+          paths: { piSessions, piAgent: join(root, "agent") },
+          sessionName: "isolated",
+          rootPaneId: "root",
+        },
+        { hostPaneId: "host" },
+        null,
+        {
+          execute: async () => ({ stdout: "" }),
+          observe: async () => ({ ok: true, value: { agents: [], panes: [] } }),
+          snapshot: async () => ({
+            path: "private-root-path",
+            status: "saved",
+            contents: rootEntries
+              .map((entry) => JSON.stringify(entry))
+              .join("\n"),
+          }),
+        },
+      );
+      assert.deepEqual(projection.coreDelegation.implementerToScout, {
+        delegation: "accepted",
+        session: "observed",
+        terminalResult:
+          expectedReceipt === "observed" ? "delivered" : "published",
+        terminalStatus: "completed",
+        resultDelivered: expectedReceipt,
+      });
+      assert.equal(
+        projection.coreDelegation.firstUnverifiedBoundary,
+        expectedReceipt === "observed"
+          ? "implementer_result_delivery"
+          : "scout_result_delivery",
+      );
+      assert.doesNotMatch(JSON.stringify(projection), /private|PRIVATE/u);
+    }
+
+    await rm(join(mailbox, `result-${requestId}.json`));
+    const failedReceipt = {
+      type: "custom_message",
+      customType: "pi-herdsman-agent-result",
+      details: {
+        requestId,
+        piSessionId: "private-scout",
+        ownerSessionId: "private-implementer",
+        runId: "private-run-id",
+        workspaceId: "private-workspace-id",
+        agentLabel: "smoke-core-scout",
+        paneId: "private-pane-id",
+        agentDefinition: "scout",
+        status: "failed",
+        error: "PRIVATE_ERROR",
+      },
+      content: "PRIVATE_RESULT",
+    };
+    await writeFile(
+      join(piSessions, "implementer.jsonl"),
+      [...implementerEntries, failedReceipt]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n"),
+    );
+    const projection = await collectDiagnostics(
+      {
+        scenario: "core",
+        stage: "core-delegation",
+        paths: { piSessions, piAgent: join(root, "agent") },
+        sessionName: "isolated",
+        rootPaneId: "root",
+      },
+      { hostPaneId: "host" },
+      null,
+      {
+        execute: async () => ({ stdout: "" }),
+        observe: async () => ({ ok: true, value: { agents: [], panes: [] } }),
+        snapshot: async () => ({
+          path: "PRIVATE_PATH",
+          status: "saved",
+          contents: rootEntries
+            .map((entry) => JSON.stringify(entry))
+            .join("\n"),
+        }),
+      },
+    );
+    const evidence = sanitizedFailureEvidence(
+      { scenario: "core", simulated: true, stage: "core-delegation" },
+      { error: new Error("PRIVATE_ERROR") },
+      "STALLED",
+      "PASS",
+      { ...projection, task: "PRIVATE_TASK" },
+    );
+    const artifact = await preserveFailureEvidence(evidence);
+    try {
+      const saved = JSON.parse(await readFile(artifact, "utf8"));
+      assert.equal(
+        saved.diagnostics.coreDelegation.implementerToScout.terminalStatus,
+        "failed",
+      );
+      assert.equal(
+        saved.diagnostics.coreDelegation.implementerToScout.resultDelivered,
+        "observed",
+      );
+      assert.doesNotMatch(JSON.stringify(saved), /PRIVATE/u);
+    } finally {
+      await rm(dirname(artifact), { recursive: true, force: true });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
