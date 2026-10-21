@@ -31,6 +31,7 @@ import {
   removePendingRetirement,
   removeProjectMessagesForAssignment,
   listProjectAssignments,
+  migrateProjectAssignmentEvidence,
   listProjectMessageHeaders,
   readProjectMessage,
   supervisionRuntime,
@@ -3279,7 +3280,10 @@ export function registerLeadRuntime(
     if (leadExecutionPending) return leadToolState.normalizeLeadTools([]);
     if (!leadExecution) return leadToolState.normalizeLeadTools(baseline);
     if (leadExecution.managed)
-      return leadToolState.normalizeLeadTools(baseline);
+      return leadToolState.appendRegisteredTools(
+        leadToolState.normalizeLeadTools(baseline),
+        ["read_evidence"],
+      );
     if (!leadExecution.valid) return leadToolState.normalizeLeadTools([]);
     return leadToolState.projectLeadTools(baseline, leadExecution.definition);
   };
@@ -3469,8 +3473,15 @@ export function registerLeadRuntime(
         return undefined;
       const assignment = await currentProjectAssignment(ctx);
       if (!assignment) return undefined;
+      const migrated = migrateProjectAssignmentEvidence(
+        options.coordinationHost.supervisionRuntime(),
+        assignment.repoKey,
+        assignment.branch,
+        assignment.id,
+      );
+      if (!migrated || migrated.id !== assignment.id) return undefined;
       return {
-        assignment,
+        assignment: migrated,
         revalidate: (operation: () => Promise<void> | void) =>
           roleTransitions.withProjectAssignmentLock(
             assignment.repoKey,
@@ -7266,7 +7277,10 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
         true,
         branch,
       );
-    const existing = readProjectAssignment(runtime, manager.repoKey, branch);
+    const existing =
+      operation.action === "resume"
+        ? migrateProjectAssignmentEvidence(runtime, manager.repoKey, branch)
+        : readProjectAssignment(runtime, manager.repoKey, branch);
     if (existing && existing.repoKey !== manager.repoKey)
       throw new Error("Project assignment belongs to another repository");
     if (operation.action === "delegate" && existing)
