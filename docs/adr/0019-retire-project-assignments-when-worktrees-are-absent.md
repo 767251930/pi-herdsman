@@ -1,5 +1,9 @@
 # Retire project assignments when worktrees are absent
 
+> **Session identity update:** [ADR 0029](0029-use-immutable-managed-lead-session-identity.md) supersedes all
+> takeover and in-place ordinary-continuation decisions in this record.
+> Other decisions remain subject to their noted supersessions.
+
 [Documentation index](../README.md)
 
 ## Status

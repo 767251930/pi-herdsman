@@ -20,6 +20,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
 import { setTimeout as sleep } from "node:timers/promises";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -745,9 +746,16 @@ export function managerAssignmentDiagnostics({
   supervisorSuccess,
   supervisorResult,
   readiness,
+  supervisorCallObserved,
+  supervisorResultState,
+  supervisorErrorCategory,
+  supervisorUnstructuredErrorClass,
+  readinessDeliveryObserved,
   candidateProcessCount,
   provenanceMatch,
   errorCategory,
+  worktreeIdentityState,
+  fauxSupervisorToolAvailability,
 }) {
   return {
     expectedBranchWorktree: worktree ?? "not_observed",
@@ -758,9 +766,201 @@ export function managerAssignmentDiagnostics({
     messageSupervisorSuccess: supervisorSuccess ?? "not_observed",
     messageSupervisorResult: supervisorResult ?? "not_called",
     exactManagerReadinessDelivery: readiness ?? "not_observed",
+    fauxSupervisorToolAvailability:
+      fauxSupervisorToolAvailability === "not_offered"
+        ? "not_offered"
+        : "not_observed",
+    supervisorCallObserved: supervisorCallObserved ?? false,
+    supervisorResultState: supervisorResultState ?? "not_observed",
+    supervisorErrorCategory: supervisorErrorCategory ?? "none",
+    ...([
+      "abort_error",
+      "lock_occupied",
+      "dispatch_error",
+      "unstructured_error_unknown",
+    ].includes(supervisorUnstructuredErrorClass)
+      ? { supervisorUnstructuredErrorClass }
+      : {}),
+    supervisorHandlerBranchStatus: "not_observed",
+    supervisorPersistedErrorCategoryPresent: false,
+    supervisorPersistedErrorCategory: "not_observed",
+    readinessDeliveryObserved: readinessDeliveryObserved ?? false,
     candidateProcessCount: candidateProcessCount ?? "not_observed",
     candidateProcessProvenanceMatch: provenanceMatch ?? "not_evaluated",
     errorCategory: errorCategory ?? "none",
+    worktreeIdentityState: worktreeIdentityState ?? "not_observed",
+  };
+}
+
+export function managerHandoffSupervisorToolAvailability(contents) {
+  if (typeof contents !== "string") return "not_observed";
+  for (const line of contents.split(/\r?\n/)) {
+    try {
+      const attempt = JSON.parse(line);
+      if (
+        attempt?.model === "manager-handoff-lead" &&
+        attempt.supervisorToolAvailability === "not_offered"
+      )
+        return "not_offered";
+    } catch {
+      // Ignore malformed and unrelated attempt records.
+    }
+  }
+  return "not_observed";
+}
+
+const STRUCTURED_TOOL_ERROR_CATEGORIES = new Set([
+  "not_running_inside_herdr",
+  "agent_label_exists",
+  "pane_not_ready",
+  "target_not_found",
+  "target_ambiguous",
+  "rollback_failure",
+  "agent_busy",
+  "invalid_request",
+  "incompatible_build",
+  "internal_failure",
+]);
+
+export function supervisorMessageDiagnostics(path, expectedSessionId, text) {
+  let session;
+  try {
+    session = SessionManager.open(path);
+  } catch {
+    return emptySupervisorMessageDiagnostics(false);
+  }
+  if (session.getHeader()?.id !== expectedSessionId)
+    return emptySupervisorMessageDiagnostics(false);
+
+  const entries = session.getBranch();
+  const calls = entries.flatMap((entry, index) =>
+    entry.type === "message" &&
+    entry.message?.role === "assistant" &&
+    Array.isArray(entry.message.content)
+      ? entry.message.content
+          .filter(
+            (block) =>
+              block?.type === "toolCall" &&
+              block.name === "message_supervisor" &&
+              block.arguments?.message === text &&
+              typeof block.id === "string",
+          )
+          .map((call) => ({ call, index }))
+      : [],
+  );
+  const candidate = calls.length === 1 ? calls[0] : undefined;
+  const matchingCallIdCount = candidate
+    ? entries.reduce(
+        (count, entry) =>
+          count +
+          (entry.type === "message" && entry.message?.role === "assistant"
+            ? (Array.isArray(entry.message.content)
+                ? entry.message.content
+                : []
+              ).filter(
+                (block) =>
+                  block?.type === "toolCall" && block.id === candidate.call.id,
+              ).length
+            : 0),
+        0,
+      )
+    : 0;
+  const match = matchingCallIdCount === 1 ? candidate : undefined;
+  const call = match?.call;
+  const correlatedResults = call
+    ? entries.flatMap((entry, index) =>
+        entry.type === "message" &&
+        entry.message?.role === "toolResult" &&
+        entry.message.toolCallId === call.id
+          ? [{ message: entry.message, index }]
+          : [],
+      )
+    : [];
+  const matchingResult =
+    correlatedResults.length === 1 &&
+    correlatedResults[0].message.toolName === "message_supervisor" &&
+    correlatedResults[0].index > match.index
+      ? correlatedResults[0].message
+      : undefined;
+  const result = matchingResult;
+  const success = result && !result.isError && result.details?.ok !== false;
+  const failed =
+    result && (result.isError === true || result.details?.ok === false)
+      ? result
+      : undefined;
+  const category = failed?.details?.error?.category;
+  const errorDetails = failed?.details?.error;
+  const handlerBranchStatus = errorDetails?.branchStatus;
+  const categoryPresent =
+    errorDetails !== null &&
+    typeof errorDetails === "object" &&
+    Object.hasOwn(errorDetails, "category");
+  const resultText =
+    typeof result?.content === "string"
+      ? result.content
+      : Array.isArray(result?.content)
+        ? result.content
+            .filter((block) => block?.type === "text")
+            .map((block) => block.text)
+            .filter((value) => typeof value === "string")
+            .join("\n")
+        : "";
+  const unstructuredErrorClass =
+    failed?.isError === true &&
+    !STRUCTURED_TOOL_ERROR_CATEGORIES.has(category) &&
+    resultText
+      ? /\bAbortError\b/u.test(resultText)
+        ? "abort_error"
+        : /\bProcessLockOccupiedError\b/u.test(resultText)
+          ? "lock_occupied"
+          : /\btool\s+["']?message_supervisor["']?\s+(?:was\s+)?not found\b|\bmessage_supervisor\b.{0,40}\b(?:not found|unavailable)\b/iu.test(
+                resultText,
+              )
+            ? "dispatch_error"
+            : "unstructured_error_unknown"
+      : "not_applicable";
+  return {
+    supervisorSessionHeaderMatches: true,
+    supervisorCallObserved: !!call,
+    supervisorResultState: !call
+      ? "missing"
+      : success
+        ? "success"
+        : failed
+          ? "error"
+          : correlatedResults.length === 0
+            ? "pending"
+            : "not_observed",
+    supervisorErrorCategory:
+      failed && !success
+        ? STRUCTURED_TOOL_ERROR_CATEGORIES.has(category)
+          ? category
+          : "tool_error"
+        : "none",
+    supervisorHandlerBranchStatus:
+      handlerBranchStatus === "operation_error_returned"
+        ? handlerBranchStatus
+        : "not_observed",
+    supervisorPersistedErrorCategoryPresent: categoryPresent,
+    supervisorPersistedErrorCategory:
+      categoryPresent && STRUCTURED_TOOL_ERROR_CATEGORIES.has(category)
+        ? category
+        : "not_observed",
+    ...(unstructuredErrorClass !== "not_applicable"
+      ? { supervisorUnstructuredErrorClass: unstructuredErrorClass }
+      : {}),
+  };
+}
+
+function emptySupervisorMessageDiagnostics(headerMatches) {
+  return {
+    supervisorSessionHeaderMatches: headerMatches,
+    supervisorCallObserved: false,
+    supervisorResultState: headerMatches ? "missing" : "not_observed",
+    supervisorErrorCategory: "none",
+    supervisorHandlerBranchStatus: "not_observed",
+    supervisorPersistedErrorCategoryPresent: false,
+    supervisorPersistedErrorCategory: "not_observed",
   };
 }
 
@@ -1020,9 +1220,17 @@ export function captureTerminalFailureWorktree(ctx, worktrees, branch) {
     throw new Error("exact branch must identify one worktree");
   const [worktree] = matches;
   const path = worktree.path ?? worktree.worktree_path;
-  if (typeof path !== "string" || !path || !worktree.open_workspace_id)
-    throw new Error("exact branch worktree identity is incomplete");
-  captureTerminalFailureAssignment(ctx, path, worktree.open_workspace_id);
+  const workspaceId = worktree.open_workspace_id;
+  if (
+    (path !== undefined && path !== null && typeof path !== "string") ||
+    (workspaceId !== undefined &&
+      workspaceId !== null &&
+      typeof workspaceId !== "string")
+  )
+    throw new Error("exact branch worktree identity is malformed");
+  if (!path || !workspaceId)
+    throw observationFailure("exact branch worktree identity is incomplete");
+  captureTerminalFailureAssignment(ctx, path, workspaceId);
   return worktree;
 }
 
@@ -2902,6 +3110,16 @@ async function runTerminalFailureSmoke(ctx) {
           String(failureMessage.content),
         )
       );
+      const reportPending = !!(
+        leadSession &&
+        sessionEntries(leadSession.contents).some(
+          (entry) =>
+            entry.type === "custom" &&
+            entry.customType === "pi-herdsman-herd-run" &&
+            entry.data?.phase === "report_pending" &&
+            entry.data.sessionId === sessionId,
+        )
+      );
       const settledRows = settled
         .split(/\r?\n/)
         .filter(Boolean)
@@ -2955,6 +3173,9 @@ async function runTerminalFailureSmoke(ctx) {
           logicalReports: reports?.logicalReports ?? 0,
           actionable: !!reports?.actionable,
           managerResponded,
+          reportPending: reportPending ? "observed" : "not_observed",
+          managerReceipt: failureMessage ? "observed" : "not_observed",
+          managerFollowup: managerResponded ? "observed" : "not_observed",
           settledCount: settledRows.length,
           settledNonAborted:
             settledRows.length === 1 && settledRows[0].aborted === false,
@@ -3468,26 +3689,50 @@ async function runManagerHandoffSmoke(ctx) {
       ]);
       if (!Array.isArray(topology.worktrees))
         throw new Error("Manager handoff worktree topology is unavailable");
-      const worktree = captureManagerHandoffWorktree(
-        ctx,
-        topology.worktrees,
-        branch,
-      );
+      let worktree;
+      try {
+        worktree = captureManagerHandoffWorktree(
+          ctx,
+          topology.worktrees,
+          branch,
+        );
+      } catch (error) {
+        if (error?.code !== "SMOKE_OBSERVATION") throw error;
+        return {
+          done: false,
+          progress: managerAssignmentDiagnostics({
+            worktreeIdentityState: "incomplete",
+            errorCategory: "worktree_identity_incomplete",
+          }),
+        };
+      }
       const session = await root();
       if (session) assertNoFailedProjectDelegation(session.contents, branch);
       const rows = session ? staffDelegateResults(session.contents) : [];
       if (rows.length > 1)
         throw new Error("Manager handoff created multiple project assignments");
       const row = rows.length === 1 ? rows[0] : null;
+      const fauxAttempts = await readFile(
+        join(
+          ctx.paths.piAgent,
+          "pi-herdsman",
+          "runtime",
+          "smoke-faux-attempts.jsonl",
+        ),
+        "utf8",
+      ).catch(() => "");
       const diagnostics = (values = {}) =>
         managerAssignmentDiagnostics({
           worktree: worktree ? "true" : "false",
+          worktreeIdentityState: worktree ? "verified" : "not_observed",
           result: rows.length ? String(row?.branch === branch) : "not_observed",
           identity: managerAssignmentIdentity(row, worktree, branch),
           lead: "not_yet_evaluated",
           supervisorCall: "not_yet_evaluated",
           supervisorSuccess: "not_yet_evaluated",
           readiness: "not_yet_evaluated",
+          fauxSupervisorToolAvailability:
+            managerHandoffSupervisorToolAvailability(fauxAttempts),
           candidateProcessCount: "not_observed",
           provenanceMatch: "not_evaluated",
           ...values,
@@ -3562,10 +3807,12 @@ async function runManagerHandoffSmoke(ctx) {
         provenanceMatch = "false";
         errorCategory = "provenance_observation_failed";
       }
-      const ready = hasSuccessfulSupervisorMessage(
-        leadSession.contents,
+      const supervisor = supervisorMessageDiagnostics(
+        leadSession.path,
+        row.session,
         "MANAGER_HANDOFF_READY",
       );
+      const ready = supervisor.supervisorResultState === "success";
       const readyEntry =
         session &&
         sessionEntries(session.contents).find(
@@ -3577,15 +3824,7 @@ async function runManagerHandoffSmoke(ctx) {
             entry.content ===
               `Project ${row.branch} from lead ${row.session}:\n\nMANAGER_HANDOFF_READY`,
         );
-      const supervisorResult = supervisorMessageCallStatus(
-        leadSession.contents,
-        "MANAGER_HANDOFF_READY",
-      );
-      const readyCall = supervisorResult !== "not_called";
-      if (supervisorResult === "error")
-        throw new Error(
-          `Manager handoff message_supervisor result: ${supervisorResult}`,
-        );
+      const supervisorResult = supervisor.supervisorResultState;
       if (!ready || !readyEntry)
         return {
           done: false,
@@ -3594,10 +3833,12 @@ async function runManagerHandoffSmoke(ctx) {
             candidateProcessCount: processCount,
             provenanceMatch,
             errorCategory,
-            supervisorCall: String(readyCall),
+            ...supervisor,
+            supervisorCall: String(supervisor.supervisorCallObserved),
             supervisorSuccess: String(ready),
             supervisorResult,
             readiness: String(!!readyEntry),
+            readinessDeliveryObserved: !!readyEntry,
           }),
         };
       return {
@@ -3609,8 +3850,9 @@ async function runManagerHandoffSmoke(ctx) {
           errorCategory,
           supervisorCall: "true",
           supervisorSuccess: "true",
-          supervisorResult,
+          ...supervisor,
           readiness: "true",
+          readinessDeliveryObserved: true,
         }),
         value: { row, lead, leadSession, owner: session },
       };
@@ -6003,9 +6245,22 @@ async function runManagerRecoverySmoke(ctx) {
   assert.doesNotMatch(record.text, new RegExp(contextMarker));
   assert.equal(typeof record.piSessionFile, "string");
   assert.ok(record.piSessionFile.length > 0);
-  assert.deepEqual(
-    Object.keys(record).sort(),
-    ["branch", "id", "piSessionFile", "repoKey", "text", "version"].sort(),
+  const requiredAssignmentKeys = [
+    "branch",
+    "id",
+    "piSessionFile",
+    "repoKey",
+    "text",
+    "version",
+  ];
+  const allowedAssignmentKeys = [
+    ...requiredAssignmentKeys,
+    "requiredEvidence",
+    "resultBindings",
+  ];
+  assert.ok(requiredAssignmentKeys.every((key) => Object.hasOwn(record, key)));
+  assert.ok(
+    Object.keys(record).every((key) => allowedAssignmentKeys.includes(key)),
   );
   const assertUnchangedAssignment = async () =>
     assert.equal(
@@ -7937,11 +8192,16 @@ export async function cleanup(
   const cleanupHerdr = (args, options = {}) =>
     herdrCommand(args, { ...options, timeout: remainingTimeout() });
   const failures = [];
+  const cleanupFailureCategories = new Set();
+  const recordCleanupFailure = (category, message) => {
+    cleanupFailureCategories.add(category);
+    failures.push(message);
+  };
   try {
     await removeFile(paths.authLink);
   } catch (error) {
     if (error.code !== "ENOENT")
-      failures.push(`auth symlink: ${error.message}`);
+      recordCleanupFailure("auth_symlink", `auth symlink: ${error.message}`);
   }
   if (owned.managerBranch) {
     let managerWorktreeSafe = true;
@@ -7985,7 +8245,8 @@ export async function cleanup(
       }
     } catch (error) {
       managerWorktreeSafe = false;
-      failures.push(
+      recordCleanupFailure(
+        "manager_worktree",
         `manager worktree ${owned.managerWorkspaceId ?? owned.managerBranch}: ${error.message}`,
       );
     }
@@ -8001,7 +8262,8 @@ export async function cleanup(
           ctx.primaryCheckoutPath ?? repoRoot,
         );
       } catch (error) {
-        failures.push(
+        recordCleanupFailure(
+          "manager_branch",
           `manager branch ${owned.managerBranch}: ${error.message}`,
         );
       }
@@ -8040,7 +8302,8 @@ export async function cleanup(
           await sleepFor(Math.min(300, remainingTimeout()));
       }
     } catch (error) {
-      failures.push(
+      recordCleanupFailure(
+        "nested_session",
         `nested session cleanup ${owned.sessionName}: ${error.message}`,
       );
     }
@@ -8048,7 +8311,8 @@ export async function cleanup(
       !deleted &&
       !failures.some((item) => item.startsWith("nested session remains"))
     )
-      failures.push(
+      recordCleanupFailure(
+        "nested_session",
         `nested session remains: ${owned.sessionName}; temp=${paths.root}`,
       );
   }
@@ -8058,7 +8322,10 @@ export async function cleanup(
         env: ctx.parentEnv,
       });
     } catch (error) {
-      failures.push(`host tab ${owned.hostTabId}: ${error.message}`);
+      recordCleanupFailure(
+        "host_tab",
+        `host tab ${owned.hostTabId}: ${error.message}`,
+      );
     }
   }
   if (owned.parent) {
@@ -8073,7 +8340,8 @@ export async function cleanup(
           env: parent.env,
         });
       } catch (error) {
-        failures.push(
+        recordCleanupFailure(
+          "parent_workspace",
           `parent workspace ${parent.workspaceId}: ${error.message}`,
         );
       }
@@ -8166,12 +8434,16 @@ export async function cleanup(
     try {
       await remove(paths.root, { recursive: true, force: true });
     } catch (error) {
-      failures.push(`temporary state: ${error.message}`);
+      recordCleanupFailure(
+        "temporary_state",
+        `temporary state: ${error.message}`,
+      );
     }
   }
   ctx.cleanupErrorCode = failures.length
     ? (ctx.parentCleanupDiagnostics?.cleanupErrorCode ?? "CLEANUP_FAILED")
     : null;
+  ctx.cleanupFailureCategories = [...cleanupFailureCategories].sort();
   return failures.length ? failures.join("\n") : null;
 }
 
@@ -8214,6 +8486,173 @@ export function sanitizedFailureEvidence(ctx, failure, outcome, cleanup) {
           typeof progress.managerResponded === "boolean"
             ? progress.managerResponded
             : null,
+        settlementCallback: ["observed", "not_observed"].includes(
+          progress.settlementCallback,
+        )
+          ? progress.settlementCallback
+          : "not_observed",
+        settlementOutcome: [
+          "aborted",
+          "error",
+          "completed",
+          "other",
+          "not_observed",
+        ].includes(progress.settlementOutcome)
+          ? progress.settlementOutcome
+          : "not_observed",
+        reportPending: ["observed", "not_observed"].includes(
+          progress.reportPending,
+        )
+          ? progress.reportPending
+          : "not_observed",
+        publicationAttempt: [
+          "attempted",
+          "not_attempted",
+          "not_observed",
+        ].includes(progress.publicationAttempt)
+          ? progress.publicationAttempt
+          : "not_observed",
+        publicationOutcome: ["returned", "failed", "not_observed"].includes(
+          progress.publicationOutcome,
+        )
+          ? progress.publicationOutcome
+          : "not_observed",
+        managerReceipt: ["observed", "not_observed"].includes(
+          progress.managerReceipt,
+        )
+          ? progress.managerReceipt
+          : "not_observed",
+        managerFollowup: ["observed", "not_observed"].includes(
+          progress.managerFollowup,
+        )
+          ? progress.managerFollowup
+          : "not_observed",
+      }
+    : null;
+  const managerProgress =
+    failure?.error?.smoke?.stage === "manager-handoff-assignment"
+      ? failure.error.smoke.lastProgress
+      : null;
+  const managerHandoffProgress = managerProgress
+    ? {
+        fauxSupervisorToolAvailability: [
+          "not_offered",
+          "not_observed",
+        ].includes(managerProgress.fauxSupervisorToolAvailability)
+          ? managerProgress.fauxSupervisorToolAvailability
+          : "not_observed",
+        expectedBranchWorktree: ["true", "false", "not_observed"].includes(
+          managerProgress.expectedBranchWorktree,
+        )
+          ? managerProgress.expectedBranchWorktree
+          : "not_observed",
+        successfulCorrelatedDelegateProjectResult: [
+          "true",
+          "false",
+          "not_observed",
+        ].includes(managerProgress.successfulCorrelatedDelegateProjectResult)
+          ? managerProgress.successfulCorrelatedDelegateProjectResult
+          : "not_observed",
+        assignmentIdentitySessionWorkspaceBranchMatch: [
+          "true",
+          "false",
+          "not_observed",
+        ].includes(
+          managerProgress.assignmentIdentitySessionWorkspaceBranchMatch,
+        )
+          ? managerProgress.assignmentIdentitySessionWorkspaceBranchMatch
+          : "not_observed",
+        matchedLead: [
+          "true",
+          "false",
+          "not_observed",
+          "not_yet_evaluated",
+        ].includes(managerProgress.matchedLead)
+          ? managerProgress.matchedLead
+          : "not_yet_evaluated",
+        candidateProcessCount:
+          Number.isSafeInteger(managerProgress.candidateProcessCount) &&
+          managerProgress.candidateProcessCount >= 0
+            ? Math.min(managerProgress.candidateProcessCount, 100)
+            : "not_observed",
+        candidateProcessProvenanceMatch: [
+          "true",
+          "false",
+          "not_evaluated",
+        ].includes(managerProgress.candidateProcessProvenanceMatch)
+          ? managerProgress.candidateProcessProvenanceMatch
+          : "not_evaluated",
+        supervisorCallObserved:
+          typeof managerProgress.supervisorCallObserved === "boolean"
+            ? managerProgress.supervisorCallObserved
+            : false,
+        supervisorResultState: [
+          "not_observed",
+          "missing",
+          "pending",
+          "success",
+          "error",
+        ].includes(managerProgress.supervisorResultState)
+          ? managerProgress.supervisorResultState
+          : "not_observed",
+        supervisorErrorCategory: [
+          ...STRUCTURED_TOOL_ERROR_CATEGORIES,
+          "tool_error",
+          "none",
+        ].includes(managerProgress.supervisorErrorCategory)
+          ? managerProgress.supervisorErrorCategory
+          : "none",
+        supervisorHandlerBranchStatus:
+          managerProgress.supervisorHandlerBranchStatus ===
+          "operation_error_returned"
+            ? managerProgress.supervisorHandlerBranchStatus
+            : "not_observed",
+        supervisorPersistedErrorCategoryPresent:
+          typeof managerProgress.supervisorPersistedErrorCategoryPresent ===
+          "boolean"
+            ? managerProgress.supervisorPersistedErrorCategoryPresent
+            : false,
+        supervisorPersistedErrorCategory: STRUCTURED_TOOL_ERROR_CATEGORIES.has(
+          managerProgress.supervisorPersistedErrorCategory,
+        )
+          ? managerProgress.supervisorPersistedErrorCategory
+          : "not_observed",
+        ...([
+          "abort_error",
+          "lock_occupied",
+          "dispatch_error",
+          "unstructured_error_unknown",
+        ].includes(managerProgress.supervisorUnstructuredErrorClass)
+          ? {
+              supervisorUnstructuredErrorClass:
+                managerProgress.supervisorUnstructuredErrorClass,
+            }
+          : {}),
+        readinessDeliveryObserved:
+          typeof managerProgress.readinessDeliveryObserved === "boolean"
+            ? managerProgress.readinessDeliveryObserved
+            : false,
+        worktreeIdentityState: ["verified", "incomplete"].includes(
+          managerProgress.worktreeIdentityState,
+        )
+          ? managerProgress.worktreeIdentityState
+          : "not_observed",
+        errorCategory:
+          managerProgress.errorCategory === "worktree_identity_incomplete"
+            ? managerProgress.errorCategory
+            : "none",
+        elapsedMs:
+          typeof failure.error.smoke.elapsedMs === "number" &&
+          Number.isFinite(failure.error.smoke.elapsedMs) &&
+          failure.error.smoke.elapsedMs >= 0
+            ? failure.error.smoke.elapsedMs
+            : null,
+        inactiveMs:
+          typeof failure.error.smoke.inactiveMs === "number" &&
+          Number.isFinite(failure.error.smoke.inactiveMs) &&
+          failure.error.smoke.inactiveMs >= 0
+            ? failure.error.smoke.inactiveMs
+            : null,
       }
     : null;
   return {
@@ -8226,6 +8665,7 @@ export function sanitizedFailureEvidence(ctx, failure, outcome, cleanup) {
         ? failure.error.code.slice(0, 80)
         : undefined,
     ...(terminalFailureProgress ? { terminalFailureProgress } : {}),
+    ...(managerHandoffProgress ? { managerHandoffProgress } : {}),
     lastVerified: ctx.lastVerified ?? null,
     processesVerified: ctx.coreProcessEvidence?.length ?? 0,
     sessionStartObserved: ctx.sessionStartObserved ?? false,
@@ -8249,6 +8689,21 @@ export function sanitizedFailureEvidence(ctx, failure, outcome, cleanup) {
         }
       : null,
     cleanupErrorCode: ctx.cleanupErrorCode ?? null,
+    cleanupFailureCategories: [
+      ...new Set(
+        (ctx.cleanupFailureCategories ?? []).filter((category) =>
+          [
+            "auth_symlink",
+            "manager_worktree",
+            "manager_branch",
+            "nested_session",
+            "host_tab",
+            "parent_workspace",
+            "temporary_state",
+          ].includes(category),
+        ),
+      ),
+    ].sort(),
     cleanup,
   };
 }

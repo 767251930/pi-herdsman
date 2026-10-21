@@ -241,7 +241,7 @@ const ownershipResult = (
   },
 });
 
-test("a manually continued assigned Lead stays managed and rejects stale Manager messages", async (t) => {
+test("a manually continued assigned Lead rejects stale Manager messages and structures the malformed-topology probe error", async (t) => {
   setLeadEnvironment();
   const socket = join(tmpdir(), `manager-routing-${randomUUID()}.sock`);
   process.env.HERDR_SOCKET_PATH = socket;
@@ -269,6 +269,7 @@ test("a manually continued assigned Lead stays managed and rejects stale Manager
   const descriptor = readFileSync(descriptorPath, "utf8");
   let managerReleased = false;
   let managerIdentityUnavailable = false;
+  let malformedWorktreeTopology = false;
   const agents = [
     [chiefId, "chief-pane", "chief-tab", WORKSPACE],
     [managerId, "manager-pane", "manager-tab", WORKSPACE],
@@ -297,14 +298,23 @@ test("a manually continued assigned Lead stays managed and rejects stale Manager
         },
       };
     else if (args[0] === "worktree" && args[1] === "list")
-      result = {
-        source: {
-          repo_key: "repo-key",
-          repo_name: "project",
-          source_workspace_id: WORKSPACE,
-        },
-        worktrees: [{ open_workspace_id: "linked-workspace" }],
-      };
+      result = malformedWorktreeTopology
+        ? {
+            source: {
+              repo_key: "repo-key",
+              repo_name: "project",
+              source_workspace_id: WORKSPACE,
+            },
+            worktrees: null,
+          }
+        : {
+            source: {
+              repo_key: "repo-key",
+              repo_name: "project",
+              source_workspace_id: WORKSPACE,
+            },
+            worktrees: [{ open_workspace_id: "linked-workspace" }],
+          };
     return {
       stdout: JSON.stringify({ id: AGENT_ID, result }),
       stderr: "",
@@ -349,8 +359,39 @@ test("a manually continued assigned Lead stays managed and rejects stale Manager
     });
     await pi.events.get("session_start")![0](undefined, ctx);
     await t.waitFor(() =>
-      assert.match(statusWidget!.render(160)[0], /^● lead · managed/),
+      assert.match(statusWidget!.render(160)[0], /^● lead · Managed/),
     );
+    const supervisorTool = pi.tools.find(
+      (tool) => tool.name === "message_supervisor",
+    )!;
+    const projectMessagesBeforeProbe = listProjectMessages(
+      runtime,
+      "repo-key",
+      "smoke/routing",
+    );
+    malformedWorktreeTopology = true;
+    const malformedTopologyResult = await supervisorTool.execute(
+      "malformed-topology-probe",
+      { message: "MUST_NOT_PUBLISH" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(malformedTopologyResult.isError, true);
+    assert.deepEqual(malformedTopologyResult.content, [
+      { type: "text", text: "Herdr project topology is unavailable" },
+    ]);
+    assert.deepEqual(malformedTopologyResult.details, {
+      error: {
+        branchStatus: "operation_error_returned",
+        category: "internal_failure",
+      },
+    });
+    assert.deepEqual(
+      listProjectMessages(runtime, "repo-key", "smoke/routing"),
+      projectMessagesBeforeProbe,
+    );
+    malformedWorktreeTopology = false;
     ctx.isIdle = () => false;
     const managerMessage = {
       version: 2,
@@ -462,9 +503,32 @@ test("a manually continued assigned Lead stays managed and rejects stale Manager
     const records = (id: string) =>
       listChiefMessagePaths(runtime, id).map((path) => readChiefMessage(path));
 
+    const identityEntry = pi.entries.find(
+      (entry: any) =>
+        entry.customType === "pi-herdsman-session-kind" &&
+        entry.data?.sessionId === leadId,
+    ) as any;
+    const managedIdentity = identityEntry.data;
+    const beforeContradictoryIdentity = listProjectMessages(
+      runtime,
+      "repo-key",
+      "smoke/routing",
+    );
+    identityEntry.data = { version: 1, sessionId: leadId, kind: "ordinary" };
+    const ordinaryResult = await send("ORDINARY_CANNOT_USE_PROJECT_ROUTE");
+    assert.equal(
+      JSON.stringify(ordinaryResult).includes(
+        "Project message saved for Manager",
+      ),
+      false,
+    );
+    assert.deepEqual(
+      listProjectMessages(runtime, "repo-key", "smoke/routing"),
+      beforeContradictoryIdentity,
+    );
+    identityEntry.data = managedIdentity;
     const saved = await send("SMOKE_READY_1");
     assert.match(JSON.stringify(saved), /Project message saved for Manager/);
-    assert.equal(records(managerId).length, 0);
     assert.deepEqual(
       listProjectMessages(runtime, "repo-key", "smoke/routing").map(
         ({ repoKey, branch, fromSessionId, text }) => ({
@@ -483,7 +547,7 @@ test("a manually continued assigned Lead stays managed and rejects stale Manager
         },
       ],
     );
-    const staleText = "must be rejected after takeover";
+    const staleText = "must be rejected after retirement";
     writeChiefMessage(
       {
         version: 2,
@@ -500,6 +564,17 @@ test("a manually continued assigned Lead stays managed and rejects stale Manager
       runtime,
     );
     removeProjectAssignment(runtime, "repo-key", "smoke/routing");
+    const unavailableProjectMessages = listProjectMessages(
+      runtime,
+      "repo-key",
+      "smoke/routing",
+    );
+    const unavailableRoute = await send("MUST_NOT_FALL_BACK");
+    assert.equal(unavailableRoute.isError, true);
+    assert.deepEqual(
+      listProjectMessages(runtime, "repo-key", "smoke/routing"),
+      unavailableProjectMessages,
+    );
     await t.waitFor(() =>
       assert.equal(listChiefMessagePaths(runtime, leadId).length, 0),
     );
@@ -622,45 +697,15 @@ test("a manually continued assigned Lead stays managed and rejects stale Manager
       "Manual continuation result.",
     );
 
-    ctx.hasUI = true;
-    ctx.ui.confirm = async () => true;
-    support.failProjectMessageRemoval = true;
-    try {
-      await pi.commandOptions.get("takeover")!.handler("", ctx);
-      assert.equal(listProjectAssignments(runtime, "repo-key").length, 0);
-      assert.deepEqual(
-        listPendingRetirements(runtime, "repo-key"),
-        [],
-        "takeover produces no worktree retirement context",
-      );
-      assert.ok(
-        pi.entries.some(
-          (entry: any) => entry.customType === "pi_herdsman_state_error",
-        ),
-      );
-      assert.equal(
-        listProjectMessages(runtime, "repo-key", "smoke/routing").length,
-        3,
-      );
-    } finally {
-      support.failProjectMessageRemoval = false;
-    }
+    assert.equal(pi.commandOptions.has("takeover"), false);
+    const current = listProjectAssignments(runtime, "repo-key")[0]!;
+    assert.equal(retireProjectAssignment(runtime, current), true);
     recoverStaleProjectMessages(runtime, "repo-key");
     assert.equal(ctx.sessionManager.getSessionId(), leadId);
     assert.equal(listProjectAssignments(runtime, "repo-key").length, 0);
-    assert.equal(
-      listProjectMessages(runtime, "repo-key", "smoke/routing").length,
-      0,
-    );
-    await t.waitFor(() =>
-      assert.doesNotMatch(statusWidget!.render(160)[0], /managed/),
-    );
-    await t.waitFor(() =>
-      assert.match(statusWidget!.render(160)[0], /^● lead · orchestrate/),
-    );
     await pi.commandOptions.get("lead")!.handler("flexible", ctx);
     await t.waitFor(() =>
-      assert.match(statusWidget!.render(160)[0], /^● lead · flexible/),
+      assert.match(statusWidget!.render(160)[0], /Managed/),
     );
 
     for (const handler of pi.events.get("agent_start") ?? [])
@@ -670,7 +715,7 @@ test("a manually continued assigned Lead stays managed and rejects stale Manager
       message: {
         role: "assistant",
         timestamp: Date.now(),
-        content: [{ type: "text", text: "Post-takeover local result." }],
+        content: [{ type: "text", text: "Historical managed result." }],
       },
     });
     for (const handler of pi.events.get("agent_settled") ?? [])
@@ -1244,6 +1289,19 @@ test("project Lead observes Manager availability across turnover without exposin
   const branch: any[] = [];
   let messageId = 0;
   const pi = fakeChiefPi({
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-session-kind",
+        data: {
+          version: 1,
+          sessionId: leadId,
+          kind: "managed",
+          repoKey: "repo-key",
+          branch: assignment.branch,
+        },
+      },
+    ],
     exec,
     sendMessage: (message: any) => {
       const id = `synthetic-${++messageId}`;
@@ -1257,7 +1315,7 @@ test("project Lead observes Manager availability across turnover without exposin
     },
   });
   registerExtension!(pi.pi as never);
-  const ctx = fakeContext([], branch) as any;
+  const ctx = fakeContext(pi.entries, branch) as any;
   ctx.sessionManager = {
     ...ctx.sessionManager,
     getSessionId: () => leadId,
@@ -1385,6 +1443,95 @@ test("project Lead observes Manager availability across turnover without exposin
     const replacementState = latestState();
     assert.match(replacementState.content, /availability: available/);
     assert.doesNotMatch(replacementState.content, new RegExp(replacementId));
+
+    let assignmentLookupCalls = 0;
+    let replaceDuringPublication = false;
+    ctx.sessionManager.getSessionId = () => {
+      if (replaceDuringPublication && ++assignmentLookupCalls === 2)
+        writeProjectAssignment(runtime, { ...assignment, id: randomUUID() });
+      return leadId;
+    };
+    replaceDuringPublication = true;
+    const changedAssignment = await pi.tools
+      .find((tool) => tool.name === "message_supervisor")!
+      .execute(
+        "message",
+        { message: "ASSIGNMENT_CHANGED_BEFORE_PUBLICATION" },
+        undefined,
+        undefined,
+        ctx,
+      );
+    assert.equal(changedAssignment.isError, true);
+    assert.match(
+      changedAssignment.content[0].text,
+      /Managed project assignment is unavailable/,
+    );
+    assert.equal(changedAssignment.details.error.category, "internal_failure");
+    assert.equal(assignmentLookupCalls, 2);
+    assert.equal(
+      listProjectMessages(runtime, "repo-key", assignment.branch).some(
+        (message) => message.text === "ASSIGNMENT_CHANGED_BEFORE_PUBLICATION",
+      ),
+      false,
+    );
+    const assignmentPath = projectAssignmentPath(
+      runtime,
+      "repo-key",
+      assignment.branch,
+    );
+    writeFileSync(assignmentPath, "{ malformed assignment");
+    try {
+      const lookupFailure = await pi.tools
+        .find((tool) => tool.name === "message_supervisor")!
+        .execute(
+          "message",
+          { message: "LOOKUP_FAILURE" },
+          undefined,
+          undefined,
+          ctx,
+        );
+      assert.equal(lookupFailure.isError, true);
+      assert.match(lookupFailure.content[0].text, /project assignment/u);
+      assert.equal(lookupFailure.details.error.category, "internal_failure");
+      assert.equal(
+        listProjectMessages(runtime, "repo-key", assignment.branch).some(
+          (message) => message.text === "LOOKUP_FAILURE",
+        ),
+        false,
+      );
+    } finally {
+      writeProjectAssignment(runtime, assignment);
+    }
+    const messagesDirectory = assignmentPath.replace(/\.json$/u, ".messages");
+    const messagesBackup = `${messagesDirectory}.backup`;
+    realFs.renameSync(messagesDirectory, messagesBackup);
+    writeFileSync(messagesDirectory, "block directory creation");
+    try {
+      const publicationFailure = await pi.tools
+        .find((tool) => tool.name === "message_supervisor")!
+        .execute(
+          "message",
+          { message: "PUBLICATION_FAILURE" },
+          undefined,
+          undefined,
+          ctx,
+        );
+      assert.equal(publicationFailure.isError, true);
+      assert.match(publicationFailure.content[0].text, /ENOTDIR|EISDIR/u);
+      assert.equal(
+        publicationFailure.details.error.category,
+        "internal_failure",
+      );
+    } finally {
+      realFs.rmSync(messagesDirectory, { force: true });
+      realFs.renameSync(messagesBackup, messagesDirectory);
+    }
+    assert.equal(
+      listProjectMessages(runtime, "repo-key", assignment.branch).some(
+        (message) => message.text === "PUBLICATION_FAILURE",
+      ),
+      false,
+    );
     replacement.release();
     replacement = undefined;
   } finally {
@@ -1461,6 +1608,13 @@ test("unassigned Lead routes message supervisors directly to Chief", async () =>
   const branch: any[] = [];
   let messageId = 0;
   const pi = fakeChiefPi({
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-session-kind",
+        data: { version: 1, sessionId: leadId, kind: "ordinary" },
+      },
+    ],
     exec,
     sendMessage: (message: any) => {
       const id = `synthetic-${++messageId}`;
@@ -1474,7 +1628,7 @@ test("unassigned Lead routes message supervisors directly to Chief", async () =>
     },
   });
   registerExtension!(pi.pi as never);
-  const ctx = fakeContext([], branch) as any;
+  const ctx = fakeContext(pi.entries, branch) as any;
   ctx.sessionManager = {
     ...ctx.sessionManager,
     getSessionId: () => leadId,
@@ -1490,6 +1644,22 @@ test("unassigned Lead routes message supervisors directly to Chief", async () =>
       );
     const chiefStateResult = await observe();
     assert.equal(chiefStateResult?.message, undefined);
+    const supervisorMessage = pi.tools.find(
+      (tool) => tool.name === "message_supervisor",
+    )!;
+    const blankMessage = await supervisorMessage.execute(
+      "message",
+      { message: "   " },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(blankMessage.isError, true);
+    assert.match(
+      blankMessage.content[0].text,
+      /Message must contain non-whitespace text/,
+    );
+    assert.equal(blankMessage.details.error.category, "invalid_request");
     const chiefState = branch.at(-1);
     assert.equal(
       (pi.sentMessageCalls.at(-1)!.message as any).customType,
@@ -1511,26 +1681,18 @@ test("unassigned Lead routes message supervisors directly to Chief", async () =>
       workspaceId: WORKSPACE,
       build: OTHER_HERDSMAN_BUILD,
     });
-    const supervisorMessage = pi.tools.find(
-      (tool) => tool.name === "message_supervisor",
-    )!;
-    await assert.rejects(
-      supervisorMessage.execute(
-        "message",
-        { message: "MISMATCH_MUST_NOT_PUBLISH" },
-        undefined,
-        undefined,
-        ctx,
-      ),
-      (
-        error: Error & { category?: string; detail?: { category?: string } },
-      ) => {
-        assert.equal(
-          error.category ?? error.detail?.category,
-          "incompatible_build",
-        );
-        return true;
-      },
+    const incompatibleBuild = await supervisorMessage.execute(
+      "message",
+      { message: "MISMATCH_MUST_NOT_PUBLISH" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(incompatibleBuild.isError, true);
+    assert.match(incompatibleBuild.content[0].text, /build mismatch/u);
+    assert.equal(
+      incompatibleBuild.details.error.category,
+      "incompatible_build",
     );
     assert.deepEqual(listChiefMessagePaths(runtime, chiefId), []);
     chief.release();
@@ -1565,18 +1727,21 @@ test("unassigned Lead routes message supervisors directly to Chief", async () =>
     const unverifiedChief = branch.at(-1);
     assert.match(unverifiedChief.content, /supervisor: unverified/);
     assert.match(unverifiedChief.content, /availability: unknown/);
-    await assert.rejects(
-      pi.tools
-        .find((tool) => tool.name === "message_supervisor")!
-        .execute(
-          "message",
-          { message: "UNVERIFIED_CHIEF_MUST_REJECT" },
-          undefined,
-          undefined,
-          ctx,
-        ),
+    const discoveryFailure = await pi.tools
+      .find((tool) => tool.name === "message_supervisor")!
+      .execute(
+        "message",
+        { message: "UNVERIFIED_CHIEF_MUST_REJECT" },
+        undefined,
+        undefined,
+        ctx,
+      );
+    assert.equal(discoveryFailure.isError, true);
+    assert.match(
+      discoveryFailure.content[0].text,
       /simulated Chief discovery failure/,
     );
+    assert.equal(discoveryFailure.details.error.category, "internal_failure");
     chiefDiscoveryFailure = false;
     writeFileSync(runtime.descriptor, "invalid Chief descriptor");
     const unreadableCount = pi.sentMessageCalls.length;
@@ -1607,23 +1772,35 @@ test("unassigned Lead routes message supervisors directly to Chief", async () =>
     const noSupervisor = branch.at(-1);
     assert.match(noSupervisor.content, /supervisor: none/);
     assert.match(noSupervisor.content, /availability: unavailable/);
-    await assert.rejects(
-      pi.tools
-        .find((tool) => tool.name === "message_supervisor")!
-        .execute(
-          "message",
-          { message: "NO_SUPERVISOR_MUST_REJECT" },
-          undefined,
-          undefined,
-          ctx,
-        ),
+    const noSupervisorResult = await supervisorMessage.execute(
+      "message",
+      { message: "NO_SUPERVISOR_MUST_REJECT" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(noSupervisorResult.isError, true);
+    assert.match(
+      noSupervisorResult.content[0].text,
       /No active supervisor is available/,
     );
+    assert.equal(noSupervisorResult.details.error.category, "target_not_found");
     observationFailure = true;
     assert.equal((await observe())?.message, undefined);
     const unverified = branch.at(-1);
     assert.match(unverified.content, /supervisor: unverified/);
     assert.match(unverified.content, /availability: unknown/);
+    const unhealthyResult = await supervisorMessage.execute(
+      "message",
+      { message: "UNHEALTHY_COORDINATION_MUST_REJECT" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    // This fixture fails Herdr during the supervisor-state read itself, before the explicit unhealthy-coordination guard is reached.
+    assert.equal(unhealthyResult.isError, true);
+    assert.match(unhealthyResult.content[0].text, /simulated Herdr failure/);
+    assert.equal(unhealthyResult.details.error.category, "internal_failure");
     assert.deepEqual(
       listProjectMessages(runtime, "repo-key", "smoke/routing"),
       [],
@@ -1632,6 +1809,54 @@ test("unassigned Lead routes message supervisors directly to Chief", async () =>
     await pi.events.get("session_shutdown")?.[0]();
     chief.release();
     delete process.env.HERDR_SOCKET_PATH;
+    setLeadEnvironment();
+  }
+});
+
+test("unhealthy Lead coordination rejects supervisor messages", async () => {
+  setLeadEnvironment();
+  const leadId = randomUUID();
+  const entries = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-lead-state",
+      data: { instanceId: "malformed" },
+    },
+    {
+      type: "custom",
+      customType: "pi-herdsman-role",
+      data: { sessionId: leadId, role: "lead", leadTools: [] },
+    },
+  ];
+  const pi = fakeChiefPi({ entries });
+  registerExtension!(pi.pi as never);
+  const ctx = fakeContext(entries) as any;
+  ctx.sessionManager = {
+    ...ctx.sessionManager,
+    getSessionId: () => leadId,
+  };
+  try {
+    await pi.events.get("session_start")![0](undefined, ctx);
+
+    const supervisorMessage = pi.tools.find(
+      (tool) => tool.name === "message_supervisor",
+    )!;
+    const unavailable = await supervisorMessage.execute(
+      "message",
+      { message: "HEALTHY_ROLE_MUST_NOT_PUBLISH" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(unavailable.isError, true);
+    assert.match(
+      unavailable.content[0].text,
+      /Lead coordination state is unavailable/,
+    );
+    assert.equal(unavailable.details.error.category, "internal_failure");
+    assert.deepEqual(pi.sentMessageCalls, []);
+  } finally {
+    await pi.events.get("session_shutdown")?.[0]();
     setLeadEnvironment();
   }
 });
@@ -1809,6 +2034,21 @@ test("Chief preflight defers inbox delivery until agent_start", async (t) => {
     await pi.events.get("session_start")![0](undefined, ctx);
     assert.equal(readPeerLeadRecord(peerRuntime(), senderId), undefined);
     await pi.commandOptions.get("chief").handler("", ctx);
+    const chiefRoleRejected = await pi.tools
+      .find((tool) => tool.name === "message_supervisor")!
+      .execute(
+        "message",
+        { message: "CHIEF_ROLE_MUST_REJECT" },
+        undefined,
+        undefined,
+        ctx,
+      );
+    assert.equal(chiefRoleRejected.isError, true);
+    assert.match(
+      chiefRoleRejected.content[0].text,
+      /Chief is available only to ordinary leads/,
+    );
+    assert.equal(chiefRoleRejected.details.error.category, "invalid_request");
     const descriptor = readChiefDescriptor(supervisionRuntime().descriptor);
     const completeEvidence = "review-evidence-478\n".repeat(1_500);
     writeChiefMessage(
@@ -1882,6 +2122,7 @@ test("Chief preflight defers inbox delivery until agent_start", async (t) => {
         version: 2,
         build: HERDSMAN_BUILD,
         role: "lead",
+        sessionKind: "ordinary",
         piSessionId: senderId,
         paneId: "sender-pane",
         tabId: "sender-tab",
@@ -1937,6 +2178,71 @@ test("Chief preflight defers inbox delivery until agent_start", async (t) => {
     delete process.env.HERDR_SOCKET_PATH;
     setLeadEnvironment();
   }
+});
+
+test("Managed supervisor messages never fall through when the active role is not Lead", async () => {
+  const { createLeadCoordinationRuntime } = await import("./lead-runtime.ts");
+  let ordinaryRoutingCalls = 0;
+  let assignmentLookups = 0;
+  let projectPublications = 0;
+  const host = new Proxy(
+    {
+      pi: {},
+      leadRuntime: { chiefMode: "inactive" },
+      processRole: "lead",
+      controllerScope: { kind: "root" },
+      activeRole: () => "manager",
+      currentSupervisor: async () => {
+        ordinaryRoutingCalls++;
+        return undefined;
+      },
+      currentProjectAssignment: async () => {
+        assignmentLookups++;
+        return undefined;
+      },
+      publishProjectMessage: async () => {
+        projectPublications++;
+        return undefined;
+      },
+    },
+    {
+      get(target, key: string) {
+        return key in target
+          ? target[key as keyof typeof target]
+          : () => undefined;
+      },
+    },
+  ) as any;
+  const runtime = createLeadCoordinationRuntime(host);
+  const sessionId = randomUUID();
+  const context = fakeContext([
+    {
+      type: "custom",
+      customType: "pi-herdsman-session-kind",
+      data: {
+        version: 1,
+        sessionId,
+        kind: "managed",
+        repoKey: "repo-key",
+        branch: "managed-branch",
+      },
+    },
+  ]) as any;
+  context.sessionManager.getSessionId = () => sessionId;
+
+  await assert.rejects(
+    runtime.supervisorMessage(
+      "message",
+      { message: "must not route through Chief" },
+      undefined,
+      undefined,
+      context,
+    ),
+    /Managed Lead cannot use ordinary supervisor routing/,
+  );
+  assert.equal(ordinaryRoutingCalls, 0);
+  assert.equal(assignmentLookups, 0);
+  assert.equal(projectPublications, 0);
 });
 
 for (const reachable of [true, false]) {
@@ -2188,6 +2494,7 @@ for (const reachable of [true, false]) {
           createdAt: 0,
         };
         writeProjectMessage(backlogRecord, runtime);
+        await pi.events.get("session_start")![0](undefined, ctx);
         await pi.commandOptions.get("manager").handler("", ctx);
         await t.waitFor(() =>
           assert.equal(projectDeliveries(backlogRecord.id).length, 1),
@@ -2213,6 +2520,7 @@ for (const reachable of [true, false]) {
           getEntries: () => managerHistory,
           getBranch: () => managerBranch,
         };
+        await pi.events.get("session_start")![0](undefined, ctx);
         await pi.commandOptions.get("manager").handler("", ctx);
         await new Promise((resolve) => setTimeout(resolve, 650));
         assert.equal(projectDeliveries(liveRecord.id).length, 0);
@@ -2226,8 +2534,19 @@ for (const reachable of [true, false]) {
         process.env.HERDR_PANE_ID = "lead-pane";
         process.env.HERDR_TAB_ID = "lead-tab";
         const lead = fakeChiefPi({ exec });
+        lead.entries.push({
+          type: "custom",
+          customType: "pi-herdsman-session-kind",
+          data: {
+            version: 1,
+            sessionId: leadId,
+            kind: "managed",
+            repoKey: "repo-key",
+            branch,
+          },
+        });
         registerExtension!(lead.pi as never);
-        const leadCtx = fakeContext() as any;
+        const leadCtx = fakeContext(lead.entries) as any;
         leadCtx.sessionManager = {
           ...leadCtx.sessionManager,
           getSessionId: () => leadId,
@@ -2247,7 +2566,7 @@ for (const reachable of [true, false]) {
               leadCtx,
             );
           realFs.unlinkSync(planPath);
-          assert.equal(result.details.branch, branch);
+          assert.equal(result.details.branch, branch, JSON.stringify(result));
           assert.ok(typeof result.details.id === "string");
           const saved = listProjectMessages(runtime, "repo-key", branch).find(
             (message) => message.id === result.details.id,
@@ -2430,7 +2749,19 @@ for (const scenario of [
       tab_id: "manager-tab",
     };
     const inventory = [manager, agent];
-    const entries: unknown[] = [];
+    const entries: unknown[] = [
+      {
+        type: "custom",
+        customType: "pi-herdsman-session-kind",
+        data: {
+          version: 1,
+          sessionId,
+          kind: "managed",
+          repoKey: "repo-key",
+          branch: assignment.branch,
+        },
+      },
+    ];
     const pi = fakeChiefPi({
       entries,
       persistMessages: true,
@@ -3000,7 +3331,7 @@ async function runManagerStartupScenario(
     | "verified-absence-resume"
     | "close-resume"
     | "close-failure"
-    | "close-takeover-race"
+    | "close-retirement-race"
     | "close-tree"
     | "close-tree-failure"
     | "unassigned-close",
@@ -3065,7 +3396,7 @@ async function runManagerStartupScenario(
     [
       "close-resume",
       "close-failure",
-      "close-takeover-race",
+      "close-retirement-race",
       "close-tree",
       "close-tree-failure",
     ].includes(mode);
@@ -3396,7 +3727,7 @@ async function runManagerStartupScenario(
           ...(([
             "close-resume",
             "close-failure",
-            "close-takeover-race",
+            "close-retirement-race",
             "close-tree",
             "close-tree-failure",
             "unassigned-close",
@@ -3449,7 +3780,7 @@ async function runManagerStartupScenario(
             ([
               "close-resume",
               "close-failure",
-              "close-takeover-race",
+              "close-retirement-race",
               "close-tree",
               "close-tree-failure",
               "unassigned-close",
@@ -3512,7 +3843,7 @@ async function runManagerStartupScenario(
         [
           "close-resume",
           "close-failure",
-          "close-takeover-race",
+          "close-retirement-race",
           "close-tree",
           "close-tree-failure",
           "unassigned-close",
@@ -3858,7 +4189,7 @@ async function runManagerStartupScenario(
           ([
             "close-resume",
             "close-failure",
-            "close-takeover-race",
+            "close-retirement-race",
             "close-tree",
             "close-tree-failure",
             "unassigned-close",
@@ -4118,7 +4449,7 @@ async function runManagerStartupScenario(
       "active-closed",
       "close-resume",
       "close-failure",
-      "close-takeover-race",
+      "close-retirement-race",
       "close-tree",
       "close-tree-failure",
     ].includes(mode);
@@ -4208,7 +4539,7 @@ async function runManagerStartupScenario(
         [
           "close-resume",
           "close-failure",
-          "close-takeover-race",
+          "close-retirement-race",
           "close-tree",
           "close-tree-failure",
         ].includes(mode)
@@ -4482,7 +4813,7 @@ async function runManagerStartupScenario(
         [
           "close-resume",
           "close-failure",
-          "close-takeover-race",
+          "close-retirement-race",
           "close-tree",
           "close-tree-failure",
         ].includes(mode)
@@ -4491,14 +4822,14 @@ async function runManagerStartupScenario(
           pi.tools
             .find((tool) => tool.name === name)!
             .execute(name, value, undefined, undefined, ctx);
-        if (mode === "close-takeover-race") {
+        if (mode === "close-retirement-race") {
           const assignment = listProjectAssignments(
             supervisionRuntime(),
             repoKey,
           )[0]!;
           const releaseAssignmentLock = claimProcessLock(
             `${projectAssignmentPath(supervisionRuntime(), repoKey, assignment.branch)}.lock`,
-            { name: "test takeover assignment lock" },
+            { name: "test retirement assignment lock" },
           );
           await assert.rejects(control("stop_lead", { session: staleId }));
           removeProjectAssignment(
@@ -5825,8 +6156,8 @@ test("Manager preserves its Lead after descendant cleanup failure", () =>
   runManagerStartupScenario("close-tree-failure"));
 test("Manager retains assignment when exact Lead stop fails", () =>
   runManagerStartupScenario("close-failure"));
-test("Manager stop cannot race through takeover's assignment lock", () =>
-  runManagerStartupScenario("close-takeover-race"));
+test("Manager stop cannot race through retirement's assignment lock", () =>
+  runManagerStartupScenario("close-retirement-race"));
 test("Manager inspection rejects evidence after assignment revocation", () =>
   runManagerStartupScenario("active-live-inspect-revoked"));
 test("Manager inspection rejects evidence after lease replacement", () =>
@@ -8113,6 +8444,11 @@ test("scoped continuation revalidates terminal provenance immediately before adm
     pi.events.get("session_shutdown")?.[0]();
     startup.stopMailboxConsumer();
     resetAgentMailbox(startup.mailbox);
+    removeProjectAssignment(
+      projectRuntime,
+      "continuation-race-repo",
+      "continuation-race",
+    );
     nativeSessions.delete(id);
     realFs.rmSync(path, { force: true });
     realFs.rmSync(socketPath, { force: true });
@@ -8245,6 +8581,11 @@ test("valid scoped historical continuation ignores an unrelated corrupt mailbox"
     pi.events.get("session_shutdown")?.[0]();
     startup.stopMailboxConsumer();
     resetAgentMailbox(startup.mailbox);
+    removeProjectAssignment(
+      projectRuntime,
+      "repo-key",
+      "continuation-isolation",
+    );
     realFs.rmSync(unrelatedMailbox, { recursive: true, force: true });
     nativeSessions.delete(id);
     realFs.rmSync(path, { force: true });
@@ -8262,7 +8603,8 @@ test("scoped historical continuation rejects a corrupt exact-target mailbox", as
   const path = join(testTmpRoot, `continuation-corrupt-target-${id}.jsonl`);
   const socketPath = join(tmpdir(), `continuation-corrupt-target-${id}.sock`);
   process.env.HERDR_SOCKET_PATH = socketPath;
-  writeProjectAssignment(supervisionRuntime(socketPath), {
+  const projectRuntime = supervisionRuntime(socketPath);
+  writeProjectAssignment(projectRuntime, {
     version: 2,
     id: LEAD_SESSION_ID,
     repoKey: "repo-key",
@@ -8384,8 +8726,51 @@ test("scoped historical continuation rejects a corrupt exact-target mailbox", as
     pi.events.get("session_shutdown")?.[0]();
     startup.stopMailboxConsumer();
     resetAgentMailbox(startup.mailbox);
+    removeProjectAssignment(
+      projectRuntime,
+      "repo-key",
+      "continuation-corrupt-target",
+    );
     nativeSessions.delete(id);
     realFs.rmSync(path, { force: true });
+    realFs.rmSync(socketPath, { force: true });
+    delete process.env.HERDR_SOCKET_PATH;
+  }
+});
+
+test("cleaned scoped-continuation assignment fixtures cannot make a Lead managed", async () => {
+  setLeadEnvironment();
+  const socketPath = join(tmpdir(), `assignment-fixture-${randomUUID()}.sock`);
+  process.env.HERDR_SOCKET_PATH = socketPath;
+  const runtime = supervisionRuntime(socketPath);
+  const repoKey = `fixture-cleanup-${randomUUID()}`;
+  const branch = "scoped-continuation";
+  writeProjectAssignment(runtime, {
+    version: 2,
+    id: LEAD_SESSION_ID,
+    repoKey,
+    branch,
+    text: "temporary continuation fixture",
+  });
+  removeProjectAssignment(runtime, repoKey, branch);
+
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const context = fakeContext() as any;
+  try {
+    await pi.events.get("session_start")![0](undefined, context);
+    assert.ok(
+      pi.entries.some(
+        (entry: any) =>
+          entry.customType === "pi-herdsman-session-kind" &&
+          entry.data?.sessionId === LEAD_SESSION_ID &&
+          entry.data?.kind === "ordinary",
+      ),
+      "an ordinary Lead must initialize after its scoped fixture assignment is cleaned",
+    );
+    assert.deepEqual(listProjectAssignments(runtime, repoKey), []);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
     realFs.rmSync(socketPath, { force: true });
     delete process.env.HERDR_SOCKET_PATH;
   }
