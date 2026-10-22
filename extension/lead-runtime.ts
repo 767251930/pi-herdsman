@@ -47,8 +47,10 @@ import {
   canMessagePeer,
   staffToolName,
   supervisorStateMessage,
+  coordinationMessageDelivered,
   verifyManagerCoordinationAuthority,
   verifyRemoteChiefAuthority,
+  writePeerDeliveryReceipt,
 } from "./supervision.ts";
 import { OperationError } from "./errors.ts";
 import { sameObservedSessionPath, verifiedHerdrAgent } from "./herdr.ts";
@@ -66,10 +68,14 @@ import {
 } from "./core.ts";
 import {
   persistRequiredEvidenceSnapshot,
+  persistPeerAttachment,
+  persistPeerResultArtifact,
+  isResultBinding,
   type RequiredEvidence,
 } from "./storage.ts";
 import {
   createAgentController,
+  canonicalRefsForSemanticResult,
   buildAgentStatusSnapshot,
   createAgentStatusRuntime,
   claimDelegationLock,
@@ -132,6 +138,31 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpathSync, statSync, unlinkSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { persistedTranscriptReady as controllerPersistedTranscriptReady } from "./agent-controller.ts";
+import {
+  listSavedPeerMachines,
+  peerRecoveryRequest,
+  listRemotePeerOutbounds,
+  persistRemotePeerOutbound,
+  probePeerEndpoint,
+  removeRemotePeerOutbound,
+  retargetRemotePeerOutbound,
+  resolveRemotePeerOutboundRetry,
+  tryClaimRemotePeerOutbound,
+  runPeerEndpoint,
+  tryPollPeerReplies,
+  type SavedPeerMachine,
+} from "./peer-transport.ts";
+import {
+  createPeerCorrespondence,
+  assertPeerDataRoot,
+  listPeerCorrespondences,
+  queuePeerReply,
+  storePeerCorrespondence,
+  peerPayloadDigest,
+  resolvePeerResultBindings as splitPeerResultBindings,
+  updatePeerOriginGeneration,
+  updatePeerRecipientGeneration,
+} from "./peer-correspondence.ts";
 
 type LeadIdentityHost = {
   expectedSession(id: string, path?: string): ExpectedSession;
@@ -685,6 +716,11 @@ type LeadInboxBaseHost = {
   ) => Promise<WorktreeGroupScope>;
   readProjectAssignment: typeof import("./supervision.ts").readProjectAssignment;
   importResultBindings: typeof import("./agent-controller.ts").importResultBindings;
+  resolvePeerResultBindings(
+    ctx: ExtensionContext,
+    bindings: readonly ResultBinding[],
+  ): { bindings: ResultBinding[]; conflicts: ResultBinding[] };
+  describePeerResultConflicts(conflicts: readonly ResultBinding[]): string;
   HERDSMAN_BUILD: RuntimeBuild;
   formatRuntimeBuild: typeof import("./compatibility.ts").formatRuntimeBuild;
   listChiefMessagePaths: typeof import("./supervision.ts").listChiefMessagePaths;
@@ -735,6 +771,10 @@ type LeadInboxHost = LeadInboxBaseHost & {
   resolveEffectiveSupervisor: LeadRoleTransitionRuntime["resolveEffectiveSupervisor"];
   currentPeerPresenceValid(ctx: ExtensionContext): Promise<boolean>;
   drainProjectMessages(ctx: ExtensionContext): Promise<number>;
+  reconcileRemotePeers?(
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ): Promise<void>;
 };
 
 type LeadSupervisionHost = {
@@ -3532,6 +3572,12 @@ export function registerLeadRuntime(
         assignmentSnapshot,
         requireFreshGroup,
       ),
+    resolvePeerResultBindings: (
+      ctx: ExtensionContext,
+      bindings: readonly ResultBinding[],
+    ) => coordinationRuntime.resolvePeerResultBindings(ctx, bindings),
+    describePeerResultConflicts: (conflicts: readonly ResultBinding[]) =>
+      coordinationRuntime.describePeerResultConflicts(conflicts),
     assertCurrentLeadCoordination: (ctx: ExtensionContext) =>
       coordinationRuntime.assertCurrentLeadCoordination(ctx),
     currentChiefAuthority: (
@@ -3563,6 +3609,22 @@ export function registerLeadRuntime(
           async (count) =>
             count + (await coordinationRuntime.drainProjectMessages(ctx)),
         ),
+    reconcileRemotePeers: (ctx: ExtensionContext, signal?: AbortSignal) => {
+      return activeLeadRole(options.leadRuntime) === "manager"
+        ? coordinationRuntime
+            .peerMessage(
+              "remote-reconciliation",
+              { action: "list" },
+              signal,
+              undefined,
+              ctx,
+            )
+            .then((result: any) => {
+              if (result.details?.unavailable_machines?.length)
+                throw new Error("remote Manager reconciliation incomplete");
+            })
+        : Promise.resolve();
+    },
   };
   inboxRuntime = createLeadInboxRuntime(inboxServices);
   let herdRunRuntime: ReturnType<typeof createLeadHerdRunRuntime> | undefined;
@@ -10213,6 +10275,33 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
   type PeerOperation =
     | { action: "list" }
     | { action: "message"; session: string; message: string; files?: string[] };
+  const remotePeerRoutes = new Map<
+    string,
+    {
+      machine: SavedPeerMachine;
+      dataRoot: string;
+      claimId: string;
+      build?: unknown;
+    }
+  >();
+  const ambiguousRemoteSessions = new Set<string>();
+  const deliverRemoteOutbound = async (
+    machine: SavedPeerMachine,
+    id: string,
+    envelope: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> => {
+    try {
+      const receipt = JSON.parse(
+        await runPeerEndpoint(machine, "accept", envelope, signal),
+      ) as { accepted?: unknown; id?: unknown };
+      if (receipt.accepted !== true || receipt.id !== id) return false;
+      removeRemotePeerOutbound(id);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   const executeSupervisorMessage = async (
     _id: string,
     raw: unknown,
@@ -10413,10 +10502,31 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
       details: { id: record.id, chiefSessionId: record.toSessionId },
     };
   };
+  const resolvePeerResultBindings = (
+    ctx: ExtensionContext,
+    bindings: readonly ResultBinding[],
+  ): { bindings: ResultBinding[]; conflicts: ResultBinding[] } => {
+    return splitPeerResultBindings(bindings, (ref) =>
+      canonicalRefsForSemanticResult(
+        ctx.sessionManager.getBranch(),
+        ref,
+        "peer_message",
+      ),
+    );
+  };
+  const describePeerResultConflicts = (
+    conflicts: readonly ResultBinding[],
+  ): string =>
+    conflicts.length
+      ? `\n\nSemantic result reference conflict; use the immutable local artifact reference instead:\n${conflicts
+          .map((binding) => `${binding.ref} → ${binding.canonicalRef}`)
+          .join("\n")}`
+      : "";
+
   const executePeerMessage = async (
     _id: string,
     raw: unknown,
-    _signal: AbortSignal | undefined,
+    signal: AbortSignal | undefined,
     _update: unknown,
     ctx: ExtensionContext,
   ) => {
@@ -10453,6 +10563,23 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
         throw new Error(
           "Peer eligibility could not be verified; retry list_peers.",
         );
+      if (activeRole() === "manager" && own.role === "manager")
+        for (const correspondence of listPeerCorrespondences()) {
+          if (
+            !correspondence.finalized &&
+            correspondence.recipientSession === self &&
+            correspondence.recipientGeneration !== own.claim.id
+          ) {
+            updatePeerRecipientGeneration(
+              correspondence.id,
+              correspondence.capability,
+              self,
+              correspondence.recipientGeneration,
+              own.claim.id,
+            );
+            correspondence.recipientGeneration = own.claim.id;
+          }
+        }
       const peers = [];
       for (const record of listPeerLeadRecords(peerRuntime())) {
         if (
@@ -10489,18 +10616,428 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
           workspace_label: record.workspaceLabel ?? "",
         });
       }
+      const unavailableMachines: string[] = [];
+      const localPeerSessions = new Set(peers.map((peer) => peer.session));
+      remotePeerRoutes.clear();
+      ambiguousRemoteSessions.clear();
+      if (activeRole() === "manager") {
+        let machines: SavedPeerMachine[];
+        try {
+          machines = await listSavedPeerMachines(signal);
+        } catch {
+          machines = [];
+          unavailableMachines.push("saved machines");
+        }
+        const seen = new Set<string>();
+        for (const machine of machines) {
+          if (signal?.aborted) break;
+          if (!machine.reachable) {
+            unavailableMachines.push(machine.label);
+            continue;
+          }
+          try {
+            const snapshot = await probePeerEndpoint(machine, signal);
+            if (signal?.aborted) break;
+            if (activeRole() === "manager") {
+              for (const outbound of listRemotePeerOutbounds()) {
+                if (
+                  outbound.machine.id !== machine.id ||
+                  outbound.session !== self
+                )
+                  continue;
+                if (snapshot.dataRoot !== outbound.dataRoot) {
+                  continue;
+                }
+                const releaseOutbound = tryClaimRemotePeerOutbound(outbound.id);
+                if (!releaseOutbound) {
+                  continue;
+                }
+                let envelope = outbound.envelope;
+                try {
+                  const status = JSON.parse(
+                    await runPeerEndpoint(
+                      machine,
+                      "status",
+                      JSON.stringify({
+                        id: outbound.id,
+                        originSession: outbound.session,
+                        recipientSession: outbound.recipientSession,
+                        digest: outbound.digest,
+                        expectedDataRoot: outbound.dataRoot,
+                      }),
+                      signal,
+                    ),
+                  ) as {
+                    dataRoot?: unknown;
+                    id?: unknown;
+                    digest?: unknown;
+                    status?: unknown;
+                  };
+                  const retry = resolveRemotePeerOutboundRetry(
+                    outbound,
+                    status,
+                    snapshot,
+                  );
+                  if (retry.kind === "accepted") {
+                    removeRemotePeerOutbound(outbound.id);
+                    continue;
+                  }
+                  if (retry.kind !== "retry") continue;
+                  if (retry.envelope !== envelope) {
+                    envelope = retry.envelope;
+                    retargetRemotePeerOutbound(
+                      outbound.id,
+                      outbound.digest,
+                      outbound.recipientSession,
+                      envelope,
+                    );
+                  }
+                  await deliverRemoteOutbound(
+                    machine,
+                    outbound.id,
+                    envelope,
+                    signal,
+                  );
+                } catch (error) {
+                  // Keep ambiguous acceptance durable; retry status on a later reconciliation.
+                } finally {
+                  releaseOutbound();
+                }
+              }
+              for (const correspondence of listPeerCorrespondences()) {
+                if (correspondence.originSession !== self) continue;
+                const remote = snapshot.peers.find(
+                  (peer) =>
+                    peer.role === "manager" &&
+                    peer.piSessionId === correspondence.recipientSession,
+                );
+                if (!remote) continue;
+                if (remote.claim.id !== correspondence.recipientGeneration) {
+                  const recovery = JSON.parse(
+                    await runPeerEndpoint(
+                      machine,
+                      "recover-recipient",
+                      JSON.stringify({
+                        id: correspondence.id,
+                        expectedDataRoot: snapshot.dataRoot,
+                        capability: correspondence.capability,
+                        originSession: correspondence.originSession,
+                        originGeneration: correspondence.originGeneration,
+                        recipientSession: correspondence.recipientSession,
+                        recipientGeneration: correspondence.recipientGeneration,
+                        newRecipientGeneration: remote.claim.id,
+                      }),
+                      signal,
+                    ),
+                  ) as { recovered?: unknown };
+                  if (recovery.recovered !== true) continue;
+                  updatePeerRecipientGeneration(
+                    correspondence.id,
+                    correspondence.capability,
+                    correspondence.recipientSession,
+                    correspondence.recipientGeneration,
+                    remote.claim.id,
+                  );
+                  correspondence.recipientGeneration = remote.claim.id;
+                }
+                if (correspondence.originGeneration !== own.claim.id) {
+                  const recovery = JSON.parse(
+                    await runPeerEndpoint(
+                      machine,
+                      "recover",
+                      peerRecoveryRequest(
+                        {
+                          id: correspondence.id,
+                          capability: correspondence.capability,
+                          originSession: correspondence.originSession,
+                          originGeneration: own.claim.id,
+                          previousOriginGeneration:
+                            correspondence.originGeneration,
+                          recipientSession: correspondence.recipientSession,
+                          recipientGeneration:
+                            correspondence.recipientGeneration,
+                        },
+                        snapshot.dataRoot,
+                      ),
+                      signal,
+                    ),
+                  ) as { recovered?: unknown };
+                  if (recovery.recovered !== true) continue;
+                  updatePeerOriginGeneration(
+                    correspondence.id,
+                    correspondence.capability,
+                    self,
+                    correspondence.originGeneration,
+                    own.claim.id,
+                  );
+                  correspondence.originGeneration = own.claim.id;
+                }
+                const request = JSON.stringify({
+                  id: correspondence.id,
+                  expectedDataRoot: snapshot.dataRoot,
+                  capability: correspondence.capability,
+                  originSession: correspondence.originSession,
+                  originGeneration: correspondence.originGeneration,
+                  recipientSession: correspondence.recipientSession,
+                  recipientGeneration: correspondence.recipientGeneration,
+                });
+                const polled = await tryPollPeerReplies(() =>
+                  runPeerEndpoint(machine, "poll", request, signal),
+                );
+                if (polled === undefined) continue;
+                const response = JSON.parse(polled) as {
+                  dataRoot?: unknown;
+                  hasReplies?: unknown;
+                  replies?: Array<{
+                    id?: unknown;
+                    digest?: unknown;
+                    text?: unknown;
+                    attachments?: unknown;
+                    resultBindings?: unknown;
+                    createdAt?: unknown;
+                    acknowledged?: unknown;
+                  }>;
+                };
+                if (!Array.isArray(response.replies))
+                  throw new Error("invalid remote peer reply batch");
+                if (typeof response.dataRoot !== "string")
+                  throw new Error("peer reply endpoint omitted its data root");
+                assertPeerDataRoot(response.dataRoot, snapshot.dataRoot);
+                for (const reply of response.replies) {
+                  if (
+                    typeof reply.id !== "string" ||
+                    typeof reply.text !== "string" ||
+                    typeof reply.digest !== "string" ||
+                    typeof reply.createdAt !== "number" ||
+                    !Number.isFinite(reply.createdAt) ||
+                    (reply.attachments !== undefined &&
+                      !Array.isArray(reply.attachments)) ||
+                    (reply.resultBindings !== undefined &&
+                      (!Array.isArray(reply.resultBindings) ||
+                        !reply.resultBindings.every(isResultBinding))) ||
+                    peerPayloadDigest({
+                      text: reply.text,
+                      ...(reply.attachments?.length
+                        ? { attachments: reply.attachments }
+                        : {}),
+                      ...(Array.isArray(reply.resultBindings)
+                        ? { resultBindings: reply.resultBindings }
+                        : {}),
+                    }) !== reply.digest
+                  )
+                    throw new Error("invalid remote peer reply");
+                  let replyText = reply.text;
+                  const receivedRefs: string[] = [];
+                  for (const rawAttachment of (reply.attachments ??
+                    []) as Array<{
+                    name?: unknown;
+                    ref?: unknown;
+                    marker?: unknown;
+                    text?: unknown;
+                    sha256?: unknown;
+                  }>) {
+                    if (
+                      typeof rawAttachment.name !== "string" ||
+                      typeof rawAttachment.marker !== "string" ||
+                      typeof rawAttachment.text !== "string" ||
+                      typeof rawAttachment.sha256 !== "string" ||
+                      createHash("sha256")
+                        .update(rawAttachment.text, "utf8")
+                        .digest("hex") !== rawAttachment.sha256
+                    )
+                      throw new Error("invalid remote reply attachment");
+                    const markerIndex = replyText.indexOf(rawAttachment.marker);
+                    if (
+                      markerIndex < 0 ||
+                      replyText.indexOf(
+                        rawAttachment.marker,
+                        markerIndex + 1,
+                      ) !== -1
+                    )
+                      throw new Error("reply attachment marker is ambiguous");
+                    replyText =
+                      replyText.slice(0, markerIndex) +
+                      rawAttachment.text +
+                      replyText.slice(
+                        markerIndex + rawAttachment.marker.length,
+                      );
+                    const binding = Array.isArray(reply.resultBindings)
+                      ? (reply.resultBindings as ResultBinding[]).find(
+                          (item) => item.ref === rawAttachment.ref,
+                        )
+                      : undefined;
+                    const localPath = binding
+                      ? persistPeerResultArtifact(
+                          binding.canonicalRef,
+                          rawAttachment.text,
+                        )
+                      : persistPeerAttachment(
+                          rawAttachment.name,
+                          rawAttachment.text,
+                        );
+                    receivedRefs.push(
+                      `${rawAttachment.name}: ${binding ? `${binding.ref} (canonical ${binding.canonicalRef})` : localPath}`,
+                    );
+                  }
+                  const resultBindings = Array.isArray(reply.resultBindings)
+                    ? (reply.resultBindings as ResultBinding[])
+                    : [];
+                  const resolution = resolvePeerResultBindings(
+                    ctx,
+                    resultBindings,
+                  );
+                  replyText += describePeerResultConflicts(
+                    resolution.conflicts,
+                  );
+                  const record: ChiefMessageRecord = {
+                    version: 2,
+                    build: HERDSMAN_BUILD,
+                    id: reply.id,
+                    leaseId: correspondence.recipientGeneration,
+                    kind: "peer_message",
+                    fromSessionId: correspondence.recipientSession,
+                    toSessionId: self,
+                    leadSessionId: correspondence.recipientSession,
+                    peerSource: { role: "manager" },
+                    text: `${replyText}${receivedRefs.length ? `\n\nForwardable received files:\n${receivedRefs.join("\n")}` : ""}`,
+                    ...(resolution.bindings.length
+                      ? { resultBindings: resolution.bindings }
+                      : {}),
+                    createdAt: reply.createdAt,
+                  };
+                  writeCoordinationMessage(record, peerRuntime());
+                  importResultBindings(
+                    pi,
+                    ctx,
+                    resolution.bindings,
+                    "peer.reply",
+                  );
+                  const ack = JSON.parse(
+                    await runPeerEndpoint(
+                      machine,
+                      "ack",
+                      JSON.stringify({
+                        ...JSON.parse(request),
+                        replyId: reply.id,
+                      }),
+                      signal,
+                    ),
+                  ) as { acknowledged?: unknown };
+                  if (ack.acknowledged !== true)
+                    throw new Error("remote peer reply acknowledgement failed");
+                }
+                // A reply is progress, not route retirement. Keep the verified
+                // Manager-pair correspondence until explicit retirement.
+              }
+            }
+            for (const remote of snapshot.peers) {
+              if (
+                remote.role !== "manager" ||
+                remote.piSessionId === self ||
+                localPeerSessions.has(remote.piSessionId) ||
+                !remote.claim?.id ||
+                seen.has(
+                  `${snapshot.dataRoot}\0${remote.piSessionId}\0${remote.claim.id}`,
+                )
+              )
+                continue;
+              if (remote.build) {
+                try {
+                  requireCompatibleBuild(
+                    HERDSMAN_BUILD,
+                    remote.build as RuntimeBuild,
+                    "peer_message",
+                    `remote Manager ${remote.piSessionId}`,
+                  );
+                } catch {
+                  continue;
+                }
+              }
+              seen.add(
+                `${snapshot.dataRoot}\0${remote.piSessionId}\0${remote.claim.id}`,
+              );
+              const route = remotePeerRoutes.get(remote.piSessionId);
+              if (route) {
+                ambiguousRemoteSessions.add(remote.piSessionId);
+                remotePeerRoutes.delete(remote.piSessionId);
+                continue;
+              }
+              remotePeerRoutes.set(remote.piSessionId, {
+                machine,
+                dataRoot: snapshot.dataRoot,
+                claimId: remote.claim.id,
+                build: remote.build,
+              });
+              peers.push({
+                session: remote.piSessionId,
+                name:
+                  remote.name ?? `manager-${remote.piSessionId.slice(0, 8)}`,
+                machine: machine.label,
+                cwd: remote.cwd ?? "",
+                repo: remote.repo ?? "",
+                branch: remote.branch ?? "",
+                workspace_label: remote.workspaceLabel ?? "",
+              });
+            }
+          } catch {
+            unavailableMachines.push(machine.label);
+          }
+        }
+        for (const session of ambiguousRemoteSessions) {
+          remotePeerRoutes.delete(session);
+          const index = peers.findIndex(
+            (peer) => peer.session === session && "machine" in peer,
+          );
+          if (index >= 0) peers.splice(index, 1);
+        }
+      }
       return {
-        content: [{ type: "text", text: JSON.stringify({ self, peers }) }],
-        details: { ok: true, action: "list", self, peers },
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              self,
+              peers,
+              ...(unavailableMachines.length
+                ? { unavailable_machines: [...new Set(unavailableMachines)] }
+                : {}),
+            }),
+          },
+        ],
+        details: {
+          ok: true,
+          action: "list",
+          self,
+          peers,
+          ...(unavailableMachines.length
+            ? { unavailable_machines: [...new Set(unavailableMachines)] }
+            : {}),
+        },
       };
     }
     const sender = await livePeerLead(ctx, ctx.sessionManager.getSessionId());
-    const target = await livePeerLead(ctx, params.session);
+    const remoteRoute = remotePeerRoutes.get(params.session);
+    const returnCorrespondences =
+      sender && activeRole() === "manager" && !remoteRoute
+        ? listPeerCorrespondences().filter(
+            (item) =>
+              !item.finalized &&
+              item.originSession === params.session &&
+              item.recipientSession === sender.piSessionId &&
+              item.recipientGeneration === sender.claim.id,
+          )
+        : [];
+    const target = remoteRoute
+      ? undefined
+      : await livePeerLead(ctx, params.session);
     if (
       !sender ||
-      !target ||
       (sender.role ?? "lead") !== activeRole() ||
-      (target.role ?? "lead") !== activeRole()
+      (remoteRoute
+        ? activeRole() !== "manager" ||
+          ambiguousRemoteSessions.has(params.session)
+        : (!target || (target.role ?? "lead") !== activeRole()) &&
+          returnCorrespondences.length !== 1)
     )
       throw new Error(
         "Peer target was not found or is no longer a live same-role peer",
@@ -10525,7 +11062,7 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
         leaseId: sender.claim.id,
         kind: "peer_message",
         fromSessionId: sender.piSessionId,
-        toSessionId: target.piSessionId,
+        toSessionId: target?.piSessionId ?? params.session,
         leadSessionId: sender.piSessionId,
         peerSource: submissionSource,
         text: candidate,
@@ -10535,6 +11072,154 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
         createdAt,
       }),
     );
+    if (returnCorrespondences.length === 1) {
+      const correspondence = returnCorrespondences[0]!;
+      const replyId = randomUUID();
+      const replyAttachments = prepared.attachments.map((attachment) => {
+        if (attachment.text === undefined || attachment.marker === undefined)
+          throw new Error(
+            `Peer reply attachment was not captured completely: ${attachment.name}`,
+          );
+        return {
+          name: attachment.name,
+          ...(attachment.ref ? { ref: attachment.ref } : {}),
+          marker: attachment.marker,
+          text: attachment.text,
+          sha256: createHash("sha256")
+            .update(attachment.text, "utf8")
+            .digest("hex"),
+        };
+      });
+      queuePeerReply(
+        correspondence,
+        replyId,
+        prepared.transportText ?? prepared.text,
+        {
+          attachments: replyAttachments,
+          ...(prepared.resultBindings.length
+            ? { resultBindings: prepared.resultBindings }
+            : {}),
+        },
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Reply queued for originating Manager ${params.session} (${replyId}).`,
+          },
+        ],
+        details: { id: replyId, remoteSessionId: params.session, queued: true },
+      };
+    }
+    if (remoteRoute) {
+      const current = await probePeerEndpoint(remoteRoute.machine, signal);
+      const currentTarget = current.peers.find(
+        (peer) =>
+          peer.role === "manager" &&
+          peer.piSessionId === params.session &&
+          peer.claim.id === remoteRoute.claimId,
+      );
+      if (!currentTarget || current.dataRoot !== remoteRoute.dataRoot)
+        throw new Error("Remote Manager changed; run `list_peers` again.");
+      const record: ChiefMessageRecord = {
+        version: 2,
+        build: HERDSMAN_BUILD,
+        id: recordId,
+        leaseId: sender.claim.id,
+        kind: "peer_message",
+        fromSessionId: sender.piSessionId,
+        toSessionId: params.session,
+        leadSessionId: sender.piSessionId,
+        peerSource: { role: "manager" },
+        text: prepared.transportText ?? prepared.text,
+        ...(prepared.resultBindings.length
+          ? { resultBindings: [...prepared.resultBindings] }
+          : {}),
+        createdAt,
+      };
+      const attachments = prepared.attachments.map((attachment) => {
+        if (attachment.text === undefined || attachment.marker === undefined)
+          throw new Error(
+            `Peer attachment was not captured completely: ${attachment.name}`,
+          );
+        return {
+          name: attachment.name,
+          ...(attachment.ref ? { ref: attachment.ref } : {}),
+          marker: attachment.marker,
+          text: attachment.text,
+          sha256: createHash("sha256")
+            .update(attachment.text, "utf8")
+            .digest("hex"),
+        };
+      });
+      const correspondence =
+        listPeerCorrespondences().find(
+          (item) =>
+            !item.finalized &&
+            item.originSession === sender.piSessionId &&
+            item.recipientSession === params.session,
+        ) ??
+        createPeerCorrespondence({
+          originSession: sender.piSessionId,
+          originGeneration: sender.claim.id,
+          recipientSession: params.session,
+          recipientGeneration: remoteRoute.claimId,
+          acceptanceId: recordId,
+        });
+      if (correspondence.recipientGeneration !== remoteRoute.claimId) {
+        correspondence.recipientGeneration = remoteRoute.claimId;
+        storePeerCorrespondence(correspondence);
+      }
+      const envelope = JSON.stringify({
+        record,
+        expectedDataRoot: remoteRoute.dataRoot,
+        recipientClaimId: remoteRoute.claimId,
+        attachments,
+        correspondence,
+      });
+      const transferDigest = peerPayloadDigest({ record, attachments });
+      persistRemotePeerOutbound({
+        id: recordId,
+        machine: remoteRoute.machine,
+        dataRoot: remoteRoute.dataRoot,
+        session: sender.piSessionId,
+        claimId: sender.claim.id,
+        recipientSession: params.session,
+        digest: transferDigest,
+        envelope,
+      });
+      const releaseOutbound = tryClaimRemotePeerOutbound(recordId);
+      let accepted = false;
+      if (releaseOutbound) {
+        try {
+          accepted = await deliverRemoteOutbound(
+            remoteRoute.machine,
+            recordId,
+            envelope,
+            signal,
+          );
+        } finally {
+          releaseOutbound();
+        }
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: accepted
+              ? `Message accepted by remote Manager ${params.session} (${recordId}).`
+              : `Message queued locally for remote Manager ${params.session} (${recordId}); remote acceptance is still pending.`,
+          },
+        ],
+        details: {
+          id: recordId,
+          remoteSessionId: params.session,
+          machine: remoteRoute.machine.label,
+          accepted,
+          queued: true,
+        },
+      };
+    }
     const record = await queuePeerRecord(
       prepared.text,
       target.piSessionId,
@@ -10835,6 +11520,8 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
     currentWorktreeScope,
     authorizePeerRecord,
     peerContext,
+    resolvePeerResultBindings,
+    describePeerResultConflicts,
     queuePeerRecord,
     queueChiefRecord,
     enterCoordinationPublication,
@@ -10875,6 +11562,9 @@ export function createLeadInboxRuntime(host: LeadInboxHost) {
   let chiefInboxTimer: ReturnType<typeof setTimeout> | undefined;
   let chiefInboxGeneration = 0;
   let chiefInboxAbortController: AbortController | undefined;
+  let nextRemoteReconciliation = 0;
+  let remoteReconciliationFailures = 0;
+  let remoteReconciliationInFlight = false;
   let currentSubmittedAt: Map<string, number> | undefined;
   let settledSubmissions = new Set<string>();
   type ChiefStartPreflight = {
@@ -10911,6 +11601,8 @@ export function createLeadInboxRuntime(host: LeadInboxHost) {
     sameRuntimeBuild,
     projectAssignmentInstruction,
     importResultBindings,
+    resolvePeerResultBindings,
+    describePeerResultConflicts,
     HERDSMAN_BUILD,
     formatRuntimeBuild,
     listChiefMessagePaths,
@@ -10951,18 +11643,11 @@ export function createLeadInboxRuntime(host: LeadInboxHost) {
     ctx: ExtensionContext,
     record: ChiefMessageRecord,
   ): boolean =>
-    record.toSessionId === ctx.sessionManager.getSessionId() &&
-    ctx.sessionManager
-      .getEntries()
-      .some(
-        (entry: any) =>
-          entry?.customType === `pi-herdsman-${record.kind}` &&
-          entry?.details?.id === record.id &&
-          entry?.details?.leaseId === record.leaseId &&
-          entry?.details?.fromSessionId === record.fromSessionId &&
-          entry?.details?.leadSessionId === record.leadSessionId &&
-          entry?.details?.branch === record.branch,
-      );
+    coordinationMessageDelivered(
+      record,
+      ctx.sessionManager.getSessionId(),
+      ctx.sessionManager.getEntries(),
+    );
   const projectAssignmentAuthorized = (
     authorized: boolean,
     reason: string,
@@ -11545,6 +12230,31 @@ export function createLeadInboxRuntime(host: LeadInboxHost) {
                   !canMessagePeer(source, recipientContext)
                 )
                   throw new Error("Peer eligibility changed before delivery");
+                const peerBindings = resolvePeerResultBindings(
+                  ctx,
+                  resultBindings ?? [],
+                );
+                resultBindings = peerBindings.bindings;
+                if (
+                  peerBindings.conflicts.length &&
+                  typeof payload === "string"
+                )
+                  payload += describePeerResultConflicts(
+                    peerBindings.conflicts,
+                  );
+                else if (
+                  peerBindings.conflicts.length &&
+                  typeof payload === "object" &&
+                  payload !== null &&
+                  "content" in payload &&
+                  typeof payload.content === "string"
+                )
+                  payload = {
+                    ...payload,
+                    content:
+                      payload.content +
+                      describePeerResultConflicts(peerBindings.conflicts),
+                  };
                 let submitted: void | Promise<void>;
                 const submit = (
                   snapshot?: Map<
@@ -11661,6 +12371,8 @@ export function createLeadInboxRuntime(host: LeadInboxHost) {
           },
         },
         accepted: async (record: ChiefMessageRecord) => {
+          if (record.kind === "peer_message")
+            writePeerDeliveryReceipt(peerInboxRuntime, record);
           submittedAt.delete(record.id);
           settledSubmissions.delete(record.id);
         },
@@ -11776,6 +12488,43 @@ export function createLeadInboxRuntime(host: LeadInboxHost) {
         void Promise.resolve()
           .then(() => {
             if (!isCurrent()) return;
+            if (
+              activeRole() === "manager" &&
+              Date.now() >= nextRemoteReconciliation &&
+              !remoteReconciliationInFlight
+            ) {
+              remoteReconciliationInFlight = true;
+              nextRemoteReconciliation =
+                Date.now() +
+                Math.min(
+                  5 * 60_000,
+                  30_000 * 2 ** remoteReconciliationFailures,
+                );
+              const reconciliationGeneration = generation;
+              void Promise.resolve()
+                .then(() =>
+                  host.reconcileRemotePeers?.(
+                    ctx,
+                    chiefInboxAbortController?.signal,
+                  ),
+                )
+                .then(() => {
+                  if (reconciliationGeneration === chiefInboxGeneration) {
+                    remoteReconciliationFailures = 0;
+                  }
+                })
+                .catch((error: unknown) => {
+                  if (reconciliationGeneration === chiefInboxGeneration) {
+                    remoteReconciliationFailures = Math.min(
+                      remoteReconciliationFailures + 1,
+                      4,
+                    );
+                  }
+                })
+                .finally(() => {
+                  remoteReconciliationInFlight = false;
+                });
+            }
             return drainInbox();
           })
           .catch(() => {

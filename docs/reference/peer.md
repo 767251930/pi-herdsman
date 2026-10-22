@@ -89,6 +89,15 @@ Only the exact full `session` ID is a messaging target. Names, paths, branches,
 and workspace labels are display metadata, not target handles. The model-facing
 list has no `session_id`, `pane_id`, `tab_id`, or `workspace_id` fields.
 
+When the active coordinator is a Manager, the list also discovers live Managers
+on enabled, reachable saved Herdr machines. Those entries retain the exact Pi
+session ID and include a `machine` display label. Reachable-machine probe
+failures are reported separately as `unavailable_machines`; labels are not
+authority. Remote transport requires an independently working noninteractive
+OpenSSH target with normal strict host-key verification. `ssh://` targets and
+SSH-config aliases are supported; Herdr-only temporary authentication is not.
+Ordinary Lead discovery and messaging remain local/same-machine behavior.
+
 ```json
 {
   "session": "<exact full Pi session ID from `list_peers`>",
@@ -107,3 +116,18 @@ within both configured byte limits or the handoff is rejected; a reference-only
 attachment is not reported as delivered. The compact physical peer record
 remains bounded by the internal 8 KiB limit, with larger accepted bodies
 stored separately and verified before Pi delivery.
+
+Remote Manager sends are retained locally until the remote endpoint confirms
+durable acceptance; failed sends remain queued and are retried when the Manager
+lists peers again. Acceptance is not delivery to Pi or completion of the
+requested work. An accepted request also establishes a capability-scoped,
+durable return correspondence. The recipient Manager can reply to the exact
+originating session with `message_peer`; the reply is queued at the recipient
+and retrieved over the original SSH route when the originating Manager lists
+peers. Replies remain queued until acknowledged, so a disconnect and later
+reconnection does not require reverse SSH. Recovery is allowed only for the
+same exact Pi session after it has re-established live Manager authority; a
+replacement session is not substituted. Requests also verify the endpoint's
+effective Herdsman data root against the discovered route before recovery or
+reply transfer. Delivery to Pi and completion of the requested work remain
+separate states.
