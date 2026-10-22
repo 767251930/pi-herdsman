@@ -3195,7 +3195,11 @@ export function matchPiProvenance(
     );
     const [record] = matches;
     assert.equal(record.packageName, "@earendil-works/pi-coding-agent");
-    requireTestedBaseline("Pi", record.piVersion, expectedPiVersion);
+    assert.equal(
+      record.piVersion,
+      expectedPiVersion,
+      `smoke: executing Pi ${record.piVersion} differs from pinned Pi ${expectedPiVersion}`,
+    );
     assert.equal(record.model, expectedModel);
     assert.equal(record.hasAgentDefinitions, requireAgentDefinitions);
     const processes = foregroundProcesses.filter(
@@ -9721,7 +9725,7 @@ async function main() {
     expectedPackage: `${pkg.name}@${pkg.version}`,
     scenario,
     owned,
-    expectedPiVersion: pkg.piHerdsman.runtime.pi,
+    expectedPiVersion: preflightEvidence.piVersion,
     preflight: preflightEvidence,
   };
   ctx.initialPrompt = initialPromptForScenario(scenario, ctx);
