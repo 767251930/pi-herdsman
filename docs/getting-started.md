@@ -2,145 +2,56 @@
 
 [Documentation index](README.md) · [Coordination API](coordination-api.md)
 
-This is the shortest path from installation to useful asynchronous delegation.
-You do not need to call structured coordination tools yourself.
+## Install
 
-## 1. Install
-
-You need:
-
-- Node satisfying the released package's `engines.node` requirement
-- Pi at least the released package's `piHerdsman.runtime.pi` baseline
-- herdr at least the released package's
-  `piHerdsman.runtime.herdr.version` baseline
-
-On Linux or macOS, install the released, tested stack:
+**Linux/macOS:** Requires Node.js 22.19+ and npm.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/boadij/pi-herdsman/main/install.sh | sh
 ```
 
-The released package publishes its Node, Pi, and herdr runtime requirements.
-On mutable host installs, Pi and herdr baselines are minimums; the bootstrap
-never downgrades a newer runtime.
+**Windows:** Run in PowerShell.
 
-For Pi, a missing or older installation is handed to Pi's official managed
-installer and the result must meet the tested minimum. Pi's installer chooses
-its current managed release, so the installed Pi may be newer than Herdsman's
-tested baseline. Afterward, Pi remains natively updateable with `pi update`.
+```powershell
+irm https://raw.githubusercontent.com/boadij/pi-herdsman/main/install.ps1 | iex
+```
 
-For herdr, a missing or older installation receives the exact checksum-verified
-tested release from package metadata. Existing newer installations are left
-untouched, and subsequent updates remain native through `herdr update`.
-
-If you already manage Pi and herdr yourself:
+**Already have Pi and Herdr?**
 
 ```sh
 pi install npm:pi-herdsman
 herdr integration install pi
 ```
 
-For an SSH-ready Docker deployment, see
-[Container deployment](guides/container-deployment.md). The Docker image is a
-separate, deterministic deployment that installs exact Pi and herdr releases
-with checksum verification.
+The bootstraps install missing components and preserve compatible newer
+versions. If installation fails, follow the reported recovery instructions.
+For manual installation, see [Pi's Quickstart](https://pi.dev/docs/latest/quickstart)
+and [Herdr's installation guide](https://herdr.dev/docs/install/).
 
-## 2. Start herdr and Pi
+## Start Pi in Herdr
 
-Start herdr in your project:
+In your project directory, start Herdr, then Pi in its pane:
 
 ```sh
 herdr
-```
-
-Then start Pi inside the herdr pane:
-
-```sh
 pi
 ```
 
-Pi loads the package extension and optional `agents` skill. A Lead started
-outside herdr cannot safely manage herdr-backed Agents.
+## Delegate your first task
 
-## 3. Delegate without leaving the conversation
-
-Ask Pi normally:
+If Pi needs model authentication, use `/login` and select a provider. Then ask
+Pi to use the bundled `scout` Agent for a read-only reconnaissance task:
 
 ```text
-Use scout to inspect this repository.
+Use scout to identify this repository's main entry points.
+Explain how the application starts. Don't change any files.
 ```
 
-The Agent starts asynchronously. Once the assignment is accepted, the Lead
-conversation remains available while the Agent works.
+Delegation starts after Herdsman accepts the task. The Agent works
+asynchronously, and its result returns to the exact Pi session that delegated
+it. You can continue working while it runs.
 
-You can keep discussing the problem, delegate other genuinely independent work,
-or end the turn. Do not poll for completion. Results and Agent questions return
-to the exact owner when they need attention.
+## Manage work with `/herdsman`
 
-The exact assignment behavior is documented in
-[Lifecycle](concepts/lifecycle.md).
-
-## 4. Open Pi Herdsman
-
-Run:
-
-```text
-/herdsman
-```
-
-The menu starts with `Agents`, `Project manager`, `Session stats`, `Definitions`,
-`Settings`, and `Advanced…`. Direct commands remain available when you already
-know which operation you want.
-
-See [Commands](reference/commands.md) for the exact human-facing behavior.
-
-## 5. Customize when needed
-
-Pi Herdsman is opinionated about coordination, not your development workflow.
-Definitions control models, thinking, tools, skills, extensions, instructions,
-and permitted delegation.
-
-Continue with:
-
-- [Agent definitions](guides/agent-definitions.md)
-- [Customizing bundled Agents](guides/customizing-agents.md)
-- [Agent-definition schema](reference/agent-definition-schema.md)
-- [Configuration](reference/configuration.md)
-
-## 6. Observe active work
-
-The status widget shows current managed work and transient startup activity.
-Presentation is not control authority: operations still revalidate exact
-identity and lifecycle state.
-
-Completed Agent generations are cleaned up after result delivery. Their Pi
-sessions remain available for explicit continuation through the model-facing
-API.
-
-See [Status widget](reference/status-widget.md) and
-[Agents and identity](concepts/agents.md).
-
-## 7. Scale to project orchestration
-
-When one Lead and its Agent tree are no longer the right coordination boundary,
-an eligible Lead in the primary workspace can enter Manager mode:
-
-```text
-/manager
-```
-
-Manager mode is also discoverable through `/herdsman → Project manager`.
-
-Manager coordinates durable branch-based work across Leads. It does not own
-their Agents or implement through an Agent tree of its own. No prior chat turn
-or existing linked worktree is required in an ordinary Git primary workspace.
-
-Continue with [Project orchestration](guides/project-orchestration.md). For the
-role and authority model, read [Coordination](concepts/coordination.md).
-
-## Next steps
-
-- Keep delegating naturally through the Lead conversation.
-- Use [Project orchestration](guides/project-orchestration.md) for independent branch-based work.
-- Use [Coordination API](coordination-api.md) when you need exact model-facing interfaces.
-- Use [Recovery](guides/recovery.md) only when normal coordination cannot converge safely.
+Use `/herdsman` to discover controls for your work. For command details, see
+[Commands](reference/commands.md).
