@@ -2918,14 +2918,21 @@ function expandedResultLines(
         lines.push(
           "",
           `reply-only Managers ${replyOnly.length}`,
-          ...replyOnly.flatMap((item: any) =>
-            item && typeof item === "object"
-              ? [
-                  `  ${value(item.session) || "session"}`,
-                  "  Reply can be queued; current availability is unverified.",
-                ]
-              : [],
-          ),
+          ...replyOnly.flatMap((item: any) => {
+            if (!item || typeof item !== "object") return [];
+            const name = value(item.name);
+            const workspace = value(item.workspace_label);
+            const session = value(item.session) || "session";
+            const primary = name || workspace || session;
+            return [
+              `  ${primary}`,
+              ...(name && workspace && workspace !== name
+                ? [`  ${workspace}`]
+                : []),
+              ...(primary !== session ? [`  session: ${session}`] : []),
+              "  Reply can be queued; current availability is unverified.",
+            ];
+          }),
         );
       const unavailableMachines = Array.isArray(details.unavailable_machines)
         ? details.unavailable_machines
