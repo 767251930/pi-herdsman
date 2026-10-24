@@ -39,7 +39,7 @@ as:
 
 ```text
 ● chief · 1 manager
-└─ ○ pi-herdsman · 1 lead
+└─ ○ pi-herdsman · 1 compatible lead
    └─ worktree/silver-stone-21b7 · done
 ```
 
@@ -49,6 +49,13 @@ The widget caps ordinary reports and shows omitted reports in a final
 Chief's header shows only nonzero categories (`manager`, `direct lead`), or
 `no reports`. Manager's header shows the project name and lists managed
 branches as work, including work without live Leads:
+
+Chief also counts independently identified incompatible staff in the header
+and renders them as warning rows with `!` and `build mismatch`. These rows are
+observation-only: they have no focus target and do not grant staff actions.
+They disappear after a successful fresh observation confirms build
+convergence. Ambiguous or conflicting identity/build evidence is not shown as
+a confidently identified mismatch.
 
 ```text
 ● manager · pi-herdsman

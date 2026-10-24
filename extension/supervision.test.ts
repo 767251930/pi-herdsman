@@ -1447,6 +1447,68 @@ test("supervision authority is coordinator state, not metadata", () => {
   assert.equal("contextPercent" in malformed, false);
 });
 
+test("Lead supervision separates exact-build mismatches from actionable reports", () => {
+  const incompatibleId = id();
+  const compatibleId = id();
+  const differentSha = { version: BUILD.version, sha256: "b".repeat(64) };
+  const snapshot = projectSupervision({
+    agents: [
+      {
+        sessionId: incompatibleId,
+        sessionKind: "id",
+        workspaceId: "workspace-a",
+        paneId: "pane-a",
+        tabId: "tab-a",
+        herdrName: "Older Lead",
+      },
+      {
+        sessionId: compatibleId,
+        sessionKind: "id",
+        workspaceId: "workspace-b",
+        paneId: "pane-b",
+        tabId: "tab-b",
+      },
+    ],
+    managedAgents: [],
+    coordinationStates: [
+      state(incompatibleId, { role: "lead", build: differentSha }),
+      state(compatibleId, { role: "lead", build: BUILD }),
+    ],
+    localBuild: BUILD,
+  });
+  assert.deepEqual(
+    snapshot.leads.map((report) => report.lead),
+    [compatibleId],
+  );
+  assert.deepEqual(
+    snapshot.incompatible?.map((report) => report.session),
+    [incompatibleId],
+  );
+  assert.equal(snapshot.incompatible?.[0]?.build.sha256, differentSha.sha256);
+});
+
+test("Lead without legacy coordination build is not actionable when build verification is requested", () => {
+  const sessionId = id();
+  const legacyState = state(sessionId, { role: "lead" }) as any;
+  delete legacyState.build;
+  const snapshot = projectSupervision({
+    agents: [
+      {
+        sessionId,
+        sessionKind: "id",
+        workspaceId: "workspace-legacy",
+        paneId: "pane-legacy",
+        tabId: "tab-legacy",
+      },
+    ],
+    managedAgents: [],
+    coordinationStates: [legacyState],
+    localBuild: BUILD,
+  });
+  assert.deepEqual(snapshot.leads, []);
+  assert.equal(snapshot.incompatible?.length ?? 0, 0);
+});
+
 test("Manager supervision snapshot carries only its derived open workspaces", () => {
   const openWorkspaces: OpenProjectWorkspace[] = [
     {

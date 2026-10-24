@@ -510,6 +510,22 @@ test("Chief ambient projection pluralizes counts and handles unavailable state",
   }
 });
 
+test("Chief notification counts incompatible Manager children", () => {
+  const notification = formatSupervisionNotification(
+    [
+      lead({
+        role: "manager",
+        leadCounts: { active: 0, blocked: 0, total: 2 },
+        incompatibleLeadCount: 1,
+      }),
+    ],
+    "fresh",
+  );
+
+  assert.match(notification, /1 manager · 1 incompatible/);
+  assert.match(notification, /2 compatible leads · 1 incompatible lead/);
+});
+
 test("Chief ambient projection preserves branch and hidden-lead rendering", (t) => {
   {
     const rows = renderSupervisionLeads(
@@ -5554,7 +5570,7 @@ test("Chief tree shows project and branch without internal paths or zero counts"
   };
   const rows = renderSupervisionLeads(snapshot, 120);
   assert.equal(rows[0], "● chief · 1 manager");
-  assert.equal(rows[1], "└─ ○ pi-herdsman · 1 lead");
+  assert.equal(rows[1], "└─ ○ pi-herdsman · 1 compatible lead");
   assert.equal(rows[2], "   └─ feat/session-usage-stats · idle");
   assert.doesNotMatch(
     rows.join("\n"),
@@ -5618,10 +5634,10 @@ test("Chief tree connects nested Manager Leads without nesting direct Leads", ()
     leads: [lead({ lead: "direct", displayName: "unrelated-direct-lead" })],
   };
   assert.deepEqual(renderSupervisionLeads(snapshot, 120).slice(1), [
-    "├─ ● project-a · 2 leads",
+    "├─ ● project-a · 2 compatible leads",
     "│  ├─ child-a1 · done",
     "│  └─ child-a2 · working",
-    "├─ ● project-b · 1 lead",
+    "├─ ● project-b · 1 compatible lead",
     "│  └─ child-b1 · done",
     "└─ ○ unrelated-direct-lead",
   ]);
@@ -5872,6 +5888,52 @@ test("Manager standalone Lead rows expose their exact click target", () => {
   ]);
 });
 
+test("incompatible Manager Leads have no standalone or assigned-work click target", () => {
+  const incompatible = {
+    ...lead({ lead: "incompatible-lead", branch: "feat/older" }),
+    compatibility: "incompatible" as const,
+    availableActions: [] as const,
+  };
+  for (const snapshot of [
+    { project: "project", work: [], leads: [incompatible] },
+    {
+      project: "project",
+      work: [
+        {
+          branch: "feat/older",
+          session: incompatible.lead,
+          status: "active" as const,
+        },
+      ],
+      leads: [incompatible],
+    },
+  ]) {
+    const focused: unknown[] = [];
+    const widget = createSupervisionWidget(
+      () => snapshot,
+      () => "fresh",
+      "manager",
+      undefined,
+      (intent) => focused.push(intent),
+    );
+    assert.match(
+      stripVTControlCharacters(widget.render(120)[1]!),
+      /build mismatch/,
+    );
+    assert.equal(
+      widget.handleMouse({
+        type: "click",
+        button: "left",
+        x: 4,
+        y: 1,
+        width: 120,
+      }),
+      undefined,
+    );
+    assert.deepEqual(focused, []);
+  }
+});
+
 test("truncated supervision rows are not clickable when their name is hidden", () => {
   const focused: unknown[] = [];
   const widget = createSupervisionWidget(
@@ -5889,6 +5951,193 @@ test("truncated supervision rows are not clickable when their name is hidden", (
     undefined,
   );
   assert.deepEqual(focused, []);
+});
+
+test("incompatible staff rows are bounded, counted, and never focusable", () => {
+  const snapshot = {
+    managers: [],
+    incompatible: [
+      {
+        role: "manager" as const,
+        session: "incompatible-manager",
+        displayName: "Project B",
+        workspaceId: "workspace-b",
+        runtimeState: "idle" as const,
+        build: { version: "0.31.1", sha256: "a".repeat(64) },
+        reason: "incompatible_build" as const,
+      },
+    ],
+  };
+  const focused: unknown[] = [];
+  const widget = createSupervisionWidget(
+    () => snapshot,
+    () => "fresh",
+    "chief",
+    undefined,
+    (intent) => focused.push(intent),
+  );
+  const rows = widget.render(120).map(stripVTControlCharacters);
+  assert.match(rows[0]!, /1 incompatible/);
+  assert.match(rows[1]!, /! Project B · build mismatch/);
+  assert.ok(rows.every((row) => visibleWidth(row) <= 120));
+  assert.equal(
+    widget.handleMouse({
+      type: "click",
+      button: "left",
+      x: 4,
+      y: 1,
+      width: 120,
+    }),
+    undefined,
+  );
+  assert.deepEqual(focused, []);
+  const context = formatSupervisionContext(snapshot, { status: "fresh" });
+  assert.match(context, /observed; no available staff tools/);
+  assert.match(context, /incompatible \(observed; no available staff tools\)/);
+});
+
+test("incompatible Lead nested under a Manager is visibly observation-only", () => {
+  const focused: unknown[] = [];
+  const widget = createSupervisionWidget(
+    () => ({
+      managers: [
+        {
+          session: "manager",
+          displayName: "Project A",
+          project: "Project A",
+          workspaceId: "workspace-a",
+          runtimeState: "working" as const,
+          agentCounts: { active: 0, blocked: 0, total: 0 },
+          leadCounts: { active: 0, blocked: 0, total: 2 },
+          leads: [
+            {
+              session: "old-lead",
+              display_name: "Old Lead",
+              displayName: "Old Lead",
+              runtimeState: "idle" as const,
+              compatibility: "incompatible" as const,
+              build: { version: "old", sha256: "a".repeat(64) },
+            },
+          ],
+          availableActions: ["inspect" as const],
+        },
+      ],
+    }),
+    () => "fresh",
+    "chief",
+    undefined,
+    (intent) => focused.push(intent),
+  );
+  const rows = widget.render(120).map(stripVTControlCharacters);
+  assert.match(rows[2]!, /Old Lead · build mismatch/);
+  assert.match(rows[1]!, /2 compatible leads · 1 incompatible/);
+  assert.equal(
+    widget.handleMouse({
+      type: "click",
+      button: "left",
+      x: 4,
+      y: 2,
+      width: 120,
+    }),
+    undefined,
+  );
+  assert.deepEqual(focused, []);
+  const context = formatSupervisionContext(
+    {
+      managers: [
+        {
+          session: "manager",
+          displayName: "Project A",
+          project: "Project A",
+          workspaceId: "workspace-a",
+          runtimeState: "working",
+          agentCounts: { active: 0, blocked: 0, total: 0 },
+          leadCounts: { active: 0, blocked: 0, total: 2 },
+          leads: [
+            {
+              session: "old-lead",
+              displayName: "Old Lead",
+              runtimeState: "idle",
+              compatibility: "incompatible",
+            },
+          ],
+          availableActions: ["inspect"],
+        },
+      ],
+    },
+    { status: "fresh" },
+  );
+  assert.match(
+    context,
+    /Old Lead · incompatible \(build mismatch\) · session=old-lead/,
+  );
+  assert.doesNotMatch(context, /Old Lead.*agents=0/);
+  assert.match(context, /lead_counts \(compatible reports\):/);
+});
+
+test("supervision context counts nested incompatible observations", () => {
+  const context = formatSupervisionContext(
+    {
+      managers: [
+        {
+          session: "manager",
+          displayName: "Project A",
+          project: "Project A",
+          workspaceId: "workspace-a",
+          runtimeState: "working",
+          agentCounts: { active: 0, blocked: 0, total: 0 },
+          leadCounts: { active: 0, blocked: 0, total: 0 },
+          incompatibleLeadCount: 1,
+          leads: [
+            {
+              session: "old-lead",
+              displayName: "Old Lead",
+              runtimeState: "idle",
+              compatibility: "incompatible",
+            },
+          ],
+          availableActions: ["inspect"],
+        },
+      ],
+      leads: [],
+      incompatible: [],
+    },
+    { status: "fresh" },
+  );
+
+  assert.match(context, /incompatible_staff_observations: 1/);
+});
+
+test("Manager widget reports incompatible child totals beyond the displayed cap", () => {
+  const widget = createSupervisionWidget(
+    () => ({
+      managers: [
+        {
+          session: "manager",
+          displayName: "Project A",
+          project: "Project A",
+          workspaceId: "workspace-a",
+          runtimeState: "working" as const,
+          agentCounts: { active: 0, blocked: 0, total: 0 },
+          leadCounts: { active: 0, blocked: 0, total: 2 },
+          incompatibleLeadCount: 40,
+          leads: Array.from({ length: 32 }, (_, index) => ({
+            session: `old-lead-${index}`,
+            displayName: `Old Lead ${index}`,
+            runtimeState: "idle" as const,
+            compatibility: "incompatible" as const,
+          })),
+          availableActions: ["inspect" as const],
+        },
+      ],
+    }),
+    () => "fresh",
+    "chief",
+  );
+
+  const rows = widget.render(120);
+  assert.match(rows[1]!, /2 compatible leads · 40 incompatible/);
+  assert.ok(rows.length < 32, "the rendered child-row cap remains in effect");
 });
 
 test("truncated Manager branch is not clickable when it matches row status", () => {

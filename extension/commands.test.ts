@@ -8008,6 +8008,74 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
     pane_id: "manager-pane",
     tab_id: "manager-tab",
   };
+  const incompatibleManagerSession = randomUUID();
+  const incompatibleWorkspace = `workspace-${randomUUID()}`;
+  const incompatibleManager = {
+    agent_session: {
+      source: "herdr:pi",
+      agent: "pi",
+      kind: "id",
+      value: incompatibleManagerSession,
+    },
+    workspace_id: incompatibleWorkspace,
+    pane_id: "incompatible-manager-pane",
+    tab_id: "incompatible-manager-tab",
+  };
+  const incompatibleManagerLease = claimManagerLease({
+    build: OTHER_HERDSMAN_BUILD,
+    piSessionId: incompatibleManagerSession,
+    paneId: incompatibleManager.pane_id,
+    tabId: incompatibleManager.tab_id,
+    workspaceId: incompatibleWorkspace,
+    repoKey: "repo-key",
+  });
+  writeLeadCoordinationState(supervisionRuntime(), {
+    version: 1,
+    build: OTHER_HERDSMAN_BUILD,
+    role: "manager",
+    instanceId: randomUUID(),
+    piSessionId: incompatibleManagerSession,
+    updatedAt: Date.now(),
+  });
+  const nestedLeadSession = randomUUID();
+  const nestedLead = {
+    agent_session: {
+      source: "herdr:pi",
+      agent: "pi",
+      kind: "id",
+      value: nestedLeadSession,
+    },
+    workspace_id: incompatibleWorkspace,
+    pane_id: "nested-incompatible-manager-lead-pane",
+    tab_id: "nested-incompatible-manager-lead-tab",
+  };
+  writeLeadCoordinationState(supervisionRuntime(), {
+    version: 1,
+    role: "lead",
+    instanceId: randomUUID(),
+    piSessionId: nestedLeadSession,
+    updatedAt: Date.now(),
+  });
+  const incompatibleChildSession = randomUUID();
+  const incompatibleChild = {
+    agent_session: {
+      source: "herdr:pi",
+      agent: "pi",
+      kind: "id",
+      value: incompatibleChildSession,
+    },
+    workspace_id: WORKSPACE,
+    pane_id: "incompatible-compatible-manager-child-pane",
+    tab_id: "incompatible-compatible-manager-child-tab",
+  };
+  writeLeadCoordinationState(supervisionRuntime(), {
+    version: 1,
+    build: OTHER_HERDSMAN_BUILD,
+    role: "lead",
+    instanceId: randomUUID(),
+    piSessionId: incompatibleChildSession,
+    updatedAt: Date.now(),
+  });
   const assignedLeadSession = randomUUID();
   const assignedWorkspace = `workspace-${randomUUID()}`;
   const assignedLead = {
@@ -8102,28 +8170,60 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
     text: "assigned work",
   });
   const liveAgents = [managerAgent, assignedLead, ordinaryLead];
+  const manyCompatibleLeads = Array.from({ length: 33 }, (_, index) => {
+    const session = randomUUID();
+    writeLeadCoordinationState(supervisionRuntime(), {
+      version: 1,
+      role: "lead",
+      instanceId: randomUUID(),
+      piSessionId: session,
+      updatedAt: Date.now(),
+    });
+    return {
+      agent_session: {
+        source: "herdr:pi",
+        agent: "pi",
+        kind: "id",
+        value: session,
+      },
+      workspace_id: WORKSPACE,
+      pane_id: `many-compatible-${index}`,
+      tab_id: `many-compatible-${index}`,
+    };
+  });
   let revokeOrdinaryDuringRead = false;
   let delayOrdinaryRead = false;
   let finishDelayedRead: (() => void) | undefined;
+  const focusCalls: string[] = [];
   const exec = (command: string, args: string[]) => {
+    if (command === "herdr" && args[0] === "agent" && args[1] === "focus")
+      focusCalls.push(args[2]!);
     if (command === "herdr" && args[0] === "workspace" && args[1] === "get")
       return respond({
         workspace:
           args[2] === WORKSPACE
             ? { worktree: { repo_key: "repo-key", is_linked_worktree: false } }
-            : args[2] === assignedWorkspace || args[2] === ordinaryWorkspace
+            : args[2] === incompatibleWorkspace
               ? {
-                  worktree: {
-                    repo_key: "repo-key",
-                    is_linked_worktree: true,
-                  },
+                  worktree: { repo_key: "repo-key", is_linked_worktree: false },
                 }
-              : {},
+              : args[2] === assignedWorkspace || args[2] === ordinaryWorkspace
+                ? {
+                    worktree: {
+                      repo_key: "repo-key",
+                      is_linked_worktree: true,
+                    },
+                  }
+                : {},
       });
     if (command === "herdr" && args[0] === "worktree" && args[1] === "list")
       return respond({
         source: {
-          source_workspace_id: WORKSPACE,
+          source_workspace_id:
+            args.includes("--workspace") &&
+            args[args.indexOf("--workspace") + 1] === incompatibleWorkspace
+              ? incompatibleWorkspace
+              : WORKSPACE,
           repo_key: "repo-key",
           repo_name: "project",
         },
@@ -8137,7 +8237,7 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
     if (command === "herdr" && args[0] === "agent" && args[1] === "get")
       return respond({
         agent:
-          [assignedLead, ordinaryLead].find(
+          [incompatibleManager, nestedLead, assignedLead, ordinaryLead].find(
             (agent) => agent.pane_id === args[2],
           ) ?? managerAgent,
       });
@@ -8328,6 +8428,62 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
       /Multiple project assignments match a Lead session/,
     );
     rmSync(duplicatePath, { force: true });
+    writeLeadCoordinationState(supervisionRuntime(), {
+      version: 1,
+      build: OTHER_HERDSMAN_BUILD,
+      role: "lead",
+      instanceId: randomUUID(),
+      piSessionId: assignedLeadSession,
+      updatedAt: Date.now(),
+    });
+    writeLeadCoordinationState(supervisionRuntime(), {
+      version: 1,
+      build: OTHER_HERDSMAN_BUILD,
+      role: "lead",
+      instanceId: randomUUID(),
+      piSessionId: ordinaryLeadSession,
+      updatedAt: Date.now(),
+    });
+    await manager.commandOptions.get("manager").handler("", managerCtx);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const overviewLines = overview.render(120).join("\n");
+    assert.match(overviewLines, /build mismatch · reload Pi session/);
+    assert.match(
+      overviewLines,
+      /assigned-branch.*build mismatch · reload Pi session/,
+    );
+    assert.match(overviewLines, /unknown · build mismatch · reload Pi session/);
+    overview.handleInput("\r");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(
+      focusCalls,
+      [],
+      "incompatible overview selection sends no focus",
+    );
+    overview.handleInput("\u001b[B");
+    overview.handleInput("\r");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(
+      focusCalls,
+      [],
+      "incompatible standalone selection sends no focus",
+    );
+    overview.handleInput("\u001b");
+    writeLeadCoordinationState(supervisionRuntime(), {
+      version: 1,
+      role: "lead",
+      instanceId: randomUUID(),
+      piSessionId: assignedLeadSession,
+      updatedAt: Date.now(),
+    });
+    writeLeadCoordinationState(supervisionRuntime(), {
+      version: 1,
+      role: "lead",
+      instanceId: randomUUID(),
+      piSessionId: ordinaryLeadSession,
+      updatedAt: Date.now(),
+    });
     process.env.HERDR_WORKSPACE_ID = "chief-workspace";
     process.env.HERDR_PANE_ID = "chief-pane";
     process.env.HERDR_TAB_ID = "chief-tab";
@@ -8376,6 +8532,13 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
       );
       assert.ok(
         JSON.stringify(contextMessage?.message).includes(ordinaryLeadSession),
+        JSON.stringify(contextMessage?.message),
+      );
+      liveAgents.push(
+        ...manyCompatibleLeads,
+        incompatibleManager,
+        nestedLead,
+        incompatibleChild,
       );
       const staff = chief.tools.find((tool) => tool.name === "list_staff")!;
       const listed = await staff.execute(
@@ -8385,19 +8548,143 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
         undefined,
         chiefCtx,
       );
+      assert.equal(
+        listed.details.ok,
+        true,
+        "the partial observation is a successful fresh list result",
+      );
       assert.equal(listed.details.self.role, "chief");
-      assert.equal(listed.details.reports.length, 1);
+      assert.equal(listed.details.reports.length, 2);
       assert.equal(listed.details.reports[0].role, "manager");
       assert.equal(listed.details.reports[0].session, LEAD_SESSION_ID);
-      assert.deepEqual(
-        listed.details.reports[0].leads.map((lead: any) => lead.session),
-        [assignedLeadSession, ordinaryLeadSession],
+      assert.ok(
+        listed.details.reports[0].available_tools.includes("inspect_staff"),
       );
+      assert.ok(
+        listed.details.reports[0].available_tools.includes("message_staff"),
+      );
+      const nestedSessions = listed.details.reports[0].leads.map(
+        (lead: any) => lead.session,
+      );
+      assert.equal(nestedSessions.length, 36);
+      assert.ok(nestedSessions.includes(incompatibleChildSession));
+      const nestedIncompatible = listed.details.reports[0].leads.find(
+        (lead: any) => lead.session === incompatibleChildSession,
+      );
+      assert.equal(nestedIncompatible.compatibility, "incompatible");
+      assert.deepEqual(nestedIncompatible.available_tools, []);
+      assert.equal("agentCounts" in nestedIncompatible, false);
       assert.deepEqual(listed.details.reports[0].lead_counts, {
         active: 0,
         blocked: 0,
-        total: 2,
+        total: 35,
       });
+      const incompatibleEntry = listed.details.reports.find(
+        (report: any) => report.session === incompatibleManagerSession,
+      );
+      assert.equal(incompatibleEntry.compatibility, "incompatible");
+      assert.equal(incompatibleEntry.build.sha256, OTHER_HERDSMAN_BUILD.sha256);
+      assert.deepEqual(incompatibleEntry.available_tools, []);
+      assert.equal(
+        listed.details.reports.some(
+          (report: any) => report.session === nestedLeadSession,
+        ),
+        false,
+        "a Lead under an incompatible Manager is not elevated to Chief direct staff",
+      );
+      assert.match(listed.details.warning, /reload those Pi sessions/);
+      for (const [toolName, params] of [
+        [
+          "inspect_staff",
+          { action: "inspect", session: incompatibleManagerSession },
+        ],
+        [
+          "message_staff",
+          { session: incompatibleManagerSession, message: "unauthorized" },
+        ],
+        ["read_staff_transcript", { session: incompatibleManagerSession }],
+      ] as const) {
+        await assert.rejects(
+          chief.tools
+            .find((tool) => tool.name === toolName)!
+            .execute(
+              toolName === "inspect_staff" ? "inspect" : "action",
+              params,
+              undefined,
+              undefined,
+              chiefCtx,
+            ),
+          /not found|not eligible|not a current direct report|build mismatch/iu,
+        );
+      }
+      const descriptorPath = managerDescriptorPath(
+        supervisionRuntime(),
+        incompatibleWorkspace,
+      );
+      const converged = readManagerDescriptor(
+        supervisionRuntime(),
+        incompatibleWorkspace,
+      )!;
+      writeFileSync(
+        descriptorPath,
+        JSON.stringify({ ...converged, build: HERDSMAN_BUILD }),
+      );
+      writeLeadCoordinationState(supervisionRuntime(), {
+        version: 1,
+        build: HERDSMAN_BUILD,
+        role: "manager",
+        instanceId: randomUUID(),
+        piSessionId: incompatibleManagerSession,
+        updatedAt: Date.now(),
+      });
+      const convergedList = await staff.execute(
+        "list",
+        {},
+        undefined,
+        undefined,
+        chiefCtx,
+      );
+      assert.equal(
+        convergedList.details.reports.some(
+          (report: any) =>
+            report.session === incompatibleManagerSession &&
+            report.compatibility === "incompatible",
+        ),
+        false,
+        "a fresh matching-build observation clears the warning",
+      );
+      const nestedOnlyList = await staff.execute(
+        "list",
+        {},
+        undefined,
+        undefined,
+        chiefCtx,
+      );
+      assert.equal(
+        nestedOnlyList.details.reports.some(
+          (report: any) => report.compatibility === "incompatible",
+        ),
+        false,
+        "the compatible Manager leaves no top-level incompatible report",
+      );
+      assert.match(
+        nestedOnlyList.details.warning,
+        /incompatible Herdsman build.*reload those Pi sessions/,
+        "a nested-only mismatch still provides reload guidance",
+      );
+      await chief.events.get("before_agent_start")![0](
+        { systemPrompt: "base", systemPromptOptions: { contextFiles: [] } },
+        chiefCtx,
+      );
+      const nestedOnlyContext = chief.sentMessageCalls.findLast(
+        ({ message }: any) =>
+          message?.customType === "pi-herdsman-supervision-context",
+      );
+      assert.match(
+        JSON.stringify(nestedOnlyContext?.message),
+        /incompatible_staff_observations: 1/,
+        "the model-facing aggregate includes the nested incompatible Lead",
+      );
       await assert.rejects(
         chief.tools
           .find((tool) => tool.name === "message_staff")!
@@ -8412,6 +8699,19 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
             chiefCtx,
           ),
         /not a current direct report|Lead target was not found or is no longer eligible/,
+      );
+      writeLeadCoordinationState(supervisionRuntime(), {
+        version: 1,
+        build: OTHER_HERDSMAN_BUILD,
+        role: "manager",
+        instanceId: randomUUID(),
+        piSessionId: incompatibleManagerSession,
+        updatedAt: Date.now(),
+      });
+      await assert.rejects(
+        staff.execute("list", {}, undefined, undefined, chiefCtx),
+        /mismatch|authority|coordination/iu,
+        "conflicting descriptor and coordination builds fail closed",
       );
     } finally {
       resetAgentMailbox(agentMailboxPath(WORKSPACE, mailboxLabel));
@@ -8428,6 +8728,7 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
   } finally {
     nativeSessions.delete(ordinarySessionPath);
     realFs.rmSync(ordinarySessionPath, { force: true });
+    incompatibleManagerLease.release();
     await manager.events.get("session_shutdown")![0]();
     delete process.env.HERDR_SOCKET_PATH;
     delete process.env.HERDR_PANE_ID;
@@ -11679,7 +11980,7 @@ test("supervision clicks verify standalone Manager Leads with fresh evidence des
   await runtime.refresh(ctx);
   assert.deepEqual(widget.render(120), [
     "● chief · 1 manager",
-    "└─ ● project-manager · 1 lead",
+    "└─ ● project-manager · 1 compatible lead",
     "   └─ feat/nested · working",
   ]);
   widget.handleMouse({ type: "click", button: "left", x: 5, y: 1, width: 120 });
@@ -11692,6 +11993,15 @@ test("supervision clicks verify standalone Manager Leads with fresh evidence des
     focused,
     [paneId, assignedPaneId, managerPaneId, paneId],
     focusNotices.join(" | "),
+  );
+  currentSnapshot.managers[0].leads[0].compatibility = "incompatible";
+  widget.handleMouse({ type: "click", button: "left", x: 5, y: 2, width: 120 });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    focused,
+    [paneId, assignedPaneId, managerPaneId, paneId],
+    "a stale clickable nested Lead row must not focus after fresh discovery finds a build mismatch",
   );
   assert.equal(currentRole, "chief", "nested navigation remains observational");
   runtime.stopPeriodic();
@@ -11838,6 +12148,7 @@ async function openChiefOverview(
     failRender?: boolean;
     failRefresh?: boolean;
     openOverview?: boolean;
+    incompatibleBuild?: { version: string; sha256: string };
   } = {},
 ) {
   setLeadEnvironment();
@@ -11961,6 +12272,9 @@ async function openChiefOverview(
   if (populated)
     writeLeadCoordinationState(supervisionRuntime(), {
       version: 1,
+      ...(options.incompatibleBuild
+        ? { build: options.incompatibleBuild }
+        : {}),
       instanceId: randomUUID(),
       piSessionId: PARENT_SESSION_ID,
       updatedAt: Date.now(),
@@ -12054,6 +12368,23 @@ test("Chief overview reports unavailable when its first refresh fails", async ()
     const output = harness.component.render(120).join("\n");
     assert.match(output, /Pi Herdsman · unavailable/);
     assert.doesNotMatch(output, /0 herds/);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("Chief overview renders incompatible staff without counts or selection actions", async () => {
+  const harness = await openChiefOverview(true, {
+    incompatibleBuild: { version: "older", sha256: "a".repeat(64) },
+  });
+  try {
+    const output = harness.component.render(120).join("\n");
+    assert.match(output, /1 herd/);
+    assert.match(output, /build mismatch/);
+    assert.doesNotMatch(output, /0 agents/);
+    harness.component.handleInput(" ");
+    harness.component.handleInput("\r");
+    assert.equal(harness.doneCalls, 0);
   } finally {
     await harness.cleanup();
   }
