@@ -31,6 +31,12 @@ function parseArgs(args: string[]): {
   return { action: args[1], repo: args[3] };
 }
 
+function samePath(a: string, b: string): boolean {
+  return process.platform === "win32"
+    ? a.toLowerCase() === b.toLowerCase()
+    : a === b;
+}
+
 function verifiedRepoKey(repoPath: string): string {
   const repo = realpathSync(resolve(repoPath));
   const git = (...args: string[]) =>
@@ -41,14 +47,14 @@ function verifiedRepoKey(repoPath: string): string {
 
   if (git("--is-inside-work-tree") !== "true")
     throw new Error("Expected a Git working tree");
-  if (realpathSync(git("--show-toplevel")) !== repo)
+  if (!samePath(realpathSync(git("--show-toplevel")), repo))
     throw new Error("Expected the checkout root");
 
   const gitDir = realpathSync(git("--path-format=absolute", "--git-dir"));
   const commonDir = realpathSync(
     git("--path-format=absolute", "--git-common-dir"),
   );
-  if (gitDir !== commonDir)
+  if (!samePath(gitDir, commonDir))
     throw new Error("Expected a primary checkout, not a linked worktree");
   return commonDir;
 }

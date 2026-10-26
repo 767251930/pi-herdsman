@@ -83,6 +83,16 @@ test("merge operator validates primary repositories and scopes verified config",
     assert.equal(nonTty.status, 1);
     assert.match(nonTty.stderr, /interactive terminal/);
     assert.equal(existsSync(configPath), false);
+    if (process.platform === "win32") {
+      const differentlyCased = run([
+        "merge",
+        "allow",
+        "--repo",
+        repoA.toUpperCase(),
+      ]);
+      assert.equal(differentlyCased.status, 1);
+      assert.match(differentlyCased.stderr, /interactive terminal/);
+    }
 
     mkdirSync(join(agentDir, "pi-herdsman"), { recursive: true });
     writeFileSync(
