@@ -14,7 +14,6 @@ await build({
     "integrations/pi-codex-context-sharing":
       "extension/integrations/pi-codex-context-sharing.ts",
     "peer-bridge": "bin/peer-bridge.ts",
-    "merge-operator": "bin/merge-operator.ts",
   },
   outdir: "dist",
   bundle: true,
@@ -27,7 +26,26 @@ await build({
     "@earendil-works/pi-coding-agent",
     "@earendil-works/pi-tui",
     "@howaboua/pi-codex-conversion/context-sharing",
-    "proper-lockfile",
+    "typebox",
+  ],
+});
+await build({
+  absWorkingDir: root,
+  entryPoints: { "merge-operator": "bin/merge-operator.ts" },
+  outdir: "dist",
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node22",
+  sourcemap: true,
+  banner: {
+    js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);',
+  },
+  external: [
+    "@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent",
+    "@earendil-works/pi-tui",
+    "@howaboua/pi-codex-conversion/context-sharing",
     "typebox",
   ],
 });

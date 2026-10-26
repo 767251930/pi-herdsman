@@ -149,6 +149,41 @@ try {
     throw new Error(
       `Pi package load expected skill ${expectedSkill}, loaded ${JSON.stringify(skills.map(({ name, filePath }) => ({ name, filePath })))}`,
     );
+
+  const packed = JSON.parse(
+    execFileSync(
+      process.execPath,
+      [
+        npmExecPath,
+        "pack",
+        "--json",
+        "--ignore-scripts",
+        "--pack-destination",
+        isolated,
+      ],
+      { cwd: root, encoding: "utf8" },
+    ),
+  );
+  const archive = resolve(isolated, packed[0].filename);
+  execFileSync("tar", ["-xzf", archive, "-C", isolated]);
+  const extracted = resolve(isolated, "package");
+  const { extensions: packedExtensions, errors: packedErrors } =
+    await discoverAndLoadExtensions([extracted], isolated, isolated);
+  if (packedErrors.length)
+    throw new Error(
+      [
+        "Pi failed to load packed extension from isolated extraction:",
+        ...packedErrors.map(({ path, error }) => `${path}: ${error}`),
+      ].join("\n"),
+    );
+  const packedEntry = resolve(extracted, "dist/index.js");
+  if (
+    packedExtensions.length !== 1 ||
+    packedExtensions[0]?.resolvedPath !== packedEntry
+  )
+    throw new Error(
+      `Pi package load expected ${packedEntry}, loaded ${JSON.stringify(packedExtensions.map(({ resolvedPath }) => resolvedPath))}`,
+    );
 } finally {
   rmSync(isolated, { recursive: true, force: true });
 }
