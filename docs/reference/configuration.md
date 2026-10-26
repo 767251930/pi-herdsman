@@ -153,6 +153,27 @@ can retry guarded cleanup. An already-absent checkout is reconciled only when
 the accepted SHA is verified on the primary branch and assignment/provenance
 checks pass.
 
+For an operator-confirmed repository-specific grant, the packaged
+`pi-herdsman` executable provides:
+
+```sh
+pi-herdsman merge allow --repo /absolute/path/to/primary-checkout
+pi-herdsman merge clear --repo /absolute/path/to/primary-checkout
+```
+
+`allow` accepts only the primary checkout root and requires an interactive
+terminal with the exact response `enable`; it stores and verifies a repository
+override without changing the global setting. `clear` removes only that
+repository override and verifies its absence. Clearing restores inheritance:
+if the global policy is enabled, merging remains enabled by the global policy.
+The command is available from the built package (`dist/merge-operator.js`) and
+the `pi-herdsman` npm bin; use the operator from the same selected Herdsman
+build and configuration directory as the Manager. After authorization, do not
+clear it when the launcher exits: first confirm related Manager/Lead execution
+is finished and inspect integration and cleanup results, then run `merge clear`,
+verify removal, and only afterward close the verified demo workspace and remove
+its disposable checkout. Retain failed sessions and worktrees for inspection.
+
 Placement affects future starts, not existing agents. `tab` uses one lead-owned
 agents tab, `subtree` gives each lead-direct agent its own tab, and `split`
 splits from the caller's pane. Nested delegation always splits in its owner's

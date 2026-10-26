@@ -25,6 +25,12 @@ const files = packed[0]?.files ?? [];
 const peerBridge = readFileSync(resolve(root, "dist/peer-bridge.js"), "utf8");
 if (peerBridge.includes("@earendil-works/pi-coding-agent"))
   throw new Error("standalone peer endpoint must not import the Pi SDK");
+const mergeOperator = readFileSync(
+  resolve(root, "dist/merge-operator.js"),
+  "utf8",
+);
+if (mergeOperator.includes("@earendil-works/pi-coding-agent"))
+  throw new Error("standalone merge operator must not import the Pi SDK");
 const allowed =
   /^(?:package\.json|README\.md|SKILL\.md|LICENSE|docs\/|dist\/|skills\/)/u;
 const expectedRoot = new Set([
@@ -42,6 +48,8 @@ const expectedDist = new Set([
   "dist/index.js.map",
   "dist/peer-bridge.js",
   "dist/peer-bridge.js.map",
+  "dist/merge-operator.js",
+  "dist/merge-operator.js.map",
   "dist/integrations/pi-codex-context-sharing.js",
   "dist/integrations/pi-codex-context-sharing.js.map",
   ...expectedDefinitions.map((name) => `dist/agent-definitions/${name}`),

@@ -14,6 +14,7 @@ await build({
     "integrations/pi-codex-context-sharing":
       "extension/integrations/pi-codex-context-sharing.ts",
     "peer-bridge": "bin/peer-bridge.ts",
+    "merge-operator": "bin/merge-operator.ts",
   },
   outdir: "dist",
   bundle: true,
@@ -26,6 +27,7 @@ await build({
     "@earendil-works/pi-coding-agent",
     "@earendil-works/pi-tui",
     "@howaboua/pi-codex-conversion/context-sharing",
+    "proper-lockfile",
     "typebox",
   ],
 });

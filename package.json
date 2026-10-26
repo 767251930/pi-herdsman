@@ -102,7 +102,8 @@
     "skills"
   ],
   "bin": {
-    "pi-herdsman-peer": "dist/peer-bridge.js"
+    "pi-herdsman-peer": "dist/peer-bridge.js",
+    "pi-herdsman": "dist/merge-operator.js"
   },
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
