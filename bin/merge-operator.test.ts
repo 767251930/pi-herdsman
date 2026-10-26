@@ -11,9 +11,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { confirmEnable } from "./merge-operator.ts";
 
-const cli = new URL("./merge-operator.ts", import.meta.url).pathname;
+const cli = fileURLToPath(new URL("./merge-operator.ts", import.meta.url));
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], {
