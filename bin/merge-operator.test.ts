@@ -63,10 +63,10 @@ test("merge operator validates primary repositories and scopes verified config",
   );
   const configPath = join(agentDir, "pi-herdsman", "config.json");
   const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir };
-  const run = (args: string[]) =>
+  const run = (args: string[], extraEnv: NodeJS.ProcessEnv = {}) =>
     spawnSync(process.execPath, [cli, ...args], {
       encoding: "utf8",
-      env,
+      env: { ...env, ...extraEnv },
       input: "",
     });
   try {
@@ -107,6 +107,41 @@ test("merge operator validates primary repositories and scopes verified config",
       managerMergeEnabled: true,
       managerMergeOverrides: { [keyB]: false },
     });
+
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({ managerMergeOverrides: { [keyA]: true, [keyB]: false } })}\n`,
+    );
+    const redirected = run(["merge", "clear", "--repo", repoA], {
+      GIT_DIR: join(repoB, ".git"),
+      GIT_WORK_TREE: repoA,
+    });
+    assert.equal(redirected.status, 0, redirected.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+      managerMergeOverrides: { [keyB]: false },
+    });
+
+    if (process.platform === "win32") {
+      writeFileSync(
+        configPath,
+        `${JSON.stringify({ managerMergeOverrides: { [keyA]: true, [keyB]: false } })}\n`,
+      );
+      const differentlyCasedRedirected = run(
+        ["merge", "clear", "--repo", repoA],
+        {
+          git_dir: join(repoB, ".git"),
+          git_work_tree: repoA,
+        },
+      );
+      assert.equal(
+        differentlyCasedRedirected.status,
+        0,
+        differentlyCasedRedirected.stderr,
+      );
+      assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+        managerMergeOverrides: { [keyB]: false },
+      });
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -38,15 +38,21 @@ function samePath(a: string, b: string): boolean {
 
 function verifiedRepoKey(repoPath: string): string {
   const repo = realpathSync(resolve(repoPath));
+  const gitEnv = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([key]) => !key.toUpperCase().startsWith("GIT_"),
+    ),
+  );
   const git = (...args: string[]) =>
     execFileSync("git", ["-C", repo, "rev-parse", ...args], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
+      env: gitEnv,
     }).trim();
 
   if (git("--is-inside-work-tree") !== "true")
     throw new Error("Expected a Git working tree");
-  if (!samePath(realpathSync(git("--show-toplevel")), repo))
+  if (git("--show-prefix") !== "")
     throw new Error("Expected the checkout root");
 
   const gitDir = realpathSync(git("--path-format=absolute", "--git-dir"));
