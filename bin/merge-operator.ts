@@ -3,7 +3,6 @@ import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { pathToFileURL } from "node:url";
 import {
   effectiveMergePolicy,
   readConfig,
@@ -115,8 +114,4 @@ async function main(args: string[]): Promise<void> {
   }
 }
 
-if (
-  process.argv[1] &&
-  pathToFileURL(resolve(process.argv[1])).href === import.meta.url
-)
-  await main(process.argv.slice(2));
+if (import.meta.main) await main(process.argv.slice(2));

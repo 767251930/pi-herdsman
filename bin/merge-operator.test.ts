@@ -6,12 +6,13 @@ import {
   existsSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { confirmEnable } from "./merge-operator.ts";
 
 const cli = fileURLToPath(new URL("./merge-operator.ts", import.meta.url));
@@ -130,4 +131,39 @@ test("merge authorization requires a TTY and the exact named confirmation", asyn
     confirmEnable("/canonical/repo", true, async () => "ENABLE"),
     /not confirmed/,
   );
+});
+
+test("packaged merge CLI runs through an npm-style symlink only as the entry point", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-herdsman-merge-package-"));
+  const binDir = join(root, "node_modules", ".bin");
+  const packageCli = join(process.cwd(), "dist", "merge-operator.js");
+  mkdirSync(binDir, { recursive: true });
+  try {
+    execFileSync(process.execPath, ["scripts/build.mjs"], {
+      cwd: process.cwd(),
+      stdio: "pipe",
+    });
+    symlinkSync(packageCli, join(binDir, "pi-herdsman"), "file");
+
+    const invoked = spawnSync(process.execPath, [join(binDir, "pi-herdsman")], {
+      encoding: "utf8",
+    });
+    assert.equal(invoked.status, 2, invoked.stderr);
+    assert.match(invoked.stderr, /Usage:/);
+
+    const imported = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `await import(${JSON.stringify(pathToFileURL(packageCli).href)})`,
+        "invalid",
+      ],
+      { encoding: "utf8" },
+    );
+    assert.equal(imported.status, 0, imported.stderr);
+    assert.equal(imported.stderr, "");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
