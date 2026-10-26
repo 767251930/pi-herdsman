@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   mkdirSync,
   existsSync,
+  realpathSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -49,17 +50,11 @@ test("merge operator validates primary repositories and scopes verified config",
   mkdirSync(nested);
   git(root, "init", "--bare", "-q", bare);
   git(repoA, "worktree", "add", "-qb", "linked", linked);
-  const keyA = git(
-    repoA,
-    "rev-parse",
-    "--path-format=absolute",
-    "--git-common-dir",
+  const keyA = realpathSync(
+    git(repoA, "rev-parse", "--path-format=absolute", "--git-common-dir"),
   );
-  const keyB = git(
-    repoB,
-    "rev-parse",
-    "--path-format=absolute",
-    "--git-common-dir",
+  const keyB = realpathSync(
+    git(repoB, "rev-parse", "--path-format=absolute", "--git-common-dir"),
   );
   const configPath = join(agentDir, "pi-herdsman", "config.json");
   const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir };
