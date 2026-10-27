@@ -784,6 +784,7 @@ import support, {
   buildStatusRows,
   agentControllerExecutor,
   cascadeExecutor,
+  delegatedLifecycleExecutor,
   defaultFixtureIdentity,
   discoverAgent,
   discoverAgentDefinitions,
@@ -8196,7 +8197,7 @@ async function managerDelegateAssignmentTest(
       (args[1] === "run" || args[1] === "wait-output")
     )
       return respond({});
-    if (command === "herdr" && args[0] === "agent" && args[1] === "start") {
+    if (args[0] === "agent" && args[1] === "start") {
       started = true;
       const [assignment] = listProjectAssignments(
         supervisionRuntime(),
@@ -17095,26 +17096,31 @@ test("lead stop-all rejects an empty inventory with unresolved mailbox state", a
   assert.equal(cleanupStarted, false);
 });
 
-test("lead agents stop closes a direct subtree agents-first", async () => {
+test("Lead stop does not let the Lead continue a nested descendant directly", async () => {
   setLeadEnvironment();
+  const sessionRoot = mkdtempSync(join(tmpdir(), "herdsman-stop-proof-"));
+  const parentRequestId = randomUUID();
+  const childRequestId = randomUUID();
   const parent = {
     ...managedState(
       "pi-herdsman-parent",
-      undefined,
+      parentRequestId,
       recoveryIdentity("pi-herdsman-parent"),
     ),
+    agentDefinition: "agent",
     piSessionId: PARENT_SESSION_ID,
-    piSessionFile: "/tmp/pi-herdsman-parent.jsonl",
+    piSessionFile: join(sessionRoot, "parent.jsonl"),
   };
   const agents = {
     ...managedState(
       "pi-herdsman-agents",
-      undefined,
+      childRequestId,
       recoveryIdentity("pi-herdsman-agents"),
     ),
+    agentDefinition: "agent",
     ownerSessionId: parent.piSessionId,
     piSessionId: CHILD_SESSION_ID,
-    piSessionFile: "/tmp/pi-herdsman-agents.jsonl",
+    piSessionFile: join(sessionRoot, "agents.jsonl"),
   };
   const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
   const childMailbox = agentMailboxPath(WORKSPACE, agents.agentLabel);
@@ -17134,19 +17140,67 @@ test("lead agents stop closes a direct subtree agents-first", async () => {
             label: state.agentLabel,
           },
         },
+        ...(state === parent
+          ? [
+              {
+                type: "message",
+                message: {
+                  role: "toolResult",
+                  toolName: "delegate_agent",
+                  isError: false,
+                  details: {
+                    ok: true,
+                    owner_session_id: parent.piSessionId,
+                    session_id: agents.piSessionId,
+                    session_path: agents.piSessionFile,
+                    request_id: childRequestId,
+                    agent: agents.agentLabel,
+                    definition: "agent",
+                  },
+                },
+              },
+            ]
+          : []),
       ],
     });
+  for (const state of [parent, agents]) {
+    const entries = nativeSessions.get(state.piSessionFile!)!.entries ?? [];
+    writeFileSync(
+      state.piSessionFile!,
+      [{ type: "session", id: state.piSessionId, cwd: state.cwd }, ...entries]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+    );
+  }
   writeAgentState(parentMailbox, parent);
   writeAgentState(childMailbox, agents);
   const lifecycle = cascadeExecutor([parent, agents]);
-  const pi = fakePi({ exec: lifecycle.exec, persistMessages: true });
+  const pi = fakePi({ exec: lifecycle.exec });
+  pi.entries.push({
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolName: "delegate_agent",
+      isError: false,
+      details: {
+        ok: true,
+        owner_session_id: LEAD_SESSION_ID,
+        session_id: parent.piSessionId,
+        session_path: parent.piSessionFile,
+        request_id: parentRequestId,
+        agent: parent.agentLabel,
+        definition: "agent",
+      },
+    },
+  });
   registerExtension!(pi.pi as never);
   const command = pi.commandOptions.get("agents");
   const notices: string[] = [];
-  const context = fakeContext() as any;
+  const context = fakeContext(pi.entries) as any;
   context.hasUI = true;
   context.ui.notify = (message: string) => notices.push(message);
   try {
+    await pi.events.get("session_start")?.[0](undefined, context);
     await command.handler("stop", context);
     assert.deepEqual(lifecycle.closeOrder, [
       agents.agentLabel,
@@ -17165,20 +17219,349 @@ test("lead agents stop closes a direct subtree agents-first", async () => {
     assert.ok(
       pi.entries.some(
         (entry: any) =>
-          entry.customType === "pi-herdsman-stop-summary" &&
-          entry.details.summary === stopSummary(pi),
+          entry.customType === "pi-herdsman-agent-closed-assignment" &&
+          entry.data?.version === 1 &&
+          JSON.stringify(entry.data.proof) ===
+            JSON.stringify({
+              owner_session_id: LEAD_SESSION_ID,
+              session_id: parent.piSessionId,
+              session_path: parent.piSessionFile,
+              run_id: parent.runId,
+              request_id: parentRequestId,
+              agent: parent.agentLabel,
+              definition: "agent",
+              pane_id: parent.paneId,
+              workspace_id: parent.workspaceId,
+            }),
       ),
     );
     assert.equal(readAgentState(parentMailbox), undefined);
     assert.equal(readAgentState(childMailbox), undefined);
+    const denied = await agentTool(pi, "continue").execute(
+      "continue-stopped-nested-child",
+      { session: agents.piSessionId, task: "continue the prior assignment" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(denied.details.ok, false);
   } finally {
     await pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(parentMailbox);
     resetAgentMailbox(childMailbox);
     for (const state of [parent, agents])
       nativeSessions.delete(state.piSessionFile!);
+    rmSync(sessionRoot, { recursive: true, force: true });
   }
 });
+
+for (const acceptedChild of [true, false]) {
+  test(`close cascade ${acceptedChild ? "preserves" : "rejects"} nested continuation`, async (t) => {
+    setLeadEnvironment();
+    const sessionRoot = mkdtempSync(join(tmpdir(), "herdsman-close-cascade-"));
+    const leadPath = join(sessionRoot, "lead.jsonl");
+    const parentRequestId = randomUUID();
+    const childRequestId = randomUUID();
+    const parent = {
+      ...managedState(
+        "close-cascade-parent",
+        parentRequestId,
+        recoveryIdentity("close-cascade-parent"),
+      ),
+      agentDefinition: "agent",
+      ownerSessionId: LEAD_SESSION_ID,
+      piSessionId: PARENT_SESSION_ID,
+      piSessionFile: join(sessionRoot, "parent.jsonl"),
+    };
+    const child = {
+      ...managedState(
+        "close-cascade-child",
+        childRequestId,
+        recoveryIdentity("close-cascade-child"),
+      ),
+      agentDefinition: "agent",
+      ownerSessionId: parent.piSessionId,
+      piSessionId: CHILD_SESSION_ID,
+      piSessionFile: join(sessionRoot, "child.jsonl"),
+    };
+    const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
+    const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
+    resetAgentMailbox(parentMailbox);
+    resetAgentMailbox(childMailbox);
+    const acceptance = (
+      ownerSessionId: string,
+      state: ManagedAgentState,
+      requestId: string,
+    ) => ({
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "delegate_agent",
+        isError: false,
+        details: {
+          ok: true,
+          owner_session_id: ownerSessionId,
+          session_id: state.piSessionId,
+          session_path: state.piSessionFile,
+          request_id: requestId,
+          agent: state.agentLabel,
+          definition: state.agentDefinition,
+          run_id: state.runId,
+          pane_id: state.paneId,
+          workspace_id: state.workspaceId,
+        },
+      },
+    });
+    const parentEntries = [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: {
+          sessionId: parent.piSessionId,
+          definition: "agent",
+          label: parent.agentLabel,
+        },
+      },
+      ...(acceptedChild
+        ? [acceptance(parent.piSessionId, child, childRequestId)]
+        : []),
+    ];
+    for (const [state, entries] of [
+      [parent, parentEntries],
+      [
+        child,
+        [
+          {
+            type: "custom",
+            customType: "pi-herdsman-agent-definition",
+            data: {
+              sessionId: child.piSessionId,
+              definition: "agent",
+              label: child.agentLabel,
+            },
+          },
+        ],
+      ],
+    ] as const) {
+      nativeSessions.set(state.piSessionFile!, {
+        id: state.piSessionId!,
+        path: state.piSessionFile!,
+        entries: [...entries],
+      });
+      writeFileSync(
+        state.piSessionFile!,
+        [{ type: "session", id: state.piSessionId, cwd: state.cwd }, ...entries]
+          .map((entry) => JSON.stringify(entry))
+          .join("\n") + "\n",
+      );
+    }
+    writeAgentState(parentMailbox, parent);
+    writeAgentState(childMailbox, child);
+    const lifecycle = delegatedLifecycleExecutor(parent, [child]);
+    const pi = fakePi({ exec: lifecycle.exec });
+    const leadAcceptance = acceptance(LEAD_SESSION_ID, parent, parentRequestId);
+    pi.entries.push(leadAcceptance);
+    registerExtension!(pi.pi as never);
+    const context = fakeContext(pi.entries) as any;
+    context.sessionManager.getSessionId = () => LEAD_SESSION_ID;
+    context.hasUI = true;
+    const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+    t.after(async () => {
+      await pi.events.get("session_shutdown")?.[0]();
+      resetAgentMailbox(parentMailbox);
+      resetAgentMailbox(childMailbox);
+      nativeSessions.delete(parent.piSessionFile!);
+      nativeSessions.delete(child.piSessionFile!);
+      rmSync(sessionRoot, { recursive: true, force: true });
+    });
+
+    const result = await agentTool(pi, "close").execute(
+      "close-cascade-parent",
+      { agent: parent.agentLabel },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.action, "close");
+    assert.equal(result.details.agent, parent.agentLabel);
+    assert.equal(result.details.cleanup_error, undefined);
+    assert.equal(result.details.cleanup_errors, undefined);
+    if (acceptedChild) {
+      assert.equal(result.details.descendant_continuation_warning, undefined);
+    } else {
+      assert.match(
+        result.details.descendant_continuation_warning,
+        /continuation proof/i,
+      );
+    }
+    assert.equal(
+      result.details.closed_assignment.session_id,
+      parent.piSessionId,
+    );
+    assert.deepEqual(lifecycle.closeOrder, [
+      child.agentLabel,
+      parent.agentLabel,
+    ]);
+    // Pi persists native tool results as message entries. Preserve the actual
+    // close result here so continuation is authorized by the recorded call.
+    pi.entries.push({
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "close_agent",
+        isError: false,
+        content: result.content,
+        details: result.details,
+      },
+    });
+    writeFileSync(
+      leadPath,
+      [{ type: "session", id: LEAD_SESSION_ID, cwd: "/tmp" }, ...pi.entries]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+    );
+    const leadDiskEntries = readFileSync(leadPath, "utf8")
+      .trim()
+      .split("\n")
+      .slice(1)
+      .map((line) => JSON.parse(line));
+    nativeSessions.set(leadPath, {
+      id: LEAD_SESSION_ID,
+      path: leadPath,
+      cwd: "/tmp",
+      entries: leadDiskEntries,
+    });
+    const reopenedLead = (SessionManager as any).open(leadPath);
+    assert.equal(reopenedLead.getSessionId(), LEAD_SESSION_ID);
+    assert.equal(reopenedLead.getSessionFile(), leadPath);
+    const resumedLeadEntries = reopenedLead.getEntries() as any[];
+    const openedParent = (SessionManager as any).open(parent.piSessionFile);
+    assert.equal(openedParent.getSessionId(), parent.piSessionId);
+    const parentHistory = openedParent.getEntries() as any[];
+    assert.equal(
+      parentHistory.some(
+        (entry) =>
+          entry.customType === "pi-herdsman-agent-closed-assignment" &&
+          entry.data?.version === 1 &&
+          entry.data?.proof?.owner_session_id === parent.piSessionId &&
+          entry.data?.proof?.session_id === child.piSessionId &&
+          entry.data?.proof?.session_path === child.piSessionFile,
+      ),
+      acceptedChild,
+      acceptedChild
+        ? "B's closure proof is persisted in A's history"
+        : "B's proof is absent when A's accepted assignment cannot be verified",
+    );
+    assert.equal(
+      pi.entries.some(
+        (entry: any) =>
+          entry.customType === "pi-herdsman-agent-closed-assignment" &&
+          entry.data?.proof?.session_id === child.piSessionId,
+      ),
+      false,
+      "descendant proof is not granted to the unrelated Lead history",
+    );
+    const continuationLaunches: string[][] = [];
+    const exec = (command: string, args: string[], options?: any) => {
+      const response = lifecycle.exec(command, args, options);
+      if (command === "herdr" && args[0] === "agent" && args[1] === "start") {
+        continuationLaunches.push(args);
+        const sessionIndex = args.indexOf("--session");
+        const continuedState = lifecycle.live.get(parent.agentLabel);
+        if (continuedState && sessionIndex >= 0) {
+          const reopenedAgent = (SessionManager as any).open(
+            args[sessionIndex + 1],
+          );
+          continuedState.piSessionId = reopenedAgent.getSessionId();
+          continuedState.piSessionFile = reopenedAgent.getSessionFile();
+          writeAgentState(parentMailbox, continuedState);
+        }
+      }
+      return response;
+    };
+    const resumedLeadPi = fakePi({ exec, entries: resumedLeadEntries });
+    registerExtension!(resumedLeadPi.pi as never);
+    const resumedLeadContext = fakeContext(resumedLeadEntries) as any;
+    resumedLeadContext.sessionManager.getSessionId = () =>
+      reopenedLead.getSessionId();
+    resumedLeadContext.sessionManager.getSessionFile = () =>
+      reopenedLead.getSessionFile();
+    await resumedLeadPi.events.get("session_start")?.[0](
+      undefined,
+      resumedLeadContext,
+    );
+    const continuedParent = await agentTool(resumedLeadPi, "continue").execute(
+      "continue-cascade-parent",
+      { session: parent.piSessionId, task: "continue A after close cascade" },
+      undefined,
+      undefined,
+      resumedLeadContext,
+    );
+    assert.equal(
+      continuedParent.details.ok,
+      true,
+      JSON.stringify(continuedParent.details),
+    );
+    assert.equal(continuedParent.details.session_id, parent.piSessionId);
+    assert.equal(continuedParent.details.session_path, parent.piSessionFile);
+    assert.ok(
+      continuationLaunches[0]?.includes("--session") &&
+        continuationLaunches[0]?.includes(
+          realFs.realpathSync(parent.piSessionFile!),
+        ),
+      JSON.stringify(continuationLaunches[0]),
+    );
+    assert.notEqual(lifecycle.live.get(parent.agentLabel)?.runId, parent.runId);
+
+    // Continue B only from A's reopened saved owner history; Lead never receives B's proof.
+    const reopenedParent = (SessionManager as any).open(parent.piSessionFile);
+    assert.equal(reopenedParent.getSessionId(), parent.piSessionId);
+    assert.equal(reopenedParent.getSessionFile(), parent.piSessionFile);
+    const resumedParentEntries = reopenedParent.getEntries() as any[];
+    const resumedParentPi = fakePi({ exec, entries: resumedParentEntries });
+    registerExtension!(resumedParentPi.pi as never);
+    const resumedParentContext = fakeContext(resumedParentEntries) as any;
+    resumedParentContext.sessionManager.getSessionId = () =>
+      reopenedParent.getSessionId();
+    resumedParentContext.sessionManager.getSessionFile = () =>
+      reopenedParent.getSessionFile();
+    await resumedParentPi.events.get("session_start")?.[0](
+      undefined,
+      resumedParentContext,
+    );
+    const continuedChild = await agentTool(resumedParentPi, "continue").execute(
+      "continue-cascade-child",
+      {
+        session: child.piSessionId,
+        task: "continue B from A's durable history",
+      },
+      undefined,
+      undefined,
+      resumedParentContext,
+    );
+    assert.equal(
+      continuedChild.details.ok,
+      acceptedChild,
+      JSON.stringify(continuedChild.details),
+    );
+    assert.equal(
+      continuationLaunches.length,
+      acceptedChild ? 2 : 1,
+      acceptedChild ? "A and B are resumed" : "B is not resumed without proof",
+    );
+    assert.equal(
+      resumedLeadEntries.some(
+        (entry: any) =>
+          entry.customType === "pi-herdsman-agent-closed-assignment" &&
+          entry.data?.proof?.session_id === child.piSessionId,
+      ),
+      false,
+    );
+    await resumedLeadPi.events.get("session_shutdown")?.[0]();
+    await resumedParentPi.events.get("session_shutdown")?.[0]();
+  });
+}
 
 test("lead agents stop refuses an agent whose identity changes after inventory", async () => {
   setLeadEnvironment();
@@ -17217,10 +17600,306 @@ test("lead agents stop refuses an agent whose identity changes after inventory",
     await command.handler("stop", context);
     assert.equal(lifecycle.closeOrder.length, 0);
     assert.match(stopSummary(pi), /presence could not be verified/);
+    assert.equal(
+      pi.entries.some(
+        (entry: any) =>
+          entry.customType === "pi-herdsman-agent-closed-assignment",
+      ),
+      false,
+    );
     assert.ok(readAgentState(mailbox));
   } finally {
     await pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(mailbox);
+  }
+});
+
+test("lead can continue an active Agent after registered stop and reopening owner history", async (t) => {
+  setLeadEnvironment();
+  const sessionRoot = mkdtempSync(
+    join(tmpdir(), "herdsman-active-stop-reopen-"),
+  );
+  const requestId = randomUUID();
+  const state = {
+    ...managedState(
+      "active-stop-continuation",
+      requestId,
+      recoveryIdentity("active-stop-continuation"),
+    ),
+    agentDefinition: "agent",
+    piSessionId: CHILD_SESSION_ID,
+    piSessionFile: join(sessionRoot, "agent.jsonl"),
+  };
+  const ownerPath = join(sessionRoot, "lead.jsonl");
+  const acceptance = {
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolName: "delegate_agent",
+      isError: false,
+      details: {
+        ok: true,
+        owner_session_id: LEAD_SESSION_ID,
+        session_id: state.piSessionId,
+        session_path: state.piSessionFile,
+        request_id: requestId,
+        agent: state.agentLabel,
+        definition: "agent",
+      },
+    },
+  };
+  const ownerEntries: any[] = [acceptance];
+  const ownerSession = {
+    id: LEAD_SESSION_ID,
+    path: ownerPath,
+    cwd: "/tmp",
+    entries: ownerEntries,
+  };
+  nativeSessions.set(ownerPath, ownerSession);
+  writeFileSync(
+    ownerPath,
+    [{ type: "session", id: LEAD_SESSION_ID, cwd: "/tmp" }, ...ownerEntries]
+      .map((entry) => JSON.stringify(entry))
+      .join("\n") + "\n",
+  );
+  const agentPath = state.piSessionFile!;
+  nativeSessions.set(agentPath, {
+    id: state.piSessionId!,
+    path: agentPath,
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: {
+          sessionId: state.piSessionId,
+          definition: "agent",
+          label: state.agentLabel,
+        },
+      },
+    ],
+  });
+  writeFileSync(
+    agentPath,
+    [
+      { type: "session", id: state.piSessionId, cwd: state.cwd },
+      ...nativeSessions.get(agentPath)!.entries!,
+    ]
+      .map((entry) => JSON.stringify(entry))
+      .join("\n") + "\n",
+  );
+  const mailbox = agentMailboxPath(WORKSPACE, state.agentLabel);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, state);
+  const lifecycle = delegatedLifecycleExecutor(state);
+  let continuationLaunch: string[] = [];
+  const exec = (command: string, args: string[], options?: any) => {
+    const result = lifecycle.exec(command, args, options);
+    if (command === "herdr" && args[0] === "agent" && args[1] === "start") {
+      continuationLaunch = args;
+      const sessionIndex = args.indexOf("--session");
+      const continuedState = lifecycle.live.get(state.agentLabel);
+      if (continuedState && sessionIndex >= 0) {
+        const reopenedAgent = (SessionManager as any).open(
+          args[sessionIndex + 1],
+        );
+        continuedState.piSessionId = reopenedAgent.getSessionId();
+        continuedState.piSessionFile = reopenedAgent.getSessionFile();
+        writeAgentState(
+          agentMailboxPath(
+            continuedState.workspaceId,
+            continuedState.agentLabel,
+          ),
+          continuedState,
+        );
+      }
+    }
+    return result;
+  };
+  const pi = fakePi({ exec, entries: ownerEntries });
+  registerExtension!(pi.pi as never);
+  const stop = pi.commandOptions.get("agents");
+  const stopContext = fakeContext(ownerEntries) as any;
+  stopContext.sessionManager.getSessionId = () => LEAD_SESSION_ID;
+  stopContext.sessionManager.getSessionFile = () => ownerPath;
+  stopContext.hasUI = true;
+  stopContext.ui.notify = () => undefined;
+  const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+  t.after(async () => {
+    await pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+    nativeSessions.delete(ownerPath);
+    nativeSessions.delete(agentPath);
+    for (const agent of lifecycle.live.values())
+      resetAgentMailbox(agentMailboxPath(agent.workspaceId, agent.agentLabel));
+    rmSync(sessionRoot, { recursive: true, force: true });
+    setLeadEnvironment();
+  });
+
+  assert.equal(readResult(mailbox, requestId), undefined);
+  assert.ok(ownerEntries.includes(acceptance));
+  await stop.handler("stop", stopContext);
+  assert.deepEqual(lifecycle.closeOrder, [state.agentLabel]);
+  assert.equal(readAgentState(mailbox), undefined);
+  assert.ok(existsSync(agentPath), "the saved Agent session remains available");
+  assert.ok(
+    ownerEntries.some(
+      (entry: any) =>
+        entry.customType === "pi-herdsman-agent-closed-assignment" &&
+        entry.data?.proof?.session_id === state.piSessionId,
+    ),
+    "verified closure is persisted in the original Lead history",
+  );
+
+  // Persist the owner's append-only entries, then reopen that exact session.
+  writeFileSync(
+    ownerPath,
+    [{ type: "session", id: LEAD_SESSION_ID, cwd: "/tmp" }, ...ownerEntries]
+      .map((entry) => JSON.stringify(entry))
+      .join("\n") + "\n",
+  );
+  const diskEntries = readFileSync(ownerPath, "utf8")
+    .trim()
+    .split("\n")
+    .slice(1)
+    .map((line) => JSON.parse(line));
+  nativeSessions.set(ownerPath, { ...ownerSession, entries: diskEntries });
+  const reopened = (SessionManager as any).open(ownerPath);
+  assert.equal(reopened.getSessionId(), LEAD_SESSION_ID);
+  assert.equal(reopened.getSessionFile(), ownerPath);
+  const reopenedEntries = reopened.getEntries() as any[];
+  assert.ok(
+    reopenedEntries.some(
+      (entry) =>
+        entry.message?.toolName === "delegate_agent" &&
+        entry.message?.isError === false &&
+        entry.message?.details?.request_id === requestId &&
+        entry.message?.details?.session_id === state.piSessionId,
+    ),
+    "the accepted assignment is present in the reopened owner history",
+  );
+  assert.ok(
+    reopenedEntries.some(
+      (entry) =>
+        entry.customType === "pi-herdsman-agent-closed-assignment" &&
+        entry.data?.proof?.session_id === state.piSessionId,
+    ),
+  );
+  const resumedPi = fakePi({ exec, entries: reopenedEntries });
+  registerExtension!(resumedPi.pi as never);
+  const resumedContext = fakeContext(reopenedEntries) as any;
+  resumedContext.sessionManager.getSessionId = () => reopened.getSessionId();
+  resumedContext.sessionManager.getSessionFile = () =>
+    reopened.getSessionFile();
+  await resumedPi.events.get("session_start")?.[0](undefined, resumedContext);
+  const continued = await agentTool(resumedPi, "continue").execute(
+    "continue-after-active-stop",
+    { session: state.piSessionId, task: "continue the accepted assignment" },
+    undefined,
+    undefined,
+    resumedContext,
+  );
+  assert.equal(continued.details.ok, true, JSON.stringify(continued.details));
+  assert.ok(
+    continuationLaunch.includes("--session") &&
+      continuationLaunch.includes(realFs.realpathSync(agentPath)),
+    JSON.stringify(continuationLaunch),
+  );
+  assert.equal(continued.details.session_id, state.piSessionId);
+  assert.equal(continued.details.session_path, agentPath);
+  const continuedState = lifecycle.live.get(state.agentLabel);
+  assert.ok(continuedState);
+  assert.notEqual(continuedState.runId, state.runId);
+  assert.equal(continuedState.piSessionId, state.piSessionId);
+  assert.equal(continuedState.piSessionFile, agentPath);
+  await resumedPi.events.get("session_shutdown")?.[0]();
+});
+
+test("lead agents stop does not record closure proof when mailbox cleanup warns", async () => {
+  setLeadEnvironment();
+  const sessionRoot = mkdtempSync(
+    join(tmpdir(), "herdsman-stop-cleanup-warning-"),
+  );
+  const requestId = randomUUID();
+  const state = {
+    ...managedState(
+      "stop-mailbox-warning",
+      undefined,
+      recoveryIdentity("stop-mailbox-warning"),
+    ),
+    agentDefinition: "agent",
+    piSessionId: CHILD_SESSION_ID,
+    piSessionFile: join(sessionRoot, "agent.jsonl"),
+  };
+  const mailbox = agentMailboxPath(WORKSPACE, state.agentLabel);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, state);
+  nativeSessions.set(state.piSessionFile!, {
+    id: state.piSessionId!,
+    path: state.piSessionFile!,
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: {
+          sessionId: state.piSessionId,
+          definition: "agent",
+          label: state.agentLabel,
+        },
+      },
+    ],
+  });
+  const lifecycle = cascadeExecutor([state]);
+  const pi = fakePi({
+    exec: (command, args, options) => {
+      const result = lifecycle.exec(command, args, options);
+      if (
+        command === "herdr" &&
+        args[0] === "pane" &&
+        args[1] === "close" &&
+        result.code === 0
+      )
+        mkdirSync(join(mailbox, "cleanup-blocker"));
+      return result;
+    },
+  });
+  pi.entries.push({
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolName: "delegate_agent",
+      isError: false,
+      details: {
+        ok: true,
+        owner_session_id: LEAD_SESSION_ID,
+        session_id: state.piSessionId,
+        session_path: state.piSessionFile,
+        request_id: requestId,
+        agent: state.agentLabel,
+        definition: "agent",
+      },
+    },
+  });
+  registerExtension!(pi.pi as never);
+  const command = pi.commandOptions.get("agents");
+  const context = fakeContext(pi.entries) as any;
+  context.hasUI = true;
+  try {
+    await command.handler("stop", context);
+    assert.deepEqual(lifecycle.closeOrder, [state.agentLabel]);
+    assert.match(stopSummary(pi), /mailbox cleanup failed/);
+    assert.equal(
+      pi.entries.some(
+        (entry: any) =>
+          entry.customType === "pi-herdsman-agent-closed-assignment",
+      ),
+      false,
+    );
+    assert.ok(readAgentState(mailbox));
+  } finally {
+    await pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+    nativeSessions.delete(state.piSessionFile!);
+    rmSync(sessionRoot, { recursive: true, force: true });
   }
 });
 
@@ -17303,6 +17982,13 @@ test("lead agents stop continues independent leads after a partial cascade failu
     assert.match(stopSummary(pi), /Stopped 1 of 2 agents/);
     assert.match(stopSummary(pi), /✓ stop-independent/);
     assert.match(stopSummary(pi), /✗ stop-partial-failure/);
+    assert.equal(
+      pi.entries.some(
+        (entry: any) =>
+          entry.customType === "pi-herdsman-agent-closed-assignment",
+      ),
+      false,
+    );
   } finally {
     pi.events.get("session_shutdown")?.[0]();
     mailboxes.forEach((mailbox) => resetAgentMailbox(mailbox));

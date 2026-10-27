@@ -62,7 +62,10 @@ import {
 
 import { OperationError } from "./errors.ts";
 import { sameObservedSessionPath, verifiedHerdrAgent } from "./herdr.ts";
-import { ProcessLockOccupiedError } from "./lock.ts";
+import {
+  claimSessionActivationLock,
+  ProcessLockOccupiedError,
+} from "./lock.ts";
 import {
   readConfig,
   isWorktreeRemovalPreapproved,
@@ -86,6 +89,7 @@ import {
 } from "./storage.ts";
 import {
   createAgentController,
+  acceptedCloseProof,
   canonicalRefsForSemanticResult,
   buildAgentStatusSnapshot,
   createAgentStatusRuntime,
@@ -416,6 +420,12 @@ type LeadRuntimeOptions = {
 };
 
 type LeadCommandHost = {
+  persistStopClosures(
+    ctx: ExtensionContext,
+    closures: NonNullable<
+      import("./agent-controller.ts").StopOwnedAgentsResult["closures"]
+    >,
+  ): Promise<number>;
   collectOwnedSessionUsage(
     ctx: ExtensionContext,
     managedLeads?: readonly { id: string; piSessionFile?: string }[],
@@ -2206,7 +2216,21 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
           workspaceId,
           host.controller.sessionSignal(),
         );
-        host.presentStopSummary(result.summary);
+        let persisted = 0;
+        try {
+          persisted = await host.persistStopClosures(
+            ctx,
+            result.closures ?? [],
+          );
+        } catch {
+          // A verified stop does not imply that continuation proof was persisted.
+        }
+        const unavailable = (result.closures?.length ?? 0) - persisted;
+        host.presentStopSummary(
+          (result.closures?.length ?? 0) > 0
+            ? `${result.summary}\nContinuity proof saved for ${persisted} stopped Agent${persisted === 1 ? "" : "s"}; unavailable for ${unavailable}. Agents without saved proof may not be continuable.`
+            : result.summary,
+        );
       } finally {
         release();
       }
@@ -3783,6 +3807,15 @@ export function registerLeadRuntime(
   const controller = createAgentController(pi, {
     ...options.controllerServices,
     scope: { kind: "root" },
+    persistClosedDescendants: async (ctx, closures, selected) => {
+      const persisted = await projectRuntime.persistNestedStopClosures(ctx, [
+        ...closures,
+        { state: selected, definition: "" },
+      ]);
+      return persisted === closures.length
+        ? []
+        : ["Some closed descendants lack safely persisted continuation proof"];
+    },
     projectEvidence: async (ctx, signal) => {
       const operationSignal = signal ?? ctx.signal;
       if (
@@ -4197,6 +4230,8 @@ export function registerLeadRuntime(
   });
   const commandRuntime = createLeadCommandRuntime({
     ...options.commandHost,
+    persistStopClosures: (ctx, closures) =>
+      projectRuntime.persistStopClosures(ctx, closures),
     getRemovalPreauthorization: (ctx: ExtensionContext) =>
       projectRuntime.getRemovalPreauthorization(ctx),
     setRemovalPreauthorization: (enabled: boolean, ctx: ExtensionContext) =>
@@ -7249,6 +7284,225 @@ function restoreHerdRunReportId(
 }
 
 export function createLeadProjectRuntime(host: LeadProjectHost) {
+  const stopClosureEntry = "pi-herdsman-agent-closed-assignment";
+  const stopClosureProof = (
+    branch: readonly any[],
+    ownerSessionId: string,
+    closed: {
+      state: import("./mailbox.ts").ManagedAgentState;
+      definition: string;
+    },
+  ) => {
+    return acceptedCloseProof(branch, ownerSessionId, closed);
+  };
+  const persistActiveStopClosures = async (
+    ctx: ExtensionContext,
+    closures: NonNullable<
+      import("./agent-controller.ts").StopOwnedAgentsResult["closures"]
+    >,
+  ) => {
+    let persisted = 0;
+    const owner = ctx.sessionManager.getSessionId();
+    for (const closed of closures) {
+      if (closed.state.ownerSessionId !== owner) continue;
+      const proof = stopClosureProof(
+        ctx.sessionManager.getBranch(),
+        owner,
+        closed,
+      );
+      if (proof) {
+        await host.pi.appendEntry(stopClosureEntry, { version: 1, proof });
+        const entries = ctx.sessionManager.getEntries() as readonly any[];
+        const branch = ctx.sessionManager.getBranch() as readonly any[];
+        const saved = (entry: any) =>
+          entry?.type === "custom" &&
+          entry.customType === stopClosureEntry &&
+          entry.data?.version === 1 &&
+          JSON.stringify(entry.data.proof) === JSON.stringify(proof);
+        if (
+          entries.filter(saved).length === 1 &&
+          branch.filter(saved).length === 1 &&
+          stopClosureProof(branch, owner, closed) &&
+          JSON.stringify(stopClosureProof(branch, owner, closed)) ===
+            JSON.stringify(proof)
+        )
+          persisted++;
+      }
+    }
+    return persisted;
+  };
+  const persistNestedStopClosures = async (
+    ctx: ExtensionContext,
+    closures: NonNullable<
+      import("./agent-controller.ts").StopOwnedAgentsResult["closures"]
+    >,
+  ): Promise<number> => {
+    let persisted = 0;
+    const root = ctx.sessionManager.getSessionId();
+    const owners = new Map(
+      closures.flatMap(({ state }) =>
+        state.piSessionId && state.piSessionFile
+          ? [[state.piSessionId, state.piSessionFile] as const]
+          : [],
+      ),
+    );
+    for (const closed of closures) {
+      const owner = closed.state.ownerSessionId;
+      const path = owners.get(owner);
+      if (owner === root || !path) continue;
+      let release: (() => void) | undefined;
+      try {
+        const canonical = realpathSync(path);
+        release = claimSessionActivationLock(canonical);
+        if (
+          !(await stoppedClosureOwner(ctx, owner, root, closures, ctx.signal))
+        )
+          continue;
+        const manager = host.SessionManager.open(canonical);
+        if (
+          manager.getSessionId() !== owner ||
+          !manager.getSessionFile() ||
+          !host.sameObservedSessionPath(manager.getSessionFile()!, canonical)
+        )
+          continue;
+        const proof = stopClosureProof(manager.getBranch(), owner, closed);
+        if (!proof) continue;
+        manager.appendCustomEntry(stopClosureEntry, { version: 1, proof });
+        if (
+          (manager.getEntries() as readonly any[]).filter(
+            (entry) =>
+              entry?.type === "custom" &&
+              entry.customType === stopClosureEntry &&
+              entry.data?.version === 1 &&
+              JSON.stringify(entry.data.proof) === JSON.stringify(proof),
+          ).length === 1 &&
+          (manager.getBranch() as readonly any[]).some(
+            (entry) =>
+              entry?.type === "custom" &&
+              entry.customType === stopClosureEntry &&
+              JSON.stringify(entry.data?.proof) === JSON.stringify(proof),
+          ) &&
+          (await stoppedClosureOwner(ctx, owner, root, closures, ctx.signal))
+        )
+          persisted++;
+      } catch {
+        // A closed descendant can remain stopped without continuation proof.
+      } finally {
+        release?.();
+      }
+    }
+    return persisted;
+  };
+  const stoppedClosureOwner = async (
+    ctx: ExtensionContext,
+    owner: string,
+    leadSessionId: string,
+    closures: NonNullable<
+      import("./agent-controller.ts").StopOwnedAgentsResult["closures"]
+    >,
+    signal?: AbortSignal,
+  ): Promise<boolean> => {
+    if (owner === leadSessionId)
+      return (await host.liveLead(ctx, leadSessionId)).length === 0;
+    const parent = closures.find(({ state }) => state.piSessionId === owner);
+    if (!parent) return false;
+    const snapshot = await host.herdrSessionSnapshot(host.pi, ctx, signal);
+    if (!Array.isArray(snapshot?.agents)) return false;
+    return !snapshot.agents.some(
+      (agent: HerdrRecord) => host.herdrSessionId(agent) === owner,
+    );
+  };
+  const persistForeignStopClosures = async (
+    ctx: ExtensionContext,
+    target: HerdrRecord,
+    ownerSessionId: string,
+    closures: NonNullable<
+      import("./agent-controller.ts").StopOwnedAgentsResult["closures"]
+    >,
+    signal?: AbortSignal,
+  ): Promise<number> => {
+    if (!closures.length) return 0;
+    const ownerFiles = new Map<string, string>();
+    // The Lead path is obtained only from the verified supervised Lead record.
+    const leadPath = host.supervisedSessionFile(target, ownerSessionId);
+    if (leadPath) ownerFiles.set(ownerSessionId, leadPath);
+    for (const closed of closures)
+      if (closed.state.piSessionId && closed.state.piSessionFile)
+        ownerFiles.set(closed.state.piSessionId, closed.state.piSessionFile);
+    let persisted = 0;
+    for (const closed of closures) {
+      const owner = closed.state.ownerSessionId;
+      const ownerFile = ownerFiles.get(owner);
+      if (!ownerFile) continue;
+      let release: (() => void) | undefined;
+      try {
+        const canonical = realpathSync(ownerFile);
+        release = claimSessionActivationLock(canonical);
+        if (
+          !(await stoppedClosureOwner(
+            ctx,
+            owner,
+            ownerSessionId,
+            closures,
+            signal,
+          ))
+        )
+          continue;
+        const manager = host.SessionManager.open(canonical);
+        if (
+          manager.getSessionId() !== owner ||
+          !manager.getSessionFile() ||
+          !host.sameObservedSessionPath(manager.getSessionFile()!, canonical)
+        )
+          continue;
+        const proof = stopClosureProof(manager.getBranch(), owner, closed);
+        if (!proof) continue;
+        // Recheck exact owner absence while activation is excluded, before the write.
+        if (
+          !(await stoppedClosureOwner(
+            ctx,
+            owner,
+            ownerSessionId,
+            closures,
+            signal,
+          ))
+        )
+          continue;
+        manager.appendCustomEntry(stopClosureEntry, { version: 1, proof });
+        const entries = manager.getEntries() as readonly any[];
+        const branch = manager.getBranch() as readonly any[];
+        if (
+          entries.filter(
+            (entry) =>
+              entry?.type === "custom" &&
+              entry.customType === stopClosureEntry &&
+              entry.data?.version === 1 &&
+              JSON.stringify(entry.data.proof) === JSON.stringify(proof),
+          ).length === 1 &&
+          branch.some(
+            (entry) =>
+              entry?.type === "custom" &&
+              entry.customType === stopClosureEntry &&
+              entry.data?.version === 1 &&
+              JSON.stringify(entry.data.proof) === JSON.stringify(proof),
+          ) &&
+          (await stoppedClosureOwner(
+            ctx,
+            owner,
+            ownerSessionId,
+            closures,
+            signal,
+          ))
+        )
+          persisted++;
+      } catch {
+        // Physical stop remains successful; continuity proof is optional and fail-closed.
+      } finally {
+        release?.();
+      }
+    }
+    return persisted;
+  };
   const stopExecution = async (
     session: string,
     target: HerdrRecord,
@@ -7268,6 +7522,14 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
       await host.stopProjectLeadPane(ctx, target, session, signal);
       if ((await host.liveLead(ctx, session)).length)
         throw new Error("Lead remains live after stop; work was preserved");
+      const persisted = await persistForeignStopClosures(
+        ctx,
+        target,
+        session,
+        result.closures ?? [],
+        signal,
+      );
+      return { result, persisted };
     } finally {
       release();
     }
@@ -7313,12 +7575,12 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
       );
       if (live.length !== 1)
         throw new Error("Exact live Lead was not found or is ambiguous");
-      await stopExecution(session, live[0], ctx, signal);
+      const stopped = await stopExecution(session, live[0], ctx, signal);
       return {
         content: [
           {
             type: "text" as const,
-            text: `Lead ${session} stopped; project work preserved.`,
+            text: `Lead ${session} stopped; project work preserved.${stopped.persisted ? ` Continuation proof saved for ${stopped.persisted} Agent${stopped.persisted === 1 ? "" : "s"}.` : " Continuation proof could not be safely preserved; stopped Agents may not be continuable."}`,
           },
         ],
         details: {
@@ -10904,6 +11166,18 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
   };
   return {
     stopExecution,
+    persistStopClosures: async (
+      ctx: ExtensionContext,
+      closures: NonNullable<
+        import("./agent-controller.ts").StopOwnedAgentsResult["closures"]
+      >,
+    ) => {
+      return (
+        (await persistActiveStopClosures(ctx, closures)) +
+        (await persistNestedStopClosures(ctx, closures))
+      );
+    },
+    persistNestedStopClosures,
     stop,
     activateProjectLead,
     removeWorktree,

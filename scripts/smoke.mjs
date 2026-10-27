@@ -39,6 +39,7 @@ const scenarioNames = [
   "supervisor-agent",
   "manager-bootstrap",
   "manager-recovery",
+  "active-stop",
   "terminal-failure",
   "agent-terminal-failure",
   "manager-handoff",
@@ -1850,6 +1851,7 @@ export function correlatedContinuationTask(
   resultId,
   expectedSessionId,
   prompt,
+  identity = null,
 ) {
   const entries = sessionEntries(contents);
   const byId = new Map(
@@ -1882,7 +1884,15 @@ export function correlatedContinuationTask(
       message.isError ||
       message.details?.ok !== true ||
       message.details.action !== "continue" ||
-      message.details.session_id !== expectedSessionId
+      message.details.session_id !== expectedSessionId ||
+      (identity &&
+        (message.details.session_path !== identity.sessionPath ||
+          message.details.owner_session_id !== identity.ownerSessionId ||
+          message.details.agent !== identity.label ||
+          message.details.definition !== identity.definition ||
+          typeof message.details.request_id !== "string" ||
+          !message.details.request_id.trim() ||
+          message.details.request_id === identity.requestId))
     )
       continue;
     for (const candidate of ancestors.slice(0, index).reverse()) {
@@ -1901,15 +1911,164 @@ export function correlatedContinuationTask(
       );
       if (!call) continue;
       const task = call.arguments?.task;
+      if (
+        identity &&
+        ![identity.sessionId, identity.sessionPath].includes(
+          call.arguments?.session,
+        )
+      )
+        continue;
       // Keep the exact task in memory only; reject oversized tasks rather than truncate them.
       return typeof task === "string" &&
         task.trim() &&
         Buffer.byteLength(task) <= 16 * 1024
-        ? task
+        ? identity
+          ? {
+              task,
+              requestId: message.details.request_id,
+              resultId: ancestors[index].id,
+            }
+          : task
         : null;
     }
   }
   return null;
+}
+
+export function activeStopContinuationEvidence(
+  contents,
+  childContents,
+  resultId,
+  prompt,
+  marker,
+  identity,
+  boundary,
+) {
+  const continuation = correlatedContinuationTask(
+    contents,
+    resultId,
+    identity.sessionId,
+    prompt,
+    identity,
+  );
+  if (
+    !continuation ||
+    typeof boundary !== "string" ||
+    !childContents.startsWith(boundary)
+  )
+    return null;
+  if (
+    !savedSessionHeaderEvidence(childContents, identity.sessionId)
+      .sessionIdMatches
+  )
+    return null;
+  const childEntries = sessionEntries(childContents);
+  const boundaryLeaf = sessionEntries(boundary).at(-1)?.id;
+  if (typeof boundaryLeaf !== "string" || !boundaryLeaf) return null;
+  const childById = new Map(
+    childEntries.filter((entry) => entry.id).map((entry) => [entry.id, entry]),
+  );
+  const appendedIds = new Set(
+    sessionEntries(childContents.slice(boundary.length))
+      .map((entry) => entry.id)
+      .filter(Boolean),
+  );
+  const normalize = (text) => text.replace(/\s+/g, " ").trim().toLowerCase();
+  let childEntry = childEntries.at(-1);
+  const childVisited = new Set();
+  let taskFound = false;
+  let boundaryFound = false;
+  while (childEntry?.id && !childVisited.has(childEntry.id)) {
+    childVisited.add(childEntry.id);
+    if (childEntry.id === boundaryLeaf && taskFound) boundaryFound = true;
+    if (
+      appendedIds.has(childEntry.id) &&
+      childEntry.type === "message" &&
+      childEntry.message?.role === "user" &&
+      normalize(messageText(childEntry.message.content)).includes(
+        normalize(continuation.task),
+      )
+    )
+      taskFound = true;
+    childEntry = childById.get(childEntry.parentId);
+  }
+  if (!taskFound || !boundaryFound) return null;
+  const entries = sessionEntries(contents);
+  const byId = new Map(
+    entries.filter((entry) => entry.id).map((entry) => [entry.id, entry]),
+  );
+  const ancestors = [];
+  const visited = new Set();
+  let current = byId.get(resultId);
+  while (current?.id && !visited.has(current.id)) {
+    visited.add(current.id);
+    ancestors.push(current);
+    current = byId.get(current.parentId);
+  }
+  const receipts = ancestors.filter(
+    (entry) =>
+      entry.type === "custom_message" &&
+      entry.customType === "pi-herdsman-agent-result" &&
+      entry.details?.requestId === continuation.requestId,
+  );
+  if (receipts.length !== 1) return null;
+  const { details, content } = receipts[0];
+  const resultIndex = ancestors.findIndex(
+    (entry) => entry.id === continuation.resultId,
+  );
+  if (resultIndex <= ancestors.indexOf(receipts[0])) return null;
+  if (
+    details.ownerSessionId !== identity.ownerSessionId ||
+    details.agentLabel !== identity.label ||
+    details.agentDefinition !== identity.definition ||
+    details.piSessionId !== identity.sessionId ||
+    (details.piSessionFile !== undefined &&
+      details.piSessionFile !== identity.sessionPath) ||
+    typeof details.runId !== "string" ||
+    !details.runId.trim() ||
+    details.runId === identity.runId ||
+    details.status !== "completed" ||
+    typeof content !== "string"
+  )
+    return null;
+  if (![true, false, null].includes(details.sessionRetired)) return null;
+  if (
+    Object.hasOwn(details, "resultRef") &&
+    (typeof details.resultRef !== "string" ||
+      !/^result:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+        details.resultRef,
+      ) ||
+      details.resultRef !== `result:${details.requestId}`)
+  )
+    return null;
+  const parts = content.split("\n\n");
+  if (!parts.shift()?.startsWith("Agent result · ")) return null;
+  if (
+    Object.hasOwn(details, "resultRef") &&
+    !parts.shift()?.startsWith("Result ref: ")
+  )
+    return null;
+  if (details.sessionRetired === true || details.sessionRetired === null) {
+    const retirement = parts.shift();
+    if (
+      retirement !==
+      (details.sessionRetired
+        ? "Continuation unavailable: session retired after context pressure. If follow-up work remains, use delegate_agent with this result and relevant files."
+        : "Continuation policy unverified. Continue only from the original trusted project context, or delegate a fresh Agent.")
+    )
+      return null;
+  }
+  if (
+    details.delegationStatus !== undefined &&
+    parts.pop() !== details.delegationStatus
+  )
+    return null;
+  if (!parts.join("\n\n").includes(marker)) return null;
+  return {
+    sessionId: identity.sessionId,
+    runId: details.runId,
+    requestId: continuation.requestId,
+  };
 }
 
 async function sessionPathEvidence(ctx, path, expectedSessionId) {
@@ -5112,6 +5271,8 @@ export function initialPromptForScenario(scenario, ctx) {
       return "Reply exactly with PI_HERDSMAN_SUPERVISOR_AGENT_STARTUP.";
     case "manager-recovery":
       return undefined;
+    case "active-stop":
+      return "Reply exactly PI_HERDSMAN_ACTIVE_STOP_READY";
     case "manager-bootstrap":
       return undefined;
     case "terminal-failure":
@@ -5140,6 +5301,8 @@ export async function runScenario(ctx, scenario) {
       return runSupervisorAgentSmoke(ctx);
     case "manager-recovery":
       return runManagerRecoverySmoke(ctx);
+    case "active-stop":
+      return runActiveStopSmoke(ctx);
     case "manager-bootstrap":
       return runManagerBootstrapSmoke(ctx);
     case "terminal-failure":
@@ -8613,6 +8776,531 @@ async function runManagerRecoverySmoke(ctx) {
     "15000",
   ]);
   markStage(ctx, "post-leave-validation");
+}
+
+async function runActiveStopSmoke(ctx) {
+  const label = `stop-${randomUUID().slice(0, 12)}`;
+  const startupPrompt = initialPromptForScenario("active-stop", ctx);
+  const marker = `ACTIVE_STOP_CONTINUED_${randomUUID()}`;
+  const promptRoot = (prompt) =>
+    nestedCommand(ctx, ["agent", "prompt", ctx.rootPaneId, prompt]);
+  const rootReady = await waitForEvidence(
+    ctx,
+    "active-stop-root-ready",
+    async () => {
+      const snapshot = await rootSessionSnapshot(ctx);
+      if (!snapshot) {
+        let terminalTail = "";
+        try {
+          terminalTail = sanitizeManagerBootstrapText(
+            await nestedPaneText(ctx, ctx.rootPaneId, "visible"),
+            ctx,
+          ).slice(-1000);
+        } catch (error) {
+          terminalTail = `terminal read failed: ${sanitizeManagerBootstrapText(error.message, ctx).slice(0, 300)}`;
+        }
+        const processObservation = await tryNestedCommand(ctx, [
+          "pane",
+          "process-info",
+          "--pane",
+          ctx.rootPaneId,
+        ]);
+        return {
+          done: false,
+          observationError: "isolated root Pi session snapshot is unavailable",
+          progress: {
+            candidateProcess: sanitizeManagerBootstrapText(
+              JSON.stringify(
+                processObservation.ok
+                  ? processObservation.value
+                  : processObservation.error,
+              ).slice(-1000),
+              ctx,
+            ),
+            terminalTail,
+          },
+          evidence: terminalTail,
+        };
+      }
+      const responseCompleted = !!assistantResultForSession(
+        snapshot,
+        startupPrompt,
+        "PI_HERDSMAN_ACTIVE_STOP_READY",
+      );
+      const startupHistory = responseCompleted
+        ? undefined
+        : sessionEntries(snapshot.contents)
+            .filter(
+              (entry) =>
+                entry.type === "message" &&
+                ["user", "assistant"].includes(entry.message?.role),
+            )
+            .slice(-4)
+            .map((entry) => ({
+              id: sanitizeManagerBootstrapText(entry.id, ctx).slice(0, 100),
+              role: entry.message.role,
+              stopReason: entry.message.stopReason ?? null,
+              parentId: sanitizeManagerBootstrapText(entry.parentId, ctx).slice(
+                0,
+                100,
+              ),
+              text: sanitizeManagerBootstrapText(
+                messageText(entry.message.content),
+                ctx,
+              ).slice(-200),
+            }));
+      const header = sessionEntries(snapshot.contents).find(
+        (entry) => entry.type === "session",
+      );
+      if (typeof header?.id !== "string" || !header.id.trim())
+        return {
+          done: false,
+          observationError: "isolated root Pi session identity is unavailable",
+        };
+      const observed = await tryNestedCommand(ctx, [
+        "pane",
+        "process-info",
+        "--pane",
+        ctx.rootPaneId,
+      ]);
+      if (!observed.ok) {
+        const processObservationError = sanitizeManagerBootstrapText(
+          observed.error,
+          ctx,
+        ).slice(0, 300);
+        let terminalTail = "";
+        try {
+          terminalTail = sanitizeManagerBootstrapText(
+            await nestedPaneText(ctx, ctx.rootPaneId, "visible"),
+            ctx,
+          ).slice(-1000);
+        } catch (error) {
+          terminalTail = `terminal read failed: ${sanitizeManagerBootstrapText(error.message, ctx).slice(0, 300)}`;
+        }
+        return {
+          done: false,
+          observationError: processObservationError,
+          progress: {
+            responseCompleted,
+            ...(startupHistory && { startupHistory }),
+            candidateProcess: processObservationError,
+            terminalTail,
+          },
+          evidence: terminalTail,
+        };
+      }
+      const matches = candidateProcess(
+        observed.value,
+        ctx.candidateExtension,
+        ctx.herdrStateExtension,
+      );
+      let terminalTail = "";
+      if (!responseCompleted || matches.length !== 1) {
+        try {
+          terminalTail = sanitizeManagerBootstrapText(
+            await nestedPaneText(ctx, ctx.rootPaneId, "visible"),
+            ctx,
+          ).slice(-1000);
+        } catch (error) {
+          terminalTail = `terminal read failed: ${sanitizeManagerBootstrapText(error.message, ctx).slice(0, 300)}`;
+        }
+      }
+      if (
+        !responseCompleted ||
+        matches.length !== 1 ||
+        !Number.isSafeInteger(matches[0]?.pid) ||
+        matches[0].pid <= 0
+      )
+        return {
+          done: false,
+          observationError: `expected exactly one candidate foreground process with a positive PID in root pane (observed ${matches.length})`,
+          progress: {
+            snapshot: true,
+            responseCompleted,
+            ...(startupHistory && { startupHistory }),
+            candidatePids: matches
+              .map(({ pid }) => pid)
+              .filter((pid) => Number.isSafeInteger(pid) && pid > 0)
+              .sort((a, b) => a - b),
+            candidateProcess: sanitizeManagerBootstrapText(
+              JSON.stringify(observed.value).slice(-1000),
+              ctx,
+            ),
+            terminalTail,
+          },
+        };
+      return {
+        done: true,
+        value: { snapshot, pid: matches[0].pid },
+        progress: { snapshot: true, rootPid: matches[0].pid },
+      };
+    },
+    { timeoutMs: 30_000, stallMs: CONTROL_STALL_MS },
+  );
+  const root = rootReady.snapshot;
+  const ownerId = sessionEntries(root.contents).find(
+    (entry) => entry.type === "session",
+  )?.id;
+  assert.ok(ownerId, "active-stop Lead session ID is unavailable");
+  const task = `Work as the assigned Agent and remain active. Do not finish until continued. Remember ${marker}.`;
+  await promptRoot(
+    `Delegate exactly one Agent with label ${label} to do this task: ${task}`,
+  );
+  let initial;
+  await waitForEvidence(
+    ctx,
+    "active-stop-agent-ready",
+    async () => {
+      const listed = await tryNestedCommand(ctx, ["agent", "list"]);
+      if (!listed.ok) return { done: false, observationError: listed.error };
+      const records = await smokeManagedAgentRecords(
+        ctx,
+        (listed.value.agents ?? []).filter(
+          (agent) => agent.pane_id && agent.pane_id !== ctx.rootPaneId,
+        ),
+      );
+      const owned = records.filter(
+        ({ mailbox }) =>
+          mailbox?.state.ownerSessionId === ownerId &&
+          mailbox.state.activeRequestId,
+      );
+      if (owned.length > 1)
+        throw new Error(
+          `active-stop expected one active Lead-owned Agent, observed ${owned.length}`,
+        );
+      const matches = owned.filter(
+        ({ mailbox }) => mailbox.state.agentLabel === label,
+      );
+      if (matches.length > 1)
+        throw new Error("active-stop observed duplicate Agent label");
+      if (!matches.length) {
+        const root = await rootSessionSnapshot(ctx);
+        return {
+          done: false,
+          progress: {
+            listed: listed.value.agents?.length ?? 0,
+            owned: owned.length,
+            delegation: root ? rootDelegationDiagnostics(root.contents) : null,
+          },
+        };
+      }
+      const { agent, session, mailbox } = matches[0];
+      const observed = await tryNestedCommand(ctx, [
+        "pane",
+        "process-info",
+        "--pane",
+        agent.pane_id,
+      ]);
+      if (!observed.ok)
+        return { done: false, observationError: observed.error };
+      const processes = candidateProcess(
+        observed.value,
+        ctx.candidateExtension,
+        ctx.herdrStateExtension,
+      );
+      if (
+        session &&
+        mailbox &&
+        processes.length === 1 &&
+        Number.isSafeInteger(processes[0]?.pid) &&
+        processes[0].pid > 0
+      )
+        initial = { agent, session, mailbox, pid: processes[0].pid };
+      return {
+        done: !!initial,
+        value: initial,
+        progress: {
+          session: !!session,
+          mailbox: !!mailbox,
+          pids: processes.map(({ pid }) => pid).filter(Boolean),
+        },
+      };
+    },
+    { timeoutMs: 6 * 60_000, stallMs: MODEL_STALL_MS },
+  );
+  const { agent, session, mailbox, pid } = initial;
+  assert.equal(agent.workspace_id, ctx.rootWorkspaceId);
+  assert.equal(mailbox.state.ownerSessionId, ownerId);
+  assert.equal(mailbox.state.piSessionId, session.id);
+  assert.equal(mailbox.state.paneId, agent.pane_id);
+  assert.equal(mailbox.state.workspaceId, ctx.rootWorkspaceId);
+  const identity = {
+    sessionId: session.id,
+    sessionPath: session.path,
+    ownerSessionId: ownerId,
+    requestId: mailbox.state.activeRequestId,
+    runId: mailbox.state.runId,
+    label,
+    definition: mailbox.state.agentDefinition,
+    paneId: agent.pane_id,
+    workspaceId: ctx.rootWorkspaceId,
+  };
+  assert.ok(
+    Object.values(identity).every(Boolean),
+    "active-stop initial generation identity incomplete",
+  );
+  await submitPaneCommand(ctx, ctx.rootPaneId, "/agents stop");
+  const confirmation = await waitForEvidence(
+    ctx,
+    "active-stop-confirmation",
+    async () => {
+      const text = await nestedPaneText(ctx, ctx.rootPaneId, "visible");
+      const normalized = text.replace(/\s+/gu, " ");
+      const exact =
+        normalized.includes("Stop all agents?") &&
+        normalized.includes("1 working") &&
+        /discard/i.test(normalized);
+      const selectedYes = /(?:^|\s)→\s*Yes(?:\s|$)/u.test(normalized);
+      return {
+        done: exact && selectedYes,
+        value: normalized,
+        progress: {
+          title: normalized.includes("Stop all agents?"),
+          summary: normalized.includes("1 working"),
+          warning: /discard/i.test(normalized),
+          selectedYes,
+        },
+        evidence: normalized.slice(-1000),
+      };
+    },
+    { timeoutMs: 15_000, stallMs: CONTROL_STALL_MS },
+  );
+  assert.match(confirmation, /Stop all agents\?/);
+  assert.match(confirmation, /1 working/);
+  assert.match(confirmation, /discard/i);
+  assert.match(confirmation, /(?:^|\s)→\s*Yes(?:\s|$)/u);
+  await nestedPaneInput(ctx, ["pane", "send-keys", ctx.rootPaneId, "enter"]);
+  const proof = await waitForEvidence(
+    ctx,
+    "active-stop-closure-proof",
+    async () => {
+      const saved = await exactIsolatedSession(ctx, ownerId);
+      if (!saved || saved.path !== root.path) return { done: false };
+      const proofs = sessionEntries(saved.contents)
+        .filter(
+          (entry) =>
+            entry.type === "custom" &&
+            entry.customType === "pi-herdsman-agent-closed-assignment" &&
+            entry.data?.version === 1,
+        )
+        .map((entry) => entry.data.proof)
+        .filter(
+          (p) =>
+            p &&
+            p.owner_session_id === ownerId &&
+            p.session_id === identity.sessionId &&
+            p.session_path === identity.sessionPath &&
+            p.run_id === identity.runId &&
+            p.request_id === identity.requestId &&
+            p.agent === identity.label &&
+            p.definition === identity.definition &&
+            p.pane_id === identity.paneId &&
+            p.workspace_id === identity.workspaceId,
+        );
+      return {
+        done: proofs.length === 1,
+        value: proofs[0],
+        progress: { proofCount: proofs.length },
+      };
+    },
+    { timeoutMs: 60_000, stallMs: CONTROL_STALL_MS },
+  );
+  assert.ok(proof);
+  await waitForEvidence(
+    ctx,
+    "active-stop-pane-removed",
+    async () => {
+      const panes = await tryNestedCommand(ctx, ["pane", "list"]);
+      if (!panes.ok)
+        return {
+          done: false,
+          observationError: "Agent pane observation unavailable",
+        };
+      const panePresent = listedPanes(panes.value).some(
+        (item) => item.paneId === identity.paneId,
+      );
+      return { done: !panePresent, progress: { panePresent } };
+    },
+    { timeoutMs: 60_000, stallMs: CONTROL_STALL_MS },
+  );
+  await waitForEvidence(
+    ctx,
+    "active-stop-cleanup",
+    async () => {
+      const listed = await tryNestedCommand(ctx, ["agent", "list"]);
+      if (!listed.ok)
+        return {
+          done: false,
+          observationError:
+            "Agent registration cleanup observation unavailable",
+        };
+      const alive = (() => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch (error) {
+          return error?.code !== "ESRCH";
+        }
+      })();
+      return {
+        done:
+          !(listed.value.agents ?? []).some(
+            (item) => item.pane_id === identity.paneId,
+          ) &&
+          !alive &&
+          !(await exactAgentMailboxPending(ctx, {
+            piSessionId: identity.sessionId,
+            requestId: identity.requestId,
+            ownerSessionId: ownerId,
+            paneId: identity.paneId,
+            workspaceId: identity.workspaceId,
+          })),
+        progress: { alive, pid },
+      };
+    },
+    { timeoutMs: 60_000, stallMs: CONTROL_STALL_MS },
+  );
+  const followup = `Continue the exact Agent saved at ${identity.sessionPath}. This task is a continuation, not the original assignment. Return ${marker} exactly.`;
+  await waitForEvidence(
+    ctx,
+    "active-stop-no-replay-before-continuation",
+    async () => {
+      const listed = await tryNestedCommand(ctx, ["agent", "list"]);
+      const panes = await tryNestedCommand(ctx, ["pane", "list"]);
+      if (!listed.ok || !panes.ok)
+        return {
+          done: false,
+          observationError: "no-replay Agent/pane observation unavailable",
+        };
+      const agents = await smokeManagedAgentRecords(
+        ctx,
+        listed.value.agents ?? [],
+      );
+      const matchingAgents = agents.filter(
+        ({ session, mailbox: box }) =>
+          session?.id === identity.sessionId ||
+          (box?.state.piSessionId === identity.sessionId &&
+            box.state.ownerSessionId === ownerId &&
+            (box.state.activeRequestId || box.state.runId !== identity.runId)),
+      );
+      const matchingPanes = listedPanes(panes.value).filter(
+        ({ paneId }) => paneId === identity.paneId,
+      );
+      let mailboxPending = false;
+      const mailboxRoot = join(
+        ctx.paths.piAgent,
+        "pi-herdsman",
+        "runtime",
+        "mailboxes-v5",
+      );
+      for (const dir of await readdir(mailboxRoot, {
+        withFileTypes: true,
+      }).catch((error) =>
+        error.code === "ENOENT" ? [] : Promise.reject(error),
+      )) {
+        if (
+          !dir.isDirectory() ||
+          dir.isSymbolicLink() ||
+          !/^[0-9a-f]{32}$/u.test(dir.name)
+        )
+          continue;
+        const state = JSON.parse(
+          await readFile(
+            join(mailboxRoot, dir.name, "state.json"),
+            "utf8",
+          ).catch((error) =>
+            error.code === "ENOENT" ? "{}" : Promise.reject(error),
+          ),
+        );
+        if (
+          state.piSessionId === identity.sessionId &&
+          state.ownerSessionId === ownerId &&
+          (state.activeRequestId || state.runId !== identity.runId)
+        )
+          mailboxPending = true;
+      }
+      const processObservations = await Promise.all(
+        listedPanes(panes.value).map(({ paneId }) =>
+          tryNestedCommand(ctx, ["pane", "process-info", "--pane", paneId]),
+        ),
+      );
+      if (processObservations.some((result) => !result.ok))
+        return {
+          done: false,
+          observationError: "no-replay process observation unavailable",
+        };
+      const matchingProcess = processObservations.some((result) =>
+        candidateProcess(
+          result.value,
+          ctx.candidateExtension,
+          ctx.herdrStateExtension,
+        ).some((process) => process.pid === pid),
+      );
+      return {
+        done:
+          matchingAgents.length === 0 &&
+          matchingPanes.length === 0 &&
+          !matchingProcess &&
+          !mailboxPending,
+        progress: {
+          matchingAgents: matchingAgents.length,
+          matchingPanes: matchingPanes.length,
+          matchingProcess,
+          mailboxPending,
+        },
+      };
+    },
+    { timeoutMs: 15_000, stallMs: CONTROL_STALL_MS },
+  );
+  const continuationBoundary = await readFile(identity.sessionPath, "utf8");
+  await promptRoot(followup);
+  await waitForEvidence(
+    ctx,
+    "active-stop-continuation",
+    async () => {
+      const snapshot = await rootSessionSnapshot(ctx);
+      const results =
+        snapshot &&
+        continuationResultsForPrompt(snapshot.contents, followup, marker);
+      if (results?.length > 1)
+        throw new Error("active-stop produced multiple descendant responses");
+      if (results?.length === 1) {
+        const childContents = await readFile(
+          identity.sessionPath,
+          "utf8",
+        ).catch((error) =>
+          error.code === "ENOENT" ? "" : Promise.reject(error),
+        );
+        const evidence = activeStopContinuationEvidence(
+          snapshot.contents,
+          childContents,
+          results[0].id,
+          followup,
+          marker,
+          identity,
+          continuationBoundary,
+        );
+        if (evidence) return { done: true, value: evidence };
+      }
+      return {
+        done: false,
+        progress: {
+          results: results?.length ?? 0,
+          successfulCorrelatedContinueCalls:
+            results?.filter((result) =>
+              correlatedContinuationTask(
+                snapshot.contents,
+                result.id,
+                identity.sessionId,
+                followup,
+                identity,
+              ),
+            ).length ?? 0,
+        },
+      };
+    },
+    { timeoutMs: 6 * 60_000, stallMs: MODEL_STALL_MS },
+  );
 }
 
 async function runChiefTreeSmoke(ctx) {

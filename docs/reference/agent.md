@@ -124,9 +124,20 @@ is used for the new generation. Omitted model and thinking fields restore the
 saved session settings, while explicit definition fields override them.
 After normal mailbox cleanup, scoped historical continuation is allowed only
 when the saved assignment's persisted terminal provenance matches its accepted
-evidence and the current project assignment still authorizes the work. Missing
-or conflicting provenance, or unavailable current project authorization, fails
-closed.
+evidence, or a verified clean close/stop receipt matches the accepted request,
+exact session, and direct owner on the active Pi branch, and the current project
+assignment still authorizes the work. A clean stop can preserve a versioned
+receipt in the owner's history for a later explicit continuation; stop never
+automatically restarts unfinished work. Missing acceptance, partial/unknown
+closure, conflicting provenance, or unavailable current project authorization
+fails closed. Receipt persistence for a foreign owner requires shutdown,
+quiescence/exclusion, and history revalidation, and may be unavailable even
+when cleanup succeeds. Persistence is not crash-atomic. A root controller may
+access a recursively owned descendant only when complete durable ancestry is
+proven, with matching active-branch acceptance or closure evidence at every
+owner edge. This does not give a Manager supervising a Lead ownership of the
+Lead's Agents; physical cleanup alone does not prove nested continuation
+eligibility.
 Concurrent or otherwise conflicting managed representations of the exact
 session fail closed. The controller's own active Pi session cannot be continued
 to itself.

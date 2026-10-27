@@ -364,6 +364,8 @@ test("parent delegates two same-definition children with exact ownership", async
   };
   (context as any).thinkingLevel = "high";
   const mailboxes: string[] = [];
+  const childSessionIds: string[] = [];
+  const childSessionFiles: string[] = [];
   try {
     for (const handler of pi.events.get("session_start") ?? [])
       await handler(undefined, context);
@@ -512,6 +514,16 @@ test("parent delegates two same-definition children with exact ownership", async
       3,
     );
     assert.equal(lifecycle.createdTabs(), 0);
+    for (const state of mailboxes.map((mailbox) => readAgentState(mailbox)!)) {
+      childSessionIds.push(state.piSessionId);
+      childSessionFiles.push(state.piSessionFile!);
+      writeValidPiSessionFile({
+        id: state.piSessionId,
+        path: state.piSessionFile!,
+        cwd: state.cwd,
+      });
+      registerNativeAgentSession(state);
+    }
     for (const label of labels) {
       const beforeClose = readAgentState(agentMailboxPath(WORKSPACE, label))!;
       const closed = await pi.tools
@@ -548,6 +560,9 @@ test("parent delegates two same-definition children with exact ownership", async
     for (const handler of pi.events.get("session_shutdown") ?? []) handler();
     resetAgentMailbox(parentMailbox);
     for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
+    for (const sessionId of childSessionIds) nativeSessions.delete(sessionId);
+    for (const sessionFile of childSessionFiles)
+      realFs.rmSync(sessionFile, { force: true });
     for (const [name] of files) realFs.unlinkSync(join(PI_AGENTS_DIR, name));
   }
 });
@@ -11452,6 +11467,136 @@ test("continuation after a later unscoped assignment does not revive prior requi
     realFs.rmSync(promptPath, { force: true });
     realFs.rmSync(plan.path, { force: true });
     realFs.rmSync(review.path, { force: true });
+  }
+});
+
+test("verified stop proof continues the exact accepted saved session", async () => {
+  setLeadEnvironment();
+  const name = `stop-proof-${randomUUID().slice(0, 8)}`;
+  const sessionId = DEFAULT_PI_SESSION_ID;
+  const path = join(PI_AGENT_ROOT, `${name}-session.jsonl`);
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  const promptPath = join(PI_AGENT_ROOT, `${name}-prompt.md`);
+  const requestId = randomUUID();
+  const state = managedState(name);
+  const session = {
+    id: sessionId,
+    path,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: { sessionId, definition: name, label: name },
+      },
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-required-evidence",
+        data: {
+          version: 1,
+          sessionId,
+          requestId,
+          runId: state.runId,
+          ownerSessionId: state.ownerSessionId,
+          workspaceId: state.workspaceId,
+          agentLabel: name,
+          paneId: state.paneId,
+          inheritedEvidence: [],
+          localEvidence: [],
+        },
+      },
+    ],
+  };
+  writeValidPiSessionFile(session);
+  realFs.writeFileSync(promptPath, "saved prompt", "utf8");
+  writePromptDefinition(definitionPath, name, promptPath);
+  nativeSessions.set(sessionId, session);
+  const savedMailbox = agentMailboxPath(WORKSPACE, name);
+  resetAgentMailbox(savedMailbox);
+  let continued: RequestRecord | undefined;
+  const startup = startupExecutor(
+    name,
+    () => sessionId,
+    undefined,
+    undefined,
+    false,
+    undefined,
+    "/tmp",
+    AGENT_ID,
+    false,
+    false,
+    false,
+    (request) => {
+      continued = request;
+    },
+  );
+  const proof = {
+    owner_session_id: state.ownerSessionId,
+    session_id: sessionId,
+    session_path: path,
+    run_id: state.runId,
+    request_id: requestId,
+    agent: name,
+    definition: name,
+    pane_id: state.paneId,
+    workspace_id: state.workspaceId,
+  };
+  const pi = fakePi({
+    exec: startup.exec,
+    entries: [
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "delegate_agent",
+          isError: false,
+          details: {
+            ok: true,
+            owner_session_id: state.ownerSessionId,
+            session_id: sessionId,
+            session_path: path,
+            request_id: requestId,
+            agent: name,
+            definition: name,
+          },
+        },
+      },
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-closed-assignment",
+        data: { version: 1, proof },
+      },
+    ],
+  });
+  registerExtension!(pi.pi as never);
+  seedLeadRole(fakeContext(pi.entries));
+  await pi.events.get("session_start")![0](undefined, fakeContext(pi.entries));
+  try {
+    const result = await registeredAgentTool(pi, "continue").execute(
+      "continue-after-verified-stop",
+      { session: path, task: "continue the accepted assignment" },
+      undefined,
+      undefined,
+      ownedSessionContext(sessionId, name),
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.session_id, sessionId);
+    assert.notEqual(result.details.run_id, state.runId);
+    assert.notEqual(result.details.request_id, requestId);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.ok(continued);
+    assert.equal(continued!.ownerSessionId, state.ownerSessionId);
+    assert.equal(continued!.agentLabel, name);
+    assert.notEqual(continued!.runId, state.runId);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    startup.stopMailboxConsumer();
+    nativeSessions.delete(sessionId);
+    resetAgentMailbox(startup.mailbox);
+    resetAgentMailbox(savedMailbox);
+    realFs.rmSync(path, { force: true });
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(promptPath, { force: true });
   }
 });
 

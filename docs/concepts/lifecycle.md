@@ -213,14 +213,25 @@ authorized definition configuration. Its omitted model and thinking fields
 restore the saved session settings, while explicit definition fields override
 them. The caller cannot rename the continued session.
 After normal mailbox cleanup, scoped continuation is allowed only when the
-saved assignment evidence matches its terminal result, or a successful clean
-close receipt matches both the accepted assignment and exact session, and the
-project remains currently authorized. Close receipts with cleanup warnings,
-missing acceptance/closure correlation, or conflicting provenance fail closed.
-Closing a generation abandons its unfinished task; continuation starts a new
-generation from the saved conversation and does not replay its unfinished work.
-A crash after mailbox cleanup but before Pi persists the close result leaves no
-historical closure proof, so continuation fails closed.
+saved assignment evidence matches its terminal result, or verified closure
+evidence matches the accepted request, exact session, and exact owner on the
+active Pi branch, and the project remains currently authorized. A clean
+`close_agent` or stop may preserve a versioned owner-history receipt for
+explicit exact-session continuation. Stop never automatically restarts an
+Agent. Closing or stopping abandons unfinished work; continuation starts a new
+generation from the saved conversation and does not replay that work.
+
+The direct owner may continue its Agent. A root controller may also access a
+recursively owned descendant only when complete durable ancestry is proven,
+with matching active-branch acceptance or closure evidence at every owner
+edge; this does not give a Manager supervising a Lead ownership of the Lead's
+Agents. Current definition and project authorization still apply. When stopping
+a foreign owner's tree, continuity receipts are written only after owner
+shutdown, quiescence/exclusion, and history revalidation; safe persistence may
+be unavailable even when physical cleanup succeeds. Partial, unknown, or
+conflicting closure provenance fails closed. Closure and receipt persistence
+are not crash-atomic, so a crash in between may leave the stopped Agent without
+continuation proof.
 Session continuation does not retain the old Herdr tab. A still-live
 generation may be restored from its exact managed identity, while ordinary
 same-workspace tab movement remains presentation-only and does not change
