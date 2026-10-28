@@ -435,21 +435,28 @@ function validateEffectiveAgentReferences(
         throw new Error(
           `agent ${definition.name} references missing agent definition ${reference}`,
         );
-  const byName = new Map(
-    definitions.map((definition) => [definition.name, definition]),
-  );
   for (const definition of definitions)
     if (SUPERVISOR_AGENT_FIELDS.has(definition.name))
-      for (const reference of definition.frontmatter.agents ?? []) {
-        if (isReservedRoleDefinition(reference))
-          throw new Error(
-            `agent ${definition.name} references reserved agent definition ${reference}`,
-          );
-        if (!byName.has(reference))
-          throw new Error(
-            `agent ${definition.name} references missing agent definition ${reference}`,
-          );
-      }
+      validateSupervisorAgentDefinitionReferences(definition, definitions);
+}
+
+export function validateSupervisorAgentDefinitionReferences(
+  definition: AgentDefinition,
+  definitions: readonly AgentDefinition[],
+): void {
+  const byName = new Map(
+    definitions.map((candidate) => [candidate.name, candidate]),
+  );
+  for (const reference of definition.frontmatter.agents ?? []) {
+    if (isReservedRoleDefinition(reference))
+      throw new Error(
+        `agent ${definition.name} references reserved agent definition ${reference}`,
+      );
+    if (!byName.has(reference))
+      throw new Error(
+        `agent ${definition.name} references missing agent definition ${reference}`,
+      );
+  }
 }
 
 function validateManagedLeadLayer(definition: AgentDefinition): void {

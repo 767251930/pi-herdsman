@@ -3971,6 +3971,16 @@ test("malformed definitions do not abort ordinary lead startup", async () => {
   const context = fakeContext() as any;
   try {
     await pi.events.get("session_start")![0](undefined, context);
+    const promptEvent: any = {
+      systemPrompt: "base",
+      systemPromptOptions: { sections: {}, contextFiles: [] },
+    };
+    await pi.events.get("before_agent_start")![0](promptEvent, context);
+    assert.match(
+      promptEvent.systemPromptOptions.sections.pi_herdsman_lead_execution,
+      /Delegate bounded execution work when an Agent can reasonably own it/,
+      "Agent discovery failure must preserve the valid role profile",
+    );
     assert.ok(
       pi.calls.some((args) => isApiSnapshot(args)),
       "agent recovery must still run after roster discovery fails",
@@ -3986,6 +3996,50 @@ test("malformed definitions do not abort ordinary lead startup", async () => {
     pi.events.get("session_shutdown")?.[0]();
     realFs.rmSync(malformed, { force: true });
     delete process.env.HERDR_PANE_ID;
+  }
+});
+
+test("role discovery failure preserves the valid Lead Agent roster", async () => {
+  setLeadEnvironment();
+  const roleDirectory = join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles");
+  realFs.mkdirSync(roleDirectory, { recursive: true });
+  const malformedRole = join(roleDirectory, "malformed-session-role.md");
+  writeFileSync(
+    malformedRole,
+    "---\nname: malformed-session-role\nagents: [\n---\nmalformed role\n",
+  );
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(pi.entries) as any;
+  try {
+    await pi.events.get("session_start")![0](undefined, context);
+    const event: any = {
+      systemPrompt: "base",
+      systemPromptOptions: { sections: {}, contextFiles: [] },
+    };
+    await pi.events.get("before_agent_start")![0](event, context);
+    const snapshot = event.systemPromptOptions.sections.agent_definitions;
+    assert.ok(snapshot);
+    const roster = JSON.parse(
+      snapshot.split("\n\nThis is the session-start definition snapshot.")[0],
+    );
+    assert.ok(roster.some(({ name }: { name: string }) => name === "scout"));
+    assert.equal(
+      event.systemPromptOptions.sections.pi_herdsman_lead_execution,
+      undefined,
+      "role discovery failure must not activate a Lead execution profile",
+    );
+    assert.ok(
+      pi.entries.some(
+        (entry: any) =>
+          entry.customType === "pi_herdsman_definition_error" &&
+          /malformed-session-role/.test(entry.data?.error),
+      ),
+      "role discovery failure must retain its diagnostic",
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    realFs.rmSync(malformedRole, { force: true });
   }
 });
 
@@ -4734,14 +4788,22 @@ test("delegating agents receive only their allowed definition roster", async () 
   setLeadEnvironment();
 });
 
-test("replaced Manager body keeps its protected prompt contract and tools", async () => {
+test("Manager disabled allowlist targets do not block other Agent delegation", async () => {
   setLeadEnvironment();
-  realFs.mkdirSync(join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles"), {
-    recursive: true,
-  });
+  const roleDirectory = join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles");
+  realFs.mkdirSync(roleDirectory, { recursive: true });
+  const managerProfile = join(roleDirectory, "manager.md");
+  const priorManagerProfile = realFs.existsSync(managerProfile)
+    ? readFileSync(managerProfile, "utf8")
+    : undefined;
+  const disabledHelper = join(PI_AGENTS_DIR, "disabled-helper.md");
   writeFileSync(
-    join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles", "manager.md"),
-    "---\nname: manager\nbodyMode: replace\n---\nCustom Manager strategy",
+    managerProfile,
+    "---\nname: manager\nbodyMode: replace\nagents: [scout, disabled-helper]\n---\nCustom Manager strategy",
+  );
+  writeFileSync(
+    disabledHelper,
+    "---\nname: disabled-helper\nenabled: false\n---\nDisabled helper",
   );
   process.env.HERDR_PANE_ID = "manager-pane";
   process.env.HERDR_TAB_ID = "manager-tab";
@@ -4858,6 +4920,17 @@ test("replaced Manager body keeps its protected prompt contract and tools", asyn
         pi.pi.getActiveTools().includes(name),
         `${name} is active for the Manager`,
       );
+    assert.ok(pi.pi.getActiveTools().includes("delegate_agent"));
+    const listed = await pi.tools
+      .find((tool) => tool.name === "list_agents")!
+      .execute("list", {}, undefined, undefined, context);
+    assert.deepEqual(
+      listed.details.agent_definitions.map(
+        (definition: { name: string }) => definition.name,
+      ),
+      ["scout"],
+      "the enabled allowlisted Agent remains delegable beside a disabled target",
+    );
     const mergeTool = pi.tools.find((tool) => tool.name === "integrate_branch");
     assert.ok(mergeTool);
     assertPortableToolSchema(mergeTool);
@@ -4902,6 +4975,10 @@ test("replaced Manager body keeps its protected prompt contract and tools", asyn
     assert.doesNotMatch(restored, /Custom Manager strategy/);
   } finally {
     await pi.events.get("session_shutdown")?.[0]();
+    realFs.rmSync(disabledHelper, { force: true });
+    if (priorManagerProfile === undefined)
+      realFs.rmSync(managerProfile, { force: true });
+    else writeFileSync(managerProfile, priorManagerProfile);
     setLeadEnvironment();
   }
 });

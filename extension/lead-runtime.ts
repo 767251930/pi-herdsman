@@ -136,7 +136,7 @@ import {
   discoverRoleDefinition,
   discoverRoleDefinitions,
   discoverAgentDefinitions,
-  validateAgentDefinitionReferences,
+  validateSupervisorAgentDefinitionReferences,
   isReservedRoleDefinition,
   isRuntimeRoleDefinition,
   matchesToolPattern,
@@ -3018,7 +3018,7 @@ export function registerLeadRuntime(
       );
       if (profile?.valid) {
         try {
-          validateAgentDefinitionReferences(
+          validateSupervisorAgentDefinitionReferences(
             profile.definition,
             discoverAgentDefinitions(
               options.leadRuntime!.leadContext!.isProjectTrusted()
@@ -4842,9 +4842,14 @@ export function registerLeadRuntime(
     normalizeBaseTools: leadToolState.normalizeBaseTools,
     prepareLeadExecution,
     discoverSessionDefinitions: async (ctx: ExtensionContext) => {
-      const roleDefinitions = discoverRoleDefinitions(
-        ctx.isProjectTrusted() ? { projectRoot: ctx.cwd } : {},
-      );
+      let roleDefinitions: AgentDefinition[] = [];
+      try {
+        roleDefinitions = discoverRoleDefinitions(
+          ctx.isProjectTrusted() ? { projectRoot: ctx.cwd } : {},
+        );
+      } catch (error) {
+        options.sessionStartOptions.appendDefinitionError(ctx, error);
+      }
       let definitions: AgentDefinition[] = [];
       try {
         definitions = (await options.commandHost.contextAgentDefinitions(ctx))
