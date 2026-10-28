@@ -10702,10 +10702,14 @@ async function prepareSupervisorAgent(ctx) {
     join(definitions, "smoke-agent.md"),
     `---\nname: smoke-agent\nmodel: smoke-faux/supervisor-agent\nextensions: [${JSON.stringify(ctx.simulatedProviderExtension)}]\n---\nReturn the requested completion marker.\n`,
   );
-  const globalAgents = join(ctx.paths.piAgent, "agents");
-  await mkdir(globalAgents, { recursive: true });
+  const globalRoleProfiles = join(
+    ctx.paths.piAgent,
+    "pi-herdsman",
+    "role-profiles",
+  );
+  await mkdir(globalRoleProfiles, { recursive: true });
   await writeFile(
-    join(globalAgents, "chief.md"),
+    join(globalRoleProfiles, "chief.md"),
     "---\nname: chief\nagents: [smoke-agent]\n---\n",
   );
 }
