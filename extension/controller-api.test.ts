@@ -3545,6 +3545,7 @@ async function runManagerStartupScenario(
     | "staff-message-mismatch"
     | "staff-message-contention"
     | "staff-message-contention-replaced"
+    | "staff-message-assignment-replaced"
     | "staff-message-timeout"
     | "delayed-herdr-session"
     | "conflict"
@@ -3571,6 +3572,8 @@ async function runManagerStartupScenario(
     | "active-live"
     | "active-live-inspect-revoked"
     | "active-live-inspect-lease-replaced"
+    | "active-live-inspect-assignment-replaced"
+    | "active-live-wrong-worktree"
     | "active-live-mismatch"
     | "active-missing"
     | "active-missing-no-session"
@@ -3660,6 +3663,8 @@ async function runManagerStartupScenario(
     mode === "active-live" ||
     mode === "active-live-inspect-revoked" ||
     mode === "active-live-inspect-lease-replaced" ||
+    mode === "active-live-inspect-assignment-replaced" ||
+    mode === "active-live-wrong-worktree" ||
     [
       "close-resume",
       "close-failure",
@@ -3693,6 +3698,10 @@ async function runManagerStartupScenario(
   let gitListOutput = "";
   let gitBranchOutput = "smoke/recover";
   let gitCwd = "/tmp";
+  const observedLeadWorkspace = () =>
+    mode === "active-live-wrong-worktree" ? WORKSPACE : childWorkspace;
+  const observedLeadCwd = () =>
+    mode === "active-live-wrong-worktree" ? gitCwd : childPath;
   let worktreeListCalls = 0;
   let invalidTopologyCall = Number.POSITIVE_INFINITY;
   let inspectionReached!: () => void;
@@ -4122,6 +4131,7 @@ async function runManagerStartupScenario(
     if (command === "herdr" && args[0] === "pane" && args[1] === "run")
       return respond({});
     if (command === "herdr" && args[0] === "agent" && args[1] === "send-keys") {
+      leadStopAttempts++;
       if (
         [
           "close-resume",
@@ -4140,8 +4150,6 @@ async function runManagerStartupScenario(
           "ctrl+d",
         ]);
       if (mode === "close-failure") throw new Error("stop refused");
-      if (mode === "close-tree" || mode === "close-tree-failure")
-        leadStopAttempts++;
       if (mode === "close-tree") {
         assert.equal(
           closedTreePanes.size,
@@ -4357,10 +4365,10 @@ async function runManagerStartupScenario(
                                     ? randomUUID()
                                     : childSession,
                               },
-                      workspace_id: childWorkspace,
+                      workspace_id: observedLeadWorkspace(),
                       pane_id: "child-pane",
                       tab_id: "child-tab",
-                      cwd: childPath,
+                      cwd: observedLeadCwd(),
                     },
                   ]
                 : []),
@@ -4469,6 +4477,7 @@ async function runManagerStartupScenario(
             : []),
           ...((mode === "active-live" && !hideActiveLead) ||
           mode.startsWith("active-live-inspect-") ||
+          mode === "active-live-wrong-worktree" ||
           mode === "active-live-mismatch" ||
           (started && startupObservations >= 3) ||
           ([
@@ -4484,10 +4493,10 @@ async function runManagerStartupScenario(
                 { length: mode === "identity-ambiguity" && delivered ? 2 : 1 },
                 () => ({
                   agent_session: childIdentity(),
-                  workspace_id: childWorkspace,
+                  workspace_id: observedLeadWorkspace(),
                   pane_id: "child-pane",
                   tab_id: "child-tab",
-                  cwd: childPath,
+                  cwd: observedLeadCwd(),
                 }),
               )
             : []),
@@ -4532,10 +4541,10 @@ async function runManagerStartupScenario(
         agent:
           args[2] === "lead" || args[2] === "child-pane"
             ? {
-                workspace_id: childWorkspace,
+                workspace_id: observedLeadWorkspace(),
                 pane_id: "child-pane",
                 tab_id: "child-tab",
-                cwd: childPath,
+                cwd: observedLeadCwd(),
                 agent_session: childIdentity(),
               }
             : managerAgent,
@@ -4750,6 +4759,8 @@ async function runManagerStartupScenario(
       "active-live",
       "active-live-inspect-revoked",
       "active-live-inspect-lease-replaced",
+      "active-live-inspect-assignment-replaced",
+      "active-live-wrong-worktree",
       "active-live-mismatch",
       "active-missing",
       "active-missing-no-session",
@@ -4833,6 +4844,7 @@ async function runManagerStartupScenario(
       if (
         mode === "active-live" ||
         mode.startsWith("active-live-inspect-") ||
+        mode === "active-live-wrong-worktree" ||
         mode === "active-live-mismatch"
       )
         writeLeadCoordinationState(supervisionRuntime(), {
@@ -5031,8 +5043,14 @@ async function runManagerStartupScenario(
         () =>
           pi.tools
             .find((tool) => tool.name === "stop_lead")!
-            .execute("close", { session: staleId }, undefined, undefined, ctx),
-        /not an exact current project assignment/,
+            .execute(
+              "close",
+              { branch: "smoke/recover" },
+              undefined,
+              undefined,
+              ctx,
+            ),
+        /Project assignment was not found/,
       );
       assert.equal(started, true);
       const liveAgents = JSON.parse(
@@ -5063,6 +5081,63 @@ async function runManagerStartupScenario(
       return;
     }
     if (activeMode) {
+      if (mode === "active-live-wrong-worktree") {
+        const listing = await pi.tools
+          .find((tool) => tool.name === "list_staff")!
+          .execute("list", {}, undefined, undefined, ctx);
+        assert.deepEqual(
+          listing.details.work
+            .filter((work: any) => work.branch === "smoke/recover")
+            .map((work: any) => work.status),
+          ["conflict"],
+        );
+        const before = listChiefMessagePaths(supervisionRuntime(), staleId).map(
+          (path) => readChiefMessage(path),
+        );
+        await assert.rejects(
+          pi.tools
+            .find((tool) => tool.name === "message_staff")!
+            .execute(
+              "message",
+              {
+                branch: "smoke/recover",
+                message: "CONFLICT_MUST_NOT_PUBLISH",
+              },
+              undefined,
+              undefined,
+              ctx,
+            ),
+          /Assigned work is not uniquely active/,
+        );
+        await assert.rejects(
+          pi.tools
+            .find((tool) => tool.name === "stop_lead")!
+            .execute(
+              "stop",
+              { branch: "smoke/recover" },
+              undefined,
+              undefined,
+              ctx,
+            ),
+          /Assigned work is not uniquely active/,
+        );
+        assert.deepEqual(
+          listChiefMessagePaths(supervisionRuntime(), staleId).map((path) =>
+            readChiefMessage(path),
+          ),
+          before,
+        );
+        assert.equal(started, true);
+        assert.equal(leadStopAttempts, 0);
+        assert.ok(
+          JSON.parse(
+            (await exec("herdr", ["agent", "list"])).stdout,
+          ).result.agents.some(
+            (agent: any) => agent.agent_session?.value === staleId,
+          ),
+        );
+        return;
+      }
       if (mode === "active-live-mismatch") {
         await assert.rejects(execute(), (error: any) => {
           assert.equal(error.detail.category, "incompatible_build");
@@ -5075,7 +5150,7 @@ async function runManagerStartupScenario(
         const inspect = pi.tools.find((tool) => tool.name === "inspect_staff")!;
         const pending = inspect.execute(
           "inspect",
-          { session: staleId },
+          { branch: "smoke/recover" },
           undefined,
           undefined,
           ctx,
@@ -5087,7 +5162,16 @@ async function runManagerStartupScenario(
             repoKey,
             "smoke/recover",
           );
-        else {
+        else if (mode === "active-live-inspect-assignment-replaced") {
+          const assignment = listProjectAssignments(
+            supervisionRuntime(),
+            repoKey,
+          )[0]!;
+          writeProjectAssignment(supervisionRuntime(), {
+            ...assignment,
+            id: randomUUID(),
+          });
+        } else {
           const descriptorPath = managerDescriptorPath(
             supervisionRuntime(),
             WORKSPACE,
@@ -5104,7 +5188,7 @@ async function runManagerStartupScenario(
         resumeInspection();
         await assert.rejects(
           pending,
-          mode === "active-live-inspect-revoked"
+          mode !== "active-live-inspect-lease-replaced"
             ? /Lead changed during inspection/
             : /Manager lease is no longer active|Lead changed during inspection/,
         );
@@ -5159,6 +5243,43 @@ async function runManagerStartupScenario(
           supervisionRuntime(),
           repoKey,
         )[0]!;
+        realFs.writeFileSync(
+          childSessionPath,
+          [
+            JSON.stringify({
+              type: "session",
+              version: 3,
+              id: staleId,
+              timestamp: new Date().toISOString(),
+              cwd: childPath,
+            }),
+            JSON.stringify({
+              type: "message",
+              id: "evidence",
+              parentId: null,
+              timestamp: new Date().toISOString(),
+              message: {
+                role: "user",
+                content: "assigned branch transcript evidence",
+                timestamp: Date.now(),
+              },
+            }),
+          ].join("\n") + "\n",
+        );
+        const transcript = await pi.tools
+          .find((tool) => tool.name === "read_staff_transcript")!
+          .execute(
+            "transcript",
+            { branch: assignment.branch },
+            undefined,
+            undefined,
+            ctx,
+          );
+        assert.equal(transcript.details.session_id, staleId);
+        assert.match(
+          transcript.details.transcript,
+          /assigned branch transcript evidence/,
+        );
         assert.equal(
           assignment.piSessionFile,
           realFs.realpathSync(childSessionPath),
@@ -5202,7 +5323,9 @@ async function runManagerStartupScenario(
             `${projectAssignmentPath(supervisionRuntime(), repoKey, assignment.branch)}.lock`,
             { name: "test retirement assignment lock" },
           );
-          await assert.rejects(control("stop_lead", { session: staleId }));
+          await assert.rejects(
+            control("stop_lead", { branch: "smoke/recover" }),
+          );
           removeProjectAssignment(
             supervisionRuntime(),
             repoKey,
@@ -5224,13 +5347,17 @@ async function runManagerStartupScenario(
             ).result.panes.some((pane: any) => pane.pane_id === "child-pane"),
           );
         } else if (mode === "close-failure") {
-          await assert.rejects(control("stop_lead", { session: staleId }));
+          await assert.rejects(
+            control("stop_lead", { branch: "smoke/recover" }),
+          );
           assert.equal(
             listProjectAssignments(supervisionRuntime(), repoKey)[0]?.id,
             staleId,
           );
         } else if (mode === "close-resume") {
-          const closed = await control("stop_lead", { session: staleId });
+          const closed = await control("stop_lead", {
+            branch: "smoke/recover",
+          });
           assert.equal(closed.details.branch, "smoke/recover");
           assert.equal(
             listProjectAssignments(supervisionRuntime(), repoKey)[0]?.id,
@@ -5409,7 +5536,9 @@ async function runManagerStartupScenario(
             delegationLockPathForTest(childWorkspace, staleId),
             { name: "test delegation lifecycle" },
           );
-          await assert.rejects(control("stop_lead", { session: staleId }));
+          await assert.rejects(
+            control("stop_lead", { branch: "smoke/recover" }),
+          );
           assert.equal(started, true, "busy lifecycle must preserve the Lead");
           assert.ok(
             readAgentState(agentMailboxPath(childWorkspace, "researcher")),
@@ -5417,7 +5546,9 @@ async function runManagerStartupScenario(
           releaseDelegation();
 
           if (mode === "close-tree-failure") {
-            await assert.rejects(control("stop_lead", { session: staleId }));
+            await assert.rejects(
+              control("stop_lead", { branch: "smoke/recover" }),
+            );
             assert.equal(started, true);
             assert.equal(leadStopAttempts, 0);
             assert.equal(
@@ -5441,7 +5572,9 @@ async function runManagerStartupScenario(
             return;
           }
 
-          const closed = await control("stop_lead", { session: staleId });
+          const closed = await control("stop_lead", {
+            branch: "smoke/recover",
+          });
           assert.equal(closed.details.ok, true, JSON.stringify(closed.details));
           assert.equal(closed.details.branch, "smoke/recover");
           assert.equal(started, false, "Lead must stop after Agent cleanup");
@@ -6145,7 +6278,8 @@ async function runManagerStartupScenario(
     if (
       mode === "staff-message-mismatch" ||
       mode === "staff-message-contention" ||
-      mode === "staff-message-contention-replaced"
+      mode === "staff-message-contention-replaced" ||
+      mode === "staff-message-assignment-replaced"
     ) {
       const state = readLeadCoordinationState(
         supervisionRuntime(),
@@ -6159,7 +6293,7 @@ async function runManagerStartupScenario(
         staffMessage.execute(
           "message",
           {
-            session: childSession,
+            branch: assignment.branch,
             message: "INVALID_EVIDENCE_MUST_NOT_PUBLISH",
             files: [invalidPath],
             retain: true,
@@ -6195,7 +6329,7 @@ async function runManagerStartupScenario(
         staffMessage.execute(
           "message",
           {
-            session: childSession,
+            branch: assignment.branch,
             message: "MISMATCH_MUST_NOT_PUBLISH",
             files: [attachmentPath],
             retain: true,
@@ -6232,7 +6366,7 @@ async function runManagerStartupScenario(
       await staffMessage.execute(
         "message",
         {
-          session: childSession,
+          branch: assignment.branch,
           message: "MISMATCH_MUST_NOT_PUBLISH",
           files: [attachmentPath],
           retain: true,
@@ -6300,7 +6434,7 @@ async function runManagerStartupScenario(
         await staffMessage.execute(
           "retain-source-mutation",
           {
-            session: childSession,
+            branch: assignment.branch,
             message: "retain this exact source version",
             files: [mutationSourcePath],
             retain: true,
@@ -6350,7 +6484,7 @@ async function runManagerStartupScenario(
       await staffMessage.execute(
         "retain-same-name-attachment",
         {
-          session: childSession,
+          branch: assignment.branch,
           message: generatedNote,
           files: [sameNameAttachmentPath],
           retain: true,
@@ -6391,7 +6525,7 @@ async function runManagerStartupScenario(
       const nonRetained = await staffMessage.execute(
         "complete-text-evidence",
         {
-          session: childSession,
+          branch: assignment.branch,
           message: "Review this plan.",
           files: [attachmentPath],
           retain: false,
@@ -6444,6 +6578,7 @@ async function runManagerStartupScenario(
       if (
         mode === "staff-message-contention" ||
         mode === "staff-message-contention-replaced" ||
+        mode === "staff-message-assignment-replaced" ||
         mode === "staff-message-timeout"
       ) {
         contentionHolder = spawn(
@@ -6479,7 +6614,7 @@ async function runManagerStartupScenario(
       const retainedPromise = staffMessage.execute(
         "complete-retained-text-evidence",
         {
-          session: childSession,
+          branch: assignment.branch,
           message: "Review this retained plan.",
           files: [attachmentPath],
           retain: true,
@@ -6490,7 +6625,8 @@ async function runManagerStartupScenario(
       );
       const waitForAuthorityContention =
         mode === "staff-message-contention" ||
-        mode === "staff-message-contention-replaced"
+        mode === "staff-message-contention-replaced" ||
+        mode === "staff-message-assignment-replaced"
           ? Promise.race([
               authorityWait,
               retainedPromise.then(
@@ -6548,6 +6684,41 @@ async function runManagerStartupScenario(
         );
         assert.ok(snapshotContents.includes(retainedPlan));
         assert.ok(snapshotContents.includes("Review this retained plan."));
+      } else if (mode === "staff-message-assignment-replaced") {
+        await waitForAuthorityContention;
+        const replacement = {
+          version: 2 as const,
+          id: randomUUID(),
+          repoKey,
+          branch: assignment.branch,
+          text: "replacement assignment",
+        };
+        // Simulate the authority lock holder publishing the replacement before releasing it.
+        realFs.writeFileSync(
+          projectAssignmentPath(
+            supervisionRuntime(),
+            repoKey,
+            assignment.branch,
+          ),
+          JSON.stringify(replacement),
+        );
+        contentionHolder!.stdin!.end("release");
+        await assert.rejects(retainedPromise);
+        assert.deepEqual(
+          listProjectAssignments(supervisionRuntime(), repoKey).find(
+            (item) => item.branch === assignment.branch,
+          ),
+          replacement,
+        );
+        assert.equal(
+          listChiefMessagePaths(supervisionRuntime(), childSession).length,
+          1,
+        );
+        assert.deepEqual(
+          listChiefMessagePaths(supervisionRuntime(), replacement.id),
+          [],
+        );
+        return;
       } else if (mode === "staff-message-contention-replaced") {
         await waitForAuthorityContention;
         assert.equal(
@@ -6732,7 +6903,13 @@ async function runManagerStartupScenario(
       assert.equal(assignment.id, childSession);
       const closed = await pi.tools
         .find((tool) => tool.name === "stop_lead")!
-        .execute("close", { session: childSession }, undefined, undefined, ctx);
+        .execute(
+          "close",
+          { branch: assignment.branch },
+          undefined,
+          undefined,
+          ctx,
+        );
       assert.equal(closed.details.ok, true);
       assert.equal(started, false);
       assert.equal(
@@ -6775,12 +6952,16 @@ test("Manager activates only after mocked Lead-state publication", () =>
   runManagerStartupScenario("success"));
 test("Manager preserves project assignment and skips notification for incompatible Lead", () =>
   runManagerStartupScenario("incompatible-build"));
+test("Manager rejects branch messaging and stopping for conflicted assigned work", () =>
+  runManagerStartupScenario("active-live-wrong-worktree"));
 test("Manager message_staff rejects incompatible Leads and delivers complete attachments", () =>
   runManagerStartupScenario("staff-message-mismatch"));
 test("Manager message_staff waits for cross-process assignment authority before retaining evidence", () =>
   runManagerStartupScenario("staff-message-contention"));
 test("Manager message_staff rejects retained evidence after lease replacement while waiting for assignment authority", () =>
   runManagerStartupScenario("staff-message-contention-replaced"));
+test("Manager message_staff does not publish to either recipient after assignment replacement", () =>
+  runManagerStartupScenario("staff-message-assignment-replaced"));
 test("Manager message_staff timeout leaves prepared evidence unreferenced and publishes no message", () =>
   runManagerStartupScenario("staff-message-timeout"));
 test("Manager delegates large attachment evidence outside coordination limits", () =>
@@ -6869,6 +7050,8 @@ test("Manager inspection rejects evidence after assignment revocation", () =>
   runManagerStartupScenario("active-live-inspect-revoked"));
 test("Manager inspection rejects evidence after lease replacement", () =>
   runManagerStartupScenario("active-live-inspect-lease-replaced"));
+test("Manager inspection rejects evidence after assignment replacement", () =>
+  runManagerStartupScenario("active-live-inspect-assignment-replaced"));
 test("Manager resume reports incompatible Lead builds as resume_work", () =>
   runManagerStartupScenario("active-live-mismatch"));
 test("Manager rejects stopping an unassigned direct Lead", () =>
