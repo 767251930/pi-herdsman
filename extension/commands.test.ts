@@ -8360,9 +8360,10 @@ async function managerDelegateAssignmentTest(
     git(["worktree", "add", "-b", `fixture-${randomUUID()}`, childCwd]);
   new ProjectTrustStore(PI_AGENT_ROOT).set(PI_AGENT_ROOT, ancestorDecision);
   t.after(() => new ProjectTrustStore(PI_AGENT_ROOT).set(PI_AGENT_ROOT, null));
-  new ProjectTrustStore(PI_AGENT_ROOT).set(childCwd, targetDecision);
+  const trustPath = extendedPaths ? toNamespacedPath(childCwd) : childCwd;
+  new ProjectTrustStore(PI_AGENT_ROOT).set(trustPath, targetDecision);
   const targetTrusted = (targetDecision ?? ancestorDecision) === true;
-  t.after(() => new ProjectTrustStore(PI_AGENT_ROOT).set(childCwd, null));
+  t.after(() => new ProjectTrustStore(PI_AGENT_ROOT).set(trustPath, null));
   const managedLeadDir = join(childCwd, ".pi", "pi-herdsman", "roles");
   realFs.mkdirSync(managedLeadDir, { recursive: true });
   realFs.writeFileSync(
@@ -8596,7 +8597,7 @@ async function managerDelegateAssignmentTest(
         root_pane: { pane_id: "child-pane", tab_id: "child-tab" },
         worktree: {
           branch: createdBranch,
-          path: extendedPaths ? toNamespacedPath(childCwd) : childCwd,
+          path: trustPath,
         },
       });
     }
