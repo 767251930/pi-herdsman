@@ -35,6 +35,8 @@ export const nativeSessions = new Map<
     sessionName?: string;
   }
 >();
+const { SessionManager: nativeSessionManager } =
+  await import("@earendil-works/pi-coding-agent");
 export let sessionOpenError: unknown;
 export let failNextMailboxWrite = false;
 export let failNextRequestRemoval = false;
@@ -118,6 +120,7 @@ const {
   buildContextEntries: nativeBuildContextEntries,
   buildSessionProjection: nativeBuildSessionProjection,
   CURRENT_SESSION_VERSION: nativeCurrentSessionVersion,
+  ProjectTrustStore: NativeProjectTrustStore,
   parseFrontmatter: nativeParseFrontmatter,
   parseSessionEntries: nativeParseSessionEntries,
   truncateTail: nativeTruncateTail,
@@ -316,6 +319,7 @@ mock.module("@earendil-works/pi-coding-agent", {
     buildSessionProjection: nativeBuildSessionProjection,
     CURRENT_SESSION_VERSION: nativeCurrentSessionVersion,
     getAgentDir: () => PI_AGENT_ROOT,
+    ProjectTrustStore: NativeProjectTrustStore,
     parseFrontmatter: nativeParseFrontmatter,
     parseSessionEntries: nativeParseSessionEntries,
     loadProjectContextFiles: ({ cwd }: { cwd: string }) => {
@@ -323,6 +327,8 @@ mock.module("@earendil-works/pi-coding-agent", {
       return [];
     },
     SessionManager: {
+      inMemory: (...args: any[]) =>
+        (nativeSessionManager as any).inMemory(...args),
       findById: (cwd: string, id: string) =>
         [...nativeSessions.values()].find(
           (session) => session.id === id && session.cwd === cwd,

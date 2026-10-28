@@ -103,7 +103,7 @@ Ordinary usage retains its owned-session warning.
 
 ## `/herdsman definitions`
 
-Opens a native category menu with `Agent definitions` and `Role profiles`.
+Opens the native `Agents & Roles` category menu with `Agents` and `Roles`.
 Each category lists effective definitions; reserved roles appear in their
 canonical role order. Project definitions are included when Pi considers the
 project trusted. Each definition shows contributing `bundled`, `project`, and/or

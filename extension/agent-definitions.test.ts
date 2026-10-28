@@ -525,13 +525,13 @@ test("reserves the layered managed Lead definition outside the Agent roster", ()
   const project = mkdtempSync(
     join(tmpdir(), "pi-herdsman-managed-lead-project-"),
   );
-  const projectAgents = join(project, ".pi", "agents");
+  const projectAgents = join(project, ".pi", "pi-herdsman", "roles");
   const global = mkdtempSync(
     join(tmpdir(), "pi-herdsman-managed-lead-global-"),
   );
-  const globalAgents = join(global, "agents");
+  const globalAgents = join(global, "pi-herdsman", "roles");
   mkdirSync(projectAgents, { recursive: true });
-  mkdirSync(globalAgents);
+  mkdirSync(globalAgents, { recursive: true });
 
   const bundled = withPiAgentDir(global, () =>
     discoverRoleDefinition(MANAGED_LEAD_DEFINITION_NAME),
@@ -618,15 +618,16 @@ test("reserves the layered managed Lead definition outside the Agent roster", ()
     new RegExp(projectPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
   );
 
+  mkdirSync(join(global, "agents"), { recursive: true });
   writeFileSync(
-    join(globalAgents, "bad.md"),
+    join(global, "agents", "bad.md"),
     '---\nname: bad\nagents: ["managed-lead"]\n---',
   );
   assert.throws(
     () => withPiAgentDir(global, () => discoverAgentDefinitions()),
     /agent bad references missing agent definition managed-lead/,
   );
-  unlinkSync(join(globalAgents, "bad.md"));
+  unlinkSync(join(global, "agents", "bad.md"));
 
   for (const [field, value] of [
     ["enabled", "false"],
@@ -662,8 +663,8 @@ test("reserves the layered managed Lead definition outside the Agent roster", ()
 
 test("reserves independent runtime role profiles with narrow fields", () => {
   const global = mkdtempSync(join(tmpdir(), "pi-herdsman-lead-profiles-"));
-  const agents = join(global, "agents");
-  mkdirSync(agents);
+  const agents = join(global, "pi-herdsman", "roles");
+  mkdirSync(agents, { recursive: true });
   const names = withPiAgentDir(global, () =>
     discoverRoleDefinitions().map(({ name }) => name),
   );
@@ -747,11 +748,11 @@ test("reserves independent runtime role profiles with narrow fields", () => {
 
 test("Manager and Chief overlays use reserved runtime-profile scope", () => {
   const project = mkdtempSync(join(tmpdir(), "pi-herdsman-role-project-"));
-  const projectAgents = join(project, ".pi", "agents");
+  const projectAgents = join(project, ".pi", "pi-herdsman", "roles");
   const global = mkdtempSync(join(tmpdir(), "pi-herdsman-role-global-"));
-  const globalAgents = join(global, "agents");
+  const globalAgents = join(global, "pi-herdsman", "roles");
   mkdirSync(projectAgents, { recursive: true });
-  mkdirSync(globalAgents);
+  mkdirSync(globalAgents, { recursive: true });
   const managerProject = join(projectAgents, "manager.md");
   const managerGlobal = join(globalAgents, "manager.md");
   const chiefGlobal = join(globalAgents, "chief.md");
@@ -820,8 +821,8 @@ test("Manager and Chief overlays use reserved runtime-profile scope", () => {
 
 test("Manager and Chief agent allowlists validate effective targets", () => {
   const global = mkdtempSync(join(tmpdir(), "pi-herdsman-supervisor-agents-"));
-  const agents = join(global, "agents");
-  mkdirSync(agents);
+  const agents = join(global, "pi-herdsman", "roles");
+  mkdirSync(agents, { recursive: true });
   writeFileSync(
     join(agents, "manager.md"),
     "---\nname: manager\nagents: [scout, disabled-helper]\n---\n",
@@ -830,8 +831,9 @@ test("Manager and Chief agent allowlists validate effective targets", () => {
     join(agents, "chief.md"),
     "---\nname: chief\nagents: [reviewer]\n---\n",
   );
+  mkdirSync(join(global, "agents"), { recursive: true });
   writeFileSync(
-    join(agents, "disabled-helper.md"),
+    join(global, "agents", "disabled-helper.md"),
     "---\nname: disabled-helper\nenabled: false\n---\n",
   );
 
@@ -875,11 +877,11 @@ test("supervisor allowlists use effective overlays and layered Agent targets", (
   const project = mkdtempSync(
     join(tmpdir(), "pi-herdsman-supervisor-project-"),
   );
-  const projectAgents = join(project, ".pi", "agents");
+  const projectAgents = join(project, ".pi", "pi-herdsman", "roles");
   const global = mkdtempSync(join(tmpdir(), "pi-herdsman-supervisor-global-"));
-  const globalAgents = join(global, "agents");
+  const globalAgents = join(global, "pi-herdsman", "roles");
   mkdirSync(projectAgents, { recursive: true });
-  mkdirSync(globalAgents);
+  mkdirSync(globalAgents, { recursive: true });
   writeFileSync(
     join(projectAgents, "manager.md"),
     "---\nname: manager\nagents: [missing-project-target]\n---\n",
@@ -892,7 +894,8 @@ test("supervisor allowlists use effective overlays and layered Agent targets", (
     join(globalAgents, "chief.md"),
     "---\nname: chief\nagents: [project-helper]\n---\n",
   );
-  const projectHelperPath = join(projectAgents, "project-helper.md");
+  const projectHelperPath = join(project, ".pi", "agents", "project-helper.md");
+  mkdirSync(join(project, ".pi", "agents"), { recursive: true });
   writeFileSync(
     projectHelperPath,
     "---\nname: project-helper\n---\nProject helper",
@@ -1455,7 +1458,7 @@ test("overlays a bundled definition and extends the roster", () => {
     assert.equal(implementer.path, overridePath);
     assert.match(
       implementer.extensionSource!.split(sep).join("/"),
-      /extension\/agent-definitions\/implementer\.md$/,
+      /extension\/agents\/implementer\.md$/,
     );
     assert.equal(implementer.overrideSource, overridePath);
     assert.equal(implementer.frontmatter.description, "User implementation");
@@ -1881,10 +1884,7 @@ test("managed launch policy always includes ask_owner and attach_handoff", () =>
   ]);
   const root = mkdtempSync(join(tmpdir(), "pi-herdsman-agent-standalone-"));
   const standalone = withPiAgentDir(root, () => discoverAgent("generalist"));
-  assert.match(
-    standalone.path.split(sep).join("/"),
-    /agent-definitions\/generalist\.md$/,
-  );
+  assert.match(standalone.path.split(sep).join("/"), /agents\/generalist\.md$/);
   assert.equal(
     agentLaunchArgs(standalone, {
       bodyPromptPath: "/prompt",
@@ -2741,4 +2741,27 @@ test("wildcard exclusions reject mandatory overlap and escape regex syntax", () 
     args[args.indexOf("--exclude-tools") + 1],
     "ask.?*,agent,xask_*",
   );
+});
+
+test("Agent and role namespaces are independent and reject misplaced names", () => {
+  const root = mkdtempSync(join(tmpdir(), "herdsman-namespaces-"));
+  const agents = join(root, "agents");
+  const roles = join(root, "pi-herdsman", "roles");
+  mkdirSync(agents, { recursive: true });
+  mkdirSync(roles, { recursive: true });
+  withPiAgentDir(root, () => {
+    writeFileSync(join(roles, "bad.md"), "---\nname: custom\n---\n");
+    assert.ok(discoverAgentDefinitions().length);
+    assert.throws(
+      () => discoverRoleDefinitions(),
+      /non-role name in pi-herdsman\/roles directory/,
+    );
+    unlinkSync(join(roles, "bad.md"));
+    writeFileSync(join(agents, "bad.md"), "---\nname: manager\n---\n");
+    assert.ok(discoverRoleDefinitions().length);
+    assert.throws(
+      () => discoverAgentDefinitions(),
+      /reserved role name in agents directory; use pi-herdsman\/roles/,
+    );
+  });
 });

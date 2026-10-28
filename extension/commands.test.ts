@@ -15,6 +15,7 @@ import { createServer } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { mock, test, type TestContext } from "node:test";
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import packageMetadata from "../package.json" with { type: "json" };
 import { Value } from "typebox/value";
 import type {
@@ -60,6 +61,10 @@ import {
   writePeerLeadRecord as writePeerLeadRecordRaw,
 } from "./supervision.ts";
 import { OperationError } from "./errors.ts";
+import {
+  coordinatorTarget,
+  rememberCoordinatorTarget,
+} from "./coordinator-target.ts";
 import { AGENT_COORDINATION_TOOLS } from "./agent-definitions.ts";
 import {
   herdsmanTempRoot,
@@ -1596,9 +1601,11 @@ test("a restricted Flexible definition cannot replace the ordinary tool baseline
   setLeadEnvironment();
   const cwd = mkdtempSync(join(tmpdir(), "herdsman-flexible-profile-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
-  mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+  mkdirSync(join(cwd, ".pi", "pi-herdsman", "roles"), {
+    recursive: true,
+  });
   writeFileSync(
-    join(cwd, ".pi", "agents", "flexible-lead.md"),
+    join(cwd, ".pi", "pi-herdsman", "roles", "flexible-lead.md"),
     "---\nname: flexible-lead\ntools: [read]\n---\nrestricted flexible\n",
   );
   const baseline = ["read", "bash", "edit", "write"];
@@ -1625,9 +1632,11 @@ test("live Flexible tool changes are inherited while exclusions stay saved", asy
   setLeadEnvironment();
   const cwd = mkdtempSync(join(tmpdir(), "herdsman-inherited-tools-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
-  mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+  mkdirSync(join(cwd, ".pi", "pi-herdsman", "roles"), {
+    recursive: true,
+  });
   writeFileSync(
-    join(cwd, ".pi", "agents", "flexible-lead.md"),
+    join(cwd, ".pi", "pi-herdsman", "roles", "flexible-lead.md"),
     "---\nname: flexible-lead\nexcludeTools: [bash]\n---\nflexible\n",
   );
   const entries: any[] = [];
@@ -1688,9 +1697,11 @@ test("failed inherited-tool persistence enforces policy and retries", async (t) 
   setLeadEnvironment();
   const cwd = mkdtempSync(join(tmpdir(), "herdsman-inherited-tools-failure-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
-  mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+  mkdirSync(join(cwd, ".pi", "pi-herdsman", "roles"), {
+    recursive: true,
+  });
   writeFileSync(
-    join(cwd, ".pi", "agents", "flexible-lead.md"),
+    join(cwd, ".pi", "pi-herdsman", "roles", "flexible-lead.md"),
     "---\nname: flexible-lead\nexcludeTools: [bash]\n---\nflexible\n",
   );
   const entries: any[] = [];
@@ -1769,8 +1780,16 @@ test("failed inherited capture still enforces invalid-profile fail-closed tools"
   setLeadEnvironment();
   const cwd = mkdtempSync(join(tmpdir(), "herdsman-invalid-inherited-tools-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
-  mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
-  const definition = join(cwd, ".pi", "agents", "flexible-lead.md");
+  mkdirSync(join(cwd, ".pi", "pi-herdsman", "roles"), {
+    recursive: true,
+  });
+  const definition = join(
+    cwd,
+    ".pi",
+    "pi-herdsman",
+    "roles",
+    "flexible-lead.md",
+  );
   writeFileSync(definition, "---\nname: flexible-lead\n---\nflexible\n");
   const entries: any[] = [];
   const pi = fakeChiefPi({
@@ -1913,7 +1932,13 @@ test("session startup restores execution from the selected branch only", async (
 
 test("Manager transitions and mode changes preserve the ordinary Lead baseline", async () => {
   setLeadEnvironment();
-  const managerOverride = join(PI_AGENTS_DIR, "manager.md");
+  const managerOverride = join(
+    PI_AGENT_ROOT,
+    "pi-herdsman",
+    "roles",
+    "manager.md",
+  );
+  mkdirSync(dirname(managerOverride), { recursive: true });
   process.env.HERDR_PANE_ID = "manager-baseline-pane";
   process.env.HERDR_TAB_ID = "manager-baseline-tab";
   process.env.HERDR_SOCKET_PATH = join(
@@ -1984,12 +2009,18 @@ test("Manager transitions and mode changes preserve the ordinary Lead baseline",
         JSON.parse(
           (await peers.execute("list", {}, undefined, undefined, context))
             .content[0].text,
-        ).peers.some((peer: { session: string }) => peer.session === targetId),
+        ).peers.some(
+          (peer: { target: string }) =>
+            peer.target === coordinatorTarget("manager", targetId),
+        ),
         true,
       );
       await message.execute(
         "message",
-        { session: targetId, message: "Manager peer" },
+        {
+          target: coordinatorTarget("manager", targetId),
+          message: "Manager peer",
+        },
         undefined,
         undefined,
         context,
@@ -2134,10 +2165,16 @@ test("ordinary Leads deliver peer messages across non-Git sockets", async (t) =>
     }
     const sender = fixtures[0]!;
     await sender.pi.tools
+      .find((tool) => tool.name === "list_peers")!
+      .execute("list", {}, undefined, undefined, sender.context);
+    await sender.pi.tools
       .find((tool) => tool.name === "message_peer")!
       .execute(
         "message",
-        { session: leads[1]!.sessionId, message: "ordinary non-Git message" },
+        {
+          target: coordinatorTarget("lead", leads[1]!.sessionId),
+          message: "ordinary non-Git message",
+        },
         undefined,
         undefined,
         sender.context,
@@ -2309,8 +2346,9 @@ test("Manager peer messages deliver to a live Manager without changing its role"
     );
     assert.ok(
       listed.peers.some(
-        (peer: { session: string }) =>
-          peer.session === recipientManager!.sessionId,
+        (peer: { target: string }) =>
+          peer.target ===
+          coordinatorTarget("manager", recipientManager!.sessionId),
       ),
       JSON.stringify(listed),
     );
@@ -2322,7 +2360,10 @@ test("Manager peer messages deliver to a live Manager without changing its role"
       .find((tool) => tool.name === "message_peer")!
       .execute(
         "message",
-        { session: recipientManager!.sessionId, message: "manager queued" },
+        {
+          target: coordinatorTarget("manager", recipientManager!.sessionId),
+          message: "manager queued",
+        },
         undefined,
         undefined,
         sender.context,
@@ -3449,7 +3490,13 @@ function fakeChiefPi(options: Parameters<typeof fakePi>[0] = {}) {
 
 test("root Lead explicitly enters Manager; a competing root session stays Lead", async (t) => {
   setLeadEnvironment();
-  const managerOverride = join(PI_AGENTS_DIR, "manager.md");
+  const managerOverride = join(
+    PI_AGENT_ROOT,
+    "pi-herdsman",
+    "roles",
+    "manager.md",
+  );
+  mkdirSync(dirname(managerOverride), { recursive: true });
   const outsideDefinition = join(PI_AGENTS_DIR, "generalist.md");
   const previousManagerOverride = realFs.existsSync(managerOverride)
     ? readFileSync(managerOverride, "utf8")
@@ -3651,7 +3698,7 @@ test("root Lead explicitly enters Manager; a competing root session stays Lead",
       assert.equal(tool.defaultActive, false);
     }
     const historicalArgs = {
-      session: "lead-historical-session",
+      target: "lead:0123456789",
       message: "Please continue the prior assignment",
     };
     const historical = staffMessage.renderCall(
@@ -3662,7 +3709,10 @@ test("root Lead explicitly enters Manager; a competing root session stays Lead",
       },
       { args: historicalArgs, argsComplete: true },
     );
-    assert.match(historical.render(160).join("\n"), /^message staff  lead-his/);
+    assert.match(
+      historical.render(160).join("\n"),
+      /^message staff  lead:0123456789/,
+    );
     await first.events.get("session_start")![0](undefined, ctx1);
     assert.deepEqual(first.pi.getActiveTools(), ["read", ...leadTools]);
     assert.equal(first.pi.getActiveTools().includes("message_staff"), false);
@@ -3861,14 +3911,14 @@ test("root Lead explicitly enters Manager; a competing root session stays Lead",
         peer.execute(
           "message",
           {
-            session: leadPeerSession,
+            target: coordinatorTarget("lead", leadPeerSession),
             message: "Wrong role",
           },
           undefined,
           undefined,
           ctx1,
         ),
-        /no longer a live same-role peer/,
+        /Unknown coordinator target/,
       );
     } finally {
       removePeerLeadRecord(peerRuntime(), leadPeerSession, leadPeer);
@@ -8203,6 +8253,8 @@ async function managerDelegateAssignmentTest(
   t: TestContext,
   projectTrusted: boolean,
   lockOrder?: "manager-first" | "lead-first",
+  targetDecision: boolean | null = projectTrusted,
+  ancestorDecision: boolean | null = null,
 ) {
   setLeadEnvironment();
   process.env.HERDR_PANE_ID = "root-pane";
@@ -8221,7 +8273,12 @@ async function managerDelegateAssignmentTest(
   const childWorkspace = `child-${randomUUID()}`;
   const childCwd = realFs.mkdtempSync(join(PI_AGENT_ROOT, "manager-child-"));
   t.after(() => rmSync(childCwd, { recursive: true, force: true }));
-  const managedLeadDir = join(childCwd, ".pi", "agents");
+  new ProjectTrustStore(PI_AGENT_ROOT).set(PI_AGENT_ROOT, ancestorDecision);
+  t.after(() => new ProjectTrustStore(PI_AGENT_ROOT).set(PI_AGENT_ROOT, null));
+  new ProjectTrustStore(PI_AGENT_ROOT).set(childCwd, targetDecision);
+  const targetTrusted = (targetDecision ?? ancestorDecision) === true;
+  t.after(() => new ProjectTrustStore(PI_AGENT_ROOT).set(childCwd, null));
+  const managedLeadDir = join(childCwd, ".pi", "pi-herdsman", "roles");
   realFs.mkdirSync(managedLeadDir, { recursive: true });
   realFs.writeFileSync(
     join(managedLeadDir, "managed-lead.md"),
@@ -8514,13 +8571,13 @@ async function managerDelegateAssignmentTest(
       assert.equal(args.includes("--no-extensions"), true);
       const thinkingIndex = args.indexOf("--thinking");
       assert.notEqual(thinkingIndex, -1);
-      assert.equal(args[thinkingIndex + 1] === "low", projectTrusted);
-      assert.equal(args.includes("--approve"), projectTrusted);
-      assert.equal(args.includes("--no-approve"), !projectTrusted);
+      assert.equal(args[thinkingIndex + 1] === "low", targetTrusted);
+      assert.equal(args.includes("--approve"), targetTrusted);
+      assert.equal(args.includes("--no-approve"), !targetTrusted);
       const promptIndex = args.indexOf("--append-system-prompt");
       assert.notEqual(promptIndex, -1);
       const childPrompt = readFileSync(args[promptIndex + 1]!, "utf8");
-      if (projectTrusted) {
+      if (targetTrusted) {
         assert.match(childPrompt, /TARGET_WORKTREE_MANAGED_LEAD/);
       } else {
         assert.doesNotMatch(childPrompt, /TARGET_WORKTREE_MANAGED_LEAD/);
@@ -9025,10 +9082,16 @@ async function managerDelegateAssignmentTest(
     const staffMessage = pi.tools.find(
       (tool) => tool.name === "message_staff",
     )!;
+    const assignedTarget = rememberCoordinatorTarget(
+      pi.pi as never,
+      ctx,
+      "lead",
+      childSession,
+    );
     for (const selector of [
       {},
-      { session: childSession },
-      { session: childSession, branch: assignment.branch },
+      { target: assignedTarget },
+      { target: assignedTarget, branch: assignment.branch },
     ])
       await assert.rejects(
         staffMessage.execute(
@@ -9706,6 +9769,13 @@ for (const projectTrusted of [true, false])
   test(`Manager delegate persists an exact worktree Lead assignment (${projectTrusted ? "trusted" : "untrusted"})`, (t) =>
     managerDelegateAssignmentTest(t, projectTrusted));
 
+test("Manager trust cannot authorize an absent or denied target decision", async (t) => {
+  await managerDelegateAssignmentTest(t, true, undefined, null);
+  await managerDelegateAssignmentTest(t, true, undefined, false, true);
+});
+test("saved target ancestor trust authorizes the target independently of Manager trust", (t) =>
+  managerDelegateAssignmentTest(t, false, undefined, null, true));
+
 test("Manager session binding holds the assignment lock before Lead publication", (t) =>
   managerDelegateAssignmentTest(t, false, "manager-first"));
 
@@ -9989,7 +10059,7 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
   };
   let overview: any;
   const manager = fakeRepositoryChiefPi({ activeTools: ["read"], exec });
-  const managerCtx = fakeContext() as any;
+  const managerCtx = fakeContext(manager.entries) as any;
   managerCtx.hasUI = true;
   managerCtx.ui.custom = async (factory: any) => {
     overview = factory(
@@ -10017,19 +10087,15 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
       undefined,
       managerCtx,
     );
-    assert.deepEqual(
-      managerListing.details.reports
-        .map((report: any) => report.session)
-        .sort(),
-      [assignedLeadSession, ordinaryLeadSession].sort(),
-      "all eligible Leads in the verified project group are Manager reports",
-    );
+    assert.equal(managerListing.details.reports.length, 2);
     const assignedReport = managerListing.details.reports.find(
-      (report: any) => report.session === assignedLeadSession,
+      (report: any) => report.relationship === "assigned",
     );
     const ordinaryReport = managerListing.details.reports.find(
-      (report: any) => report.session === ordinaryLeadSession,
+      (report: any) =>
+        report.target === coordinatorTarget("lead", ordinaryLeadSession),
     );
+    assert.equal("target" in assignedReport, false);
     assert.equal(assignedReport.relationship, "assigned");
     assert.deepEqual(assignedReport.available_tools, [
       "inspect_staff",
@@ -10045,16 +10111,12 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
       .find((tool) => tool.name === "inspect_staff")!
       .execute(
         "inspect",
-        { action: "inspect", session: ordinaryLeadSession },
+        { action: "inspect", target: ordinaryReport.target },
         undefined,
         undefined,
         managerCtx,
       );
-    assert.equal(inspection.details.session, ordinaryLeadSession);
-    assert.equal(
-      inspection.details.identity.pi_session_id,
-      ordinaryLeadSession,
-    );
+    assert.equal(inspection.details.target, ordinaryReport.target);
     assert.equal(
       inspection.details.recent_output,
       "bounded ordinary live output",
@@ -10063,7 +10125,7 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
       .find((tool) => tool.name === "read_staff_transcript")!
       .execute(
         "transcript",
-        { session: ordinaryLeadSession },
+        { target: ordinaryReport.target },
         undefined,
         undefined,
         managerCtx,
@@ -10180,6 +10242,27 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
       piSessionId: ordinaryLeadSession,
       updatedAt: Date.now(),
     });
+    await assert.rejects(
+      manager.tools
+        .find((tool) => tool.name === "message_staff")!
+        .execute(
+          "message",
+          { branch: "assigned-branch", message: "hello" },
+          undefined,
+          undefined,
+          managerCtx,
+        ),
+      (error: any) => {
+        assert.equal(error.detail.category, "incompatible_build");
+        assert.match(error.message, /assigned-branch/);
+        assert.doesNotMatch(
+          JSON.stringify(error),
+          new RegExp(assignedLeadSession),
+        );
+        assert.doesNotMatch(error.message, new RegExp(assignedLeadSession));
+        return true;
+      },
+    );
     await manager.commandOptions.get("manager").handler("", managerCtx);
     await new Promise<void>((resolve) => setImmediate(resolve));
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -10224,7 +10307,7 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
     process.env.HERDR_PANE_ID = "chief-pane";
     process.env.HERDR_TAB_ID = "chief-tab";
     const chief = fakeRepositoryChiefPi({ activeTools: ["read"], exec });
-    const chiefCtx = fakeContext() as any;
+    const chiefCtx = fakeContext(chief.entries) as any;
     chiefCtx.sessionManager.getSessionId = () => `chief-${randomUUID()}`;
     const chiefSession = chiefCtx.sessionManager.getSessionId();
     chiefCtx.sessionManager.getSessionId = () => chiefSession;
@@ -10271,7 +10354,9 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
           message?.customType === "pi-herdsman-supervision-context",
       );
       assert.ok(
-        JSON.stringify(contextMessage?.message).includes(ordinaryLeadSession),
+        JSON.stringify(contextMessage?.message).includes(
+          coordinatorTarget("manager", LEAD_SESSION_ID),
+        ),
         JSON.stringify(contextMessage?.message),
       );
       liveAgents.push(
@@ -10296,20 +10381,24 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
       assert.equal(listed.details.self.role, "chief");
       assert.equal(listed.details.reports.length, 2);
       assert.equal(listed.details.reports[0].role, "manager");
-      assert.equal(listed.details.reports[0].session, LEAD_SESSION_ID);
+      assert.equal(
+        listed.details.reports[0].target,
+        coordinatorTarget("manager", LEAD_SESSION_ID),
+      );
       assert.ok(
         listed.details.reports[0].available_tools.includes("inspect_staff"),
       );
       assert.ok(
         listed.details.reports[0].available_tools.includes("message_staff"),
       );
-      const nestedSessions = listed.details.reports[0].leads.map(
-        (lead: any) => lead.session,
+      assert.equal(listed.details.reports[0].leads.length, 36);
+      assert.ok(
+        listed.details.reports[0].leads.every(
+          (lead: any) => !("target" in lead) && !("session" in lead),
+        ),
       );
-      assert.equal(nestedSessions.length, 36);
-      assert.ok(nestedSessions.includes(incompatibleChildSession));
       const nestedIncompatible = listed.details.reports[0].leads.find(
-        (lead: any) => lead.session === incompatibleChildSession,
+        (lead: any) => lead.compatibility === "incompatible",
       );
       assert.equal(nestedIncompatible.compatibility, "incompatible");
       assert.deepEqual(nestedIncompatible.available_tools, []);
@@ -10320,29 +10409,33 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
         total: 35,
       });
       const incompatibleEntry = listed.details.reports.find(
-        (report: any) => report.session === incompatibleManagerSession,
+        (report: any) => report.compatibility === "incompatible",
       );
       assert.equal(incompatibleEntry.compatibility, "incompatible");
       assert.equal(incompatibleEntry.build.sha256, OTHER_HERDSMAN_BUILD.sha256);
       assert.deepEqual(incompatibleEntry.available_tools, []);
       assert.equal(
         listed.details.reports.some(
-          (report: any) => report.session === nestedLeadSession,
+          (report: any) =>
+            report.target === coordinatorTarget("lead", nestedLeadSession),
         ),
         false,
         "a Lead under an incompatible Manager is not elevated to Chief direct staff",
       );
       assert.match(listed.details.warning, /reload those Pi sessions/);
+      const incompatibleTarget = rememberCoordinatorTarget(
+        chief.pi as never,
+        chiefCtx,
+        "manager",
+        incompatibleManagerSession,
+      );
       for (const [toolName, params] of [
-        [
-          "inspect_staff",
-          { action: "inspect", session: incompatibleManagerSession },
-        ],
+        ["inspect_staff", { action: "inspect", target: incompatibleTarget }],
         [
           "message_staff",
-          { session: incompatibleManagerSession, message: "unauthorized" },
+          { target: incompatibleTarget, message: "unauthorized" },
         ],
-        ["read_staff_transcript", { session: incompatibleManagerSession }],
+        ["read_staff_transcript", { target: incompatibleTarget }],
       ] as const) {
         await assert.rejects(
           chief.tools
@@ -10387,7 +10480,7 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
       assert.equal(
         convergedList.details.reports.some(
           (report: any) =>
-            report.session === incompatibleManagerSession &&
+            report.target === incompatibleTarget &&
             report.compatibility === "incompatible",
         ),
         false,
@@ -10431,14 +10524,19 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
           .execute(
             "message",
             {
-              session: "unrelated-lead",
+              target: rememberCoordinatorTarget(
+                chief.pi as never,
+                chiefCtx,
+                "lead",
+                "unrelated-lead",
+              ),
               message: "Not a direct report",
             },
             undefined,
             undefined,
             chiefCtx,
           ),
-        /not a current direct report|Lead target was not found or is no longer eligible/,
+        /not a current direct report|Staff target was not found or is no longer eligible/,
       );
       writeLeadCoordinationState(supervisionRuntime(), {
         version: 1,
@@ -10646,7 +10744,8 @@ test("ordinary Lead uplink reaches its Manager while assigned branch targeting f
       .execute("list", {}, undefined, undefined, managerCtx);
     assert.equal(
       reports.details.reports.find(
-        (report: any) => report.session === leadSession,
+        (report: any) =>
+          report.target === coordinatorTarget("lead", leadSession),
       )?.relationship,
       "supervised",
     );
@@ -10668,7 +10767,7 @@ test("ordinary Lead uplink reaches its Manager while assigned branch targeting f
         undefined,
         leadCtx,
       );
-    assert.equal(uplink.details.chiefSessionId, LEAD_SESSION_ID);
+    assert.equal("chiefSessionId" in uplink.details, false);
     useManagerIdentity();
     managerCtx.isIdle = () => true;
     await t.waitFor(() =>
@@ -10680,6 +10779,14 @@ test("ordinary Lead uplink reaches its Manager while assigned branch targeting f
             message?.details?.fromSessionId === leadSession &&
             message?.details?.toSessionId === LEAD_SESSION_ID,
         ),
+      ),
+    );
+    const incoming = manager.sentMessageCalls.find(
+      ({ message }: any) => message?.details?.id === uplink.details.id,
+    )!.message as any;
+    assert.ok(
+      incoming.content.startsWith(
+        `From Lead ${coordinatorTarget("lead", leadSession)}: `,
       ),
     );
     assert.equal(
@@ -10704,7 +10811,7 @@ test("ordinary Lead uplink reaches its Manager while assigned branch targeting f
       .execute(
         "message",
         {
-          session: leadSession,
+          target: coordinatorTarget("lead", leadSession),
           message: "Manager to ordinary Lead",
         },
         undefined,
@@ -10745,7 +10852,7 @@ test("ordinary Lead uplink reaches its Manager while assigned branch targeting f
       .execute(
         "message",
         {
-          session: leadSession,
+          target: coordinatorTarget("lead", leadSession),
           message: "Manager message while ordinary Lead is idle",
         },
         undefined,
@@ -10920,7 +11027,8 @@ test("ordinary Lead uplink reaches its Manager while assigned branch targeting f
       .execute("list", {}, undefined, undefined, managerCtx);
     assert.equal(
       ambiguousReports.details.reports.some(
-        (report: any) => report.session === leadSession,
+        (report: any) =>
+          report.target === coordinatorTarget("lead", leadSession),
       ),
       false,
       "ordinary Leads are not advertised when two Managers share their repository",
@@ -10935,14 +11043,14 @@ test("ordinary Lead uplink reaches its Manager while assigned branch targeting f
         .execute(
           "message",
           {
-            session: leadSession,
+            target: coordinatorTarget("lead", leadSession),
             message: "Do not enqueue ambiguous supervision",
           },
           undefined,
           undefined,
           managerCtx,
         ),
-      /Lead target was not found or is no longer eligible/,
+      /Staff target was not found or is no longer eligible/,
     );
     assert.deepEqual(
       listCoordinationMessagePaths(supervisionRuntime(), leadSession),
@@ -10981,14 +11089,14 @@ test("ordinary Lead uplink reaches its Manager while assigned branch targeting f
         .execute("list", {}, undefined, undefined, managerCtx);
       assert.equal(
         assignedReports.details.reports.find(
-          (report: any) => report.session === leadSession,
+          (report: any) => report.branch === assignedBranch,
         )?.relationship,
         "assigned",
         "project assignment authority remains available despite multiple Managers",
       );
       assert.equal(
         assignedReports.details.reports.find(
-          (report: any) => report.session === leadSession,
+          (report: any) => report.branch === assignedBranch,
         )?.branch,
         assignedBranch,
       );
@@ -11947,10 +12055,16 @@ test("peer delivery survives sender shutdown and is accepted exactly once", asyn
     await sender.events.get("session_start")![0](undefined, senderContext);
     const peer = sender.tools.find((tool) => tool.name === "message_peer");
     assert.ok(peer);
+    const target = rememberCoordinatorTarget(
+      sender.pi as never,
+      senderContext,
+      "lead",
+      targetId,
+    );
     await assert.rejects(
       peer.execute(
         "message",
-        { session: targetId, message: "mismatch must not publish" },
+        { target, message: "mismatch must not publish" },
         undefined,
         undefined,
         senderContext,
@@ -11972,12 +12086,12 @@ test("peer delivery survives sender shutdown and is accepted exactly once", asyn
     });
     const queued = await peer.execute(
       "message",
-      { session: targetId, message: "sender survived" },
+      { target, message: "sender survived" },
       undefined,
       undefined,
       senderContext,
     );
-    assert.equal(queued.details?.session, targetId);
+    assert.equal(queued.details?.target, target);
     await sender.events.get("session_shutdown")![0]();
     assert.equal(readPeerLeadRecord(runtime, senderId), undefined);
 
@@ -13650,7 +13764,8 @@ test("/agents placement subtree writes flat config outside project settings", as
 
 test("Chief profile drives the turn-start tools, prompt, and tool-call guard", async (t) => {
   setLeadEnvironment();
-  const overridePath = join(PI_AGENTS_DIR, "chief.md");
+  const overridePath = join(PI_AGENT_ROOT, "pi-herdsman", "roles", "chief.md");
+  mkdirSync(dirname(overridePath), { recursive: true });
   const previousOverride = realFs.existsSync(overridePath)
     ? readFileSync(overridePath, "utf8")
     : undefined;
@@ -13770,7 +13885,8 @@ test("root assignment rejects a role generation changed during preflight", async
       "HERDR_SOCKET_PATH",
     ].map((key) => [key, process.env[key]]),
   );
-  const chiefPath = join(PI_AGENTS_DIR, "chief.md");
+  const chiefPath = join(PI_AGENT_ROOT, "pi-herdsman", "roles", "chief.md");
+  mkdirSync(dirname(chiefPath), { recursive: true });
   const previousChief = realFs.existsSync(chiefPath)
     ? readFileSync(chiefPath, "utf8")
     : undefined;
@@ -13855,7 +13971,8 @@ test("root assignment rechecks changed authority after Agent startup and rolls b
       "HERDR_SOCKET_PATH",
     ].map((key) => [key, process.env[key]]),
   );
-  const chiefPath = join(PI_AGENTS_DIR, "chief.md");
+  const chiefPath = join(PI_AGENT_ROOT, "pi-herdsman", "roles", "chief.md");
+  mkdirSync(dirname(chiefPath), { recursive: true });
   const previousChief = realFs.existsSync(chiefPath)
     ? readFileSync(chiefPath, "utf8")
     : undefined;
@@ -15066,7 +15183,8 @@ test("persisted chief resume isolates tools and restores its ordinary baseline",
 
 test("persisted chief collision is suspended and has no lead authority", async () => {
   setLeadEnvironment();
-  const chiefOverride = join(PI_AGENTS_DIR, "chief.md");
+  const chiefOverride = join(PI_AGENT_ROOT, "pi-herdsman", "roles", "chief.md");
+  mkdirSync(dirname(chiefOverride), { recursive: true });
   const scoutDefinition = join(PI_AGENTS_DIR, "scout.md");
   const outsideDefinition = join(PI_AGENTS_DIR, "generalist.md");
   const previousChiefOverride = realFs.existsSync(chiefOverride)
@@ -15605,7 +15723,7 @@ test("Definitions contextual help uses the selected definition description", asy
         throw new Error("TUI item was not selected: Definitions");
       }
       if (call === 1) {
-        selectTuiItem(component, "Agent definitions");
+        selectTuiItem(component, "Agents");
         return;
       }
       if (call > 2) {
@@ -15763,7 +15881,7 @@ test("definition pickers preselect configured values and honor cancellation", as
         );
         const call = customCalls++;
         if (call === 0) {
-          selectTuiItem(component, "Agent definitions");
+          selectTuiItem(component, "Agents");
         } else if (call === 1) {
           selectTuiItem(component, "preselect-agent");
         } else if (call === 2) {
@@ -15869,7 +15987,7 @@ test("TUI Model picker fuzzy-filters models and cancels in place", async () => {
       );
       switch (customCalls++) {
         case 0:
-          selectTuiItem(component, "Agent definitions");
+          selectTuiItem(component, "Agents");
           break;
         case 1:
           selectTuiItem(component, "search-agent");
@@ -17073,7 +17191,7 @@ test("Definitions edits standalone definitions through the shared override write
   };
   context.ui.select = async (label: string, options: string[]) => {
     prompts.push({ label, options });
-    if (selection++ === 0) return "Agent definitions";
+    if (selection++ === 0) return "Agents";
     if (selection === 2)
       return options.find((option) => option.includes("docs-reviewer"));
     if (selection === 3)
@@ -17089,7 +17207,7 @@ test("Definitions edits standalone definitions through the shared override write
     assert.ok(
       prompts.some(
         ({ label, options }) =>
-          label === "Agent definitions" &&
+          label === "Agents" &&
           options.some((option) => /docs-reviewer.*global/iu.test(option)),
       ),
     );
@@ -17108,7 +17226,13 @@ test("Definitions edits standalone definitions through the shared override write
 
 test("Definitions exposes managed Lead settings without Agent discovery", async () => {
   setLeadEnvironment();
-  const overridePath = join(PI_AGENTS_DIR, "managed-lead.md");
+  const overridePath = join(
+    PI_AGENT_ROOT,
+    "pi-herdsman",
+    "roles",
+    "managed-lead.md",
+  );
+  mkdirSync(dirname(overridePath), { recursive: true });
   const pi = fakePi();
   registerExtension!(pi.pi as never);
   const command = pi.commandOptions.get("agents");
@@ -17126,9 +17250,8 @@ test("Definitions exposes managed Lead settings without Agent discovery", async 
     prompts.push({ label, options });
     const visit = visits.get(label) ?? 0;
     visits.set(label, visit + 1);
-    if (label === "Definitions")
-      return visit === 0 ? "Role profiles" : undefined;
-    if (label === "Role profiles")
+    if (label === "Agents & Roles") return visit === 0 ? "Roles" : undefined;
+    if (label === "Roles")
       return visit === 0
         ? options.find((option) => option.includes("managed-lead"))
         : undefined;
@@ -17146,14 +17269,11 @@ test("Definitions exposes managed Lead settings without Agent discovery", async 
   };
   try {
     await command.handler("definitions", context);
-    const categoryMenu = prompts.find(({ label }) => label === "Definitions");
-    const definitionMenu = prompts.find(
-      ({ label }) => label === "Role profiles",
+    const categoryMenu = prompts.find(
+      ({ label }) => label === "Agents & Roles",
     );
-    assert.deepEqual(categoryMenu?.options, [
-      "Agent definitions",
-      "Role profiles",
-    ]);
+    const definitionMenu = prompts.find(({ label }) => label === "Roles");
+    assert.deepEqual(categoryMenu?.options, ["Agents", "Roles"]);
     assert.deepEqual(
       definitionMenu?.options
         .slice(0, 5)
@@ -17233,7 +17353,7 @@ test("Definitions contextual help distinguishes managed Lead and Agent launches 
       };
       if (customCall === 0) {
         customCall++;
-        selectTuiItem(component, "Role profiles");
+        selectTuiItem(component, "Roles");
       } else if (customCall === 1) {
         customCall++;
         selectTuiItem(component, "managed-lead");
@@ -17263,7 +17383,7 @@ test("Definitions contextual help distinguishes managed Lead and Agent launches 
         component.handleInput("\u001b");
       } else if (customCall === 5) {
         customCall++;
-        selectTuiItem(component, "Agent definitions");
+        selectTuiItem(component, "Agents");
       } else if (customCall === 6) {
         customCall++;
         selectTuiItem(component, "generalist");
@@ -17337,11 +17457,7 @@ test("Definitions Details snapshots effective append and replace instructions", 
           return;
         }
         const target =
-          call === 0
-            ? "Agent definitions"
-            : call === 1
-              ? selectedName
-              : "Details…";
+          call === 0 ? "Agents" : call === 1 ? selectedName : "Details…";
         if (call === 2) beforeDetails?.();
         selectTuiItem(component, target);
       });
@@ -17469,7 +17585,7 @@ test("Definitions Details in RPC reports metadata without expanding instructions
   let selection = 0;
   context.ui.select = async (label: string, options: string[]) => {
     const currentSelection = selection++;
-    if (currentSelection === 0) return "Agent definitions";
+    if (currentSelection === 0) return "Agents";
     if (currentSelection === 1)
       return options.find((option) => option.includes("details-rpc"));
     if (label === "details-rpc" && currentSelection === 2)
@@ -17578,7 +17694,7 @@ test("Definitions cancellation navigates one menu level at a time", async () => 
     prompts.push({ label, options });
     switch (selection++) {
       case 0:
-        return "Agent definitions";
+        return "Agents";
       case 1:
         return options.find((option) => option.includes("implementer"));
       case 2:
@@ -17600,15 +17716,15 @@ test("Definitions cancellation navigates one menu level at a time", async () => 
     assert.deepEqual(
       prompts.map(({ label }) => label),
       [
-        "Definitions",
-        "Agent definitions",
+        "Agents & Roles",
+        "Agents",
         "implementer",
         "Model",
         "implementer",
         "Thinking",
         "implementer",
-        "Agent definitions",
-        "Definitions",
+        "Agents",
+        "Agents & Roles",
       ],
     );
   } finally {
@@ -17644,7 +17760,7 @@ test("Definitions applies model and thinking overrides independently", async () 
       prompts.push({ label, options });
       switch (selection++) {
         case 0:
-          return "Agent definitions";
+          return "Agents";
         case 1:
           return options.find((option) => option.includes("implementer"));
         case 2:
@@ -17694,7 +17810,7 @@ test("Definitions toggles enabled state for bundled definitions", async () => {
   context.ui.select = async (label: string, options: string[]) => {
     switch (selection++) {
       case 0:
-        return "Agent definitions";
+        return "Agents";
       case 1:
         return options.find((option) => option.includes("implementer"));
       case 2:
@@ -17755,7 +17871,7 @@ test("Definitions refreshes the model registry before post-model thinking choice
   context.ui.select = async (_label: string, options: string[]) => {
     switch (selection++) {
       case 0:
-        return "Agent definitions";
+        return "Agents";
       case 1:
         assert.ok(
           options.some((option) => option.includes("inherit · current-model")),
@@ -17817,7 +17933,7 @@ test("Definitions uses the current model for inherited thinking choices", async 
   context.ui.select = async (_label: string, options: string[]) => {
     switch (selection++) {
       case 0:
-        return "Agent definitions";
+        return "Agents";
       case 1:
         assert.ok(
           options.some((option) => option.includes("inherit · current-model")),
@@ -17884,7 +18000,7 @@ test("Definitions resolves explicit compact model IDs for thinking choices", asy
     context.ui.select = async (_label: string, options: string[]) => {
       switch (selection++) {
         case 0:
-          return "Agent definitions";
+          return "Agents";
         case 1:
           assert.ok(options.some((option) => option.includes(scenario.model)));
           return options.find((option) => option.includes("implementer"));
@@ -17933,8 +18049,8 @@ test("Definitions preserves Unicode names and model/thinking metadata", async ()
   context.mode = "rpc";
   context.ui.select = async (label: string, options: string[]) => {
     prompts.push(options);
-    if (label === "Definitions" && categorySelections++ === 0)
-      return "Agent definitions";
+    if (label === "Agents & Roles" && categorySelections++ === 0)
+      return "Agents";
     return undefined;
   };
   try {
@@ -17981,7 +18097,7 @@ test("Definitions separates Agent definitions and preserves provenance", async (
   context.mode = "rpc";
   context.ui.select = async (label: string, options: string[]) => {
     prompts.push({ label, options });
-    if (selections++ === 0) return "Agent definitions";
+    if (selections++ === 0) return "Agents";
     if (selections === 2)
       return options.find((option) => option.includes("group:Custom"));
     return undefined;
@@ -17990,13 +18106,7 @@ test("Definitions separates Agent definitions and preserves provenance", async (
     await command.handler("definitions", context);
     assert.deepEqual(
       prompts.map(({ label }) => label),
-      [
-        "Definitions",
-        "Agent definitions",
-        "group:Custom",
-        "Agent definitions",
-        "Definitions",
-      ],
+      ["Agents & Roles", "Agents", "group:Custom", "Agents", "Agents & Roles"],
     );
     const definitions = prompts[1]!.options;
     assert.ok(
@@ -18051,7 +18161,7 @@ test("Definitions retains the last selected Agent when returning to its list", a
   } as any);
   assert.deepEqual(
     selections
-      .filter(({ title }) => title === "Agent definitions")
+      .filter(({ title }) => title === "Agents")
       .map(({ selected }) => selected),
     [undefined, "second"],
   );

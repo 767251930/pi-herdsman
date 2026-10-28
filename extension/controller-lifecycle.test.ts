@@ -9023,7 +9023,13 @@ test("historical session with its inherited label rejects an active managed repr
   const name = `active-session-${randomUUID().slice(0, 8)}`;
   const label = name;
   const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
-  const chiefDefinitionPath = join(PI_AGENTS_DIR, "chief.md");
+  const chiefDefinitionPath = join(
+    PI_AGENT_ROOT,
+    "pi-herdsman",
+    "roles",
+    "chief.md",
+  );
+  realFs.mkdirSync(dirname(chiefDefinitionPath), { recursive: true });
   const previousChiefDefinition = realFs.existsSync(chiefDefinitionPath)
     ? realFs.readFileSync(chiefDefinitionPath, "utf8")
     : undefined;

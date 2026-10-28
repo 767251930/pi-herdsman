@@ -5,6 +5,11 @@
 Matching project and global definitions partially overlay lower-precedence
 roles, in the order `bundled < project < global`.
 
+Role profiles live under `<project>/.pi/pi-herdsman/roles/` and
+`<agentDir>/pi-herdsman/roles/`, not the Agent directories. Project
+profiles require project trust; the global agent directory is normally
+`~/.pi/agent`.
+
 This allows local customization while continuing to inherit future bundled
 changes for omitted fields.
 
@@ -91,9 +96,9 @@ authority nor access to Agents owned by supervised Leads. Removing the
 allowlist prevents new delegation but does not abandon Agents already owned by
 that exact session; their applicable ownership and recovery controls remain.
 
-Manager accepts trusted project overlays at `<project>/.pi/agents/manager.md`
-and global overlays at `$PI_CODING_AGENT_DIR/agents/manager.md` (or
-`~/.pi/agent/agents/manager.md`). Chief accepts only global overlays because it
+Manager accepts trusted project overlays at `<project>/.pi/pi-herdsman/roles/manager.md`
+and global overlays at `<agentDir>/pi-herdsman/roles/manager.md`.
+Chief accepts only global overlays because it
 is workspace-neutral; a project-local `chief.md` is an error. Both resolve
 when the role activates or is restored. Repeating `/manager` or `/chief`
 refreshes an active profile after validating it; a failed refresh keeps the
@@ -119,7 +124,7 @@ Use the read tool when a supervised decision requires checking a local artifact.
 Leads. Every assigned Lead uses it, independently of the ordinary execution
 mode. It follows the same `bundled < project < global` precedence, but it is launch
 configuration rather than an Agent role: it is excluded from the Agent roster
-and cannot be delegated to. It appears first in the flat Definitions list, with
+and cannot be delegated to. It appears under `Roles`, with
 Model, Thinking, and Details settings but no `Enabled` action. These settings
 do not add it to Agent discovery or delegation.
 
@@ -147,9 +152,9 @@ bodyMode: append
 Also require an independent reviewer before accepting implementation output.
 ```
 
-A project override lives at `<project>/.pi/agents/managed-lead.md` and is
+A project override lives at `<project>/.pi/pi-herdsman/roles/managed-lead.md` and is
 resolved from the delegated worktree when the project is trusted. The global
-override remains `~/.pi/agent/agents/managed-lead.md`.
+override lives at `<agentDir>/pi-herdsman/roles/managed-lead.md`.
 
 `managed-lead` is an independent full launch definition, not an extension of
 either ordinary runtime profile. For example, a minimal body customization is:
@@ -371,13 +376,13 @@ Lead Pi sessions with UI can use:
 /agents definitions
 ```
 
-The native Definitions menu is a flat list, with `flexible-lead`,
-`orchestrator-lead`, and `managed-lead` first in that order. Each
-definition identifies its contributing source or sources as `bundled`,
+The native `Agents & Roles` menu opens an `Agents` or `Roles` list. Roles
+appear in canonical order: `flexible-lead`, `orchestrator-lead`,
+`managed-lead`, `manager`, and `chief`. Each definition identifies its contributing source or sources as `bundled`,
 `project`, and/or `global`. Select a definition to open:
 
 ```text
-flexible-lead / orchestrator-lead: Details…
+flexible-lead / orchestrator-lead / manager / chief: Details…
 managed-lead: Model / Thinking / Details…
 ordinary Agent: Model / Thinking / Enabled / Details…
 ```

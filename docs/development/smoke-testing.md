@@ -433,16 +433,16 @@ role behavior.
 
 ### `/herdsman definitions`
 
-Verify the native Definitions list shows:
+Verify the native `Agents & Roles` menu shows:
 
-- actionable definitions in one flat list, with reserved
+- separate `Agents` and `Roles` lists, with reserved
   `flexible-lead`, `orchestrator-lead`, `managed-lead`, `manager`, and `chief`
-  first in that canonical order;
+  in that canonical role order;
 - contributing source words `bundled`, `project`, and `global`, including
   combinations where multiple sources contribute;
 - unpadded definition-name labels, with model, thinking, and provenance as
   secondary metadata, including Unicode names;
-- model, thinking, enabled, and details actions for a selected definition;
+- model, thinking, enabled, and details actions for a selected ordinary Agent;
 - `Inherit current session` for model and thinking;
 - selected-row contextual help and width-safe layout in narrow panes.
 

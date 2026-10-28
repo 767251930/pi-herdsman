@@ -2,7 +2,8 @@
 
 [Documentation index](../README.md)
 
-This page is the canonical public schema for Markdown agent definitions.
+This page is the canonical public schema for Markdown Agent definitions and
+role profiles.
 
 ## File format
 
@@ -48,8 +49,15 @@ definition and return a partial roster.
 Bundled definitions:
 
 ```text
-dist/agent-definitions/
+dist/agents/
 ```
+
+Bundled role profiles are in `dist/roles/`. Global role profiles are
+in `<agentDir>/pi-herdsman/roles/`, and trusted project role profiles
+are in `<cwd>/.pi/pi-herdsman/roles/`. Pi's agent directory defaults
+to `~/.pi/agent`. The same precedence and overlay rules apply independently
+to each category. Reserved role names are rejected in Agent directories;
+non-role names are rejected in role-profile directories.
 
 Global definitions by default:
 
@@ -64,7 +72,10 @@ are loaded from `<cwd>/.pi/agents/` when Pi considers the project trusted.
 Precedence is `bundled < project < global`.
 
 All effective Agent definitions are sorted and validated together, including
-every `agents` reference.
+every `agents` reference. Manager and Chief `agents` allowlists are validated
+against the effective Agent roster when their policy is evaluated; invalid
+references are not silently discarded. Agent discovery does not validate the
+complete role-profile configuration.
 
 ### Reserved role definitions
 
@@ -72,8 +83,8 @@ every `agents` reference.
 are reserved role definitions, not Agents. They are excluded from the Agent
 roster and cannot be selected by `delegate_agent`, referenced as delegation
 targets from `agents`, or disabled. Manager and Chief may themselves declare
-`agents` to allowlist ordinary Agent targets. The Definitions UI lists reserved roles under `Role profiles`, separately from
-ordinary `Agent definitions`. Runtime profiles
+`agents` to allowlist ordinary Agent targets. The `Agents & Roles` menu lists reserved roles under `Roles`, separately from
+ordinary `Agents`. Runtime profiles
 provide `Details` only; `managed-lead` additionally provides `Model` and
 `Thinking`.
 
