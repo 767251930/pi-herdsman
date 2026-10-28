@@ -23,6 +23,7 @@ import {
   listAllHerdrAgents,
   herdrSessionSnapshot,
   worktreeGroupScope,
+  localRepositoryScope,
   watchHerdrLifecycle,
   leadMetadataArgs,
   reportLeadMetadata,
@@ -32,6 +33,7 @@ import {
   sameRunningProcessOwner,
   terminalOccupierSurvived,
   sameCwd,
+  sameDirectory,
   stopHerdrAgentPreservingPane,
   closeHerdrPane,
   rollbackHerdrStart,
@@ -6511,6 +6513,137 @@ test("worktree group scope propagates native Herdr errors", async () => {
         return true;
       },
     );
+  }
+});
+
+test("local repository discovery ignores inherited topology but checks explicit membership", async () => {
+  const root = mkdtempSync(join(tmpdir(), "herdsman-local-repo-"));
+  try {
+    const checkout = join(root, "checkout");
+    const common = join(checkout, ".git");
+    const linked = join(root, "linked");
+    const linkedGit = join(common, "worktrees", "linked");
+    fs.mkdirSync(linkedGit, { recursive: true });
+    fs.mkdirSync(linked);
+    let membership: unknown = null;
+    let cwd = checkout;
+    const pathCaseVariant =
+      process.platform === "win32" ? common.toUpperCase() : common;
+    let reportedRepo = pathCaseVariant;
+    let sourceWorkspace: string | undefined = "unrelated";
+    const calls: string[][] = [];
+    const pi = {
+      exec: async (command: string, args: string[]) => {
+        calls.push([command, ...args]);
+        if (command === "git") {
+          const value =
+            args[2] === "--show-toplevel"
+              ? cwd
+              : args[2] === "--git-dir" && cwd === linked
+                ? linkedGit
+                : args[2] === "--git-dir" && cwd === checkout
+                  ? pathCaseVariant
+                  : common;
+          return { code: 0, stdout: value, stderr: "" };
+        }
+        const result =
+          args[0] === "workspace"
+            ? { workspace: { workspace_id: "w", worktree: membership } }
+            : {
+                source: {
+                  repo_key: reportedRepo,
+                  repo_name: "repo",
+                  source_workspace_id: sourceWorkspace,
+                },
+                worktrees: [],
+              };
+        return {
+          code: 0,
+          stdout: JSON.stringify({ id: 1, result }),
+          stderr: "",
+        };
+      },
+    } as any;
+    assert.equal(
+      (await localRepositoryScope(pi, { cwd } as any, "w")).isPrimary,
+      true,
+    );
+    assert.ok(
+      calls.some(
+        (call) => call.join(" ") === `herdr worktree list --cwd ${cwd}`,
+      ),
+    );
+    sourceWorkspace = undefined;
+    reportedRepo = common;
+    assert.equal(
+      (await localRepositoryScope(pi, { cwd } as any, "w")).repoKey,
+      common,
+    );
+    reportedRepo = linked;
+    await assert.rejects(
+      localRepositoryScope(pi, { cwd } as any, "w"),
+      /repository does not match/,
+    );
+    reportedRepo = common;
+    membership = {
+      repo_key: common,
+      checkout_path: linked,
+      is_linked_worktree: true,
+    };
+    await assert.rejects(
+      localRepositoryScope(pi, { cwd } as any, "w"),
+      /association/,
+    );
+    membership = null;
+    cwd = linked;
+    assert.equal(
+      (await localRepositoryScope(pi, { cwd } as any, "w")).isPrimary,
+      false,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test(
+  "directory identity accepts Windows case variants",
+  { skip: process.platform !== "win32" },
+  () => {
+    const root = mkdtempSync(join(tmpdir(), "herdsman-directory-identity-"));
+    const directory = join(root, "CaseSensitiveDirectory");
+    fs.mkdirSync(directory);
+    try {
+      const caseVariant = directory.toLowerCase();
+      assert.notEqual(directory, caseVariant);
+      assert.equal(sameDirectory(directory, caseVariant), true);
+      assert.equal(sameDirectory(directory, root), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test("directory identity fails closed when filesystem IDs are unavailable", (t) => {
+  let statCalls = 0;
+  t.mock.method(fs, "realpathSync", ((path: fs.PathLike) =>
+    String(path)) as typeof fs.realpathSync);
+  t.mock.method(fs, "statSync", (() => {
+    statCalls++;
+    return {
+      dev: 0n,
+      ino: 0n,
+      isDirectory: () => true,
+    } as ReturnType<typeof fs.statSync>;
+  }) as typeof fs.statSync);
+  syncBuiltinESMExports();
+  try {
+    assert.equal(sameDirectory("C:\\Repo", "c:\\repo"), false);
+    assert.equal(statCalls, 2, "path fallback was reached");
+    assert.equal(sameDirectory("C:\\Repo", "C:\\Repo"), true);
+    assert.equal(statCalls, 4, "path fallback was reached");
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
   }
 });
 
