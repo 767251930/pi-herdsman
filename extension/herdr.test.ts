@@ -13,7 +13,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { createServer, type Socket } from "node:net";
 import test from "node:test";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { dirname, join } from "node:path";
+import { dirname, join, toNamespacedPath } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
@@ -6574,11 +6574,25 @@ test("local repository discovery ignores inherited topology but checks explicit 
       ),
     );
     sourceWorkspace = undefined;
-    reportedRepo = common;
-    assert.equal(
-      (await localRepositoryScope(pi, { cwd } as any, "w")).repoKey,
-      common,
-    );
+    for (const variant of [
+      { repoKey: common, membership: null },
+      { repoKey: toNamespacedPath(common), membership: null },
+      {
+        repoKey: common,
+        membership: {
+          repo_key: toNamespacedPath(common),
+          checkout_path: toNamespacedPath(checkout),
+          is_linked_worktree: false,
+        },
+      },
+    ]) {
+      reportedRepo = variant.repoKey;
+      membership = variant.membership;
+      assert.equal(
+        (await localRepositoryScope(pi, { cwd } as any, "w")).repoKey,
+        variant.repoKey,
+      );
+    }
     reportedRepo = linked;
     await assert.rejects(
       localRepositoryScope(pi, { cwd } as any, "w"),
@@ -6625,8 +6639,8 @@ test(
 
 test("directory identity fails closed when filesystem IDs are unavailable", (t) => {
   let statCalls = 0;
-  t.mock.method(fs, "realpathSync", ((path: fs.PathLike) =>
-    String(path)) as typeof fs.realpathSync);
+  t.mock.method(fs.realpathSync, "native", ((path: fs.PathLike) =>
+    String(path)) as typeof fs.realpathSync.native);
   t.mock.method(fs, "statSync", (() => {
     statCalls++;
     return {
