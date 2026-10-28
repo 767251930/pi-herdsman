@@ -738,7 +738,7 @@ export function herdrAgentAlias(
 function canonicalCwd(value: string): string {
   const resolved = resolve(value);
   try {
-    return realpathSync(resolved);
+    return realpathSync.native(resolved);
   } catch {
     return resolved;
   }

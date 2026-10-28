@@ -8747,7 +8747,7 @@ async function managerDelegateAssignmentTest(
         nativeSessions.set(childSessionPath(), {
           id: childSession,
           path: childSessionPath(),
-          cwd: realFs.realpathSync(childCwd),
+          cwd: realFs.realpathSync.native(childCwd),
           entries: [],
         });
       }

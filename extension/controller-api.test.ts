@@ -5125,7 +5125,10 @@ async function runManagerStartupScenario(
         repoKey,
       )[0]!;
       assert.notEqual(assignment.id, staleId);
-      assert.equal(assignment.checkoutPath, realFs.realpathSync(childPath));
+      assert.equal(
+        assignment.checkoutPath,
+        realFs.realpathSync.native(childPath),
+      );
       assert.equal(createCalls, 1);
       assert.equal(startCalls, 1);
       assert.deepEqual(
@@ -6368,7 +6371,10 @@ async function runManagerStartupScenario(
       "text",
       "version",
     ]);
-    assert.equal(assignment.checkoutPath, realFs.realpathSync(childPath));
+    assert.equal(
+      assignment.checkoutPath,
+      realFs.realpathSync.native(childPath),
+    );
     if (["success", "unmaterialized-path"].includes(mode))
       assert.equal(
         assignment.piSessionFile,
