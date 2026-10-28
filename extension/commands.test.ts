@@ -15,6 +15,7 @@ import { createServer } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { mock, test, type TestContext } from "node:test";
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import packageMetadata from "../package.json" with { type: "json" };
 import { Value } from "typebox/value";
 import type {
@@ -1596,9 +1597,11 @@ test("a restricted Flexible definition cannot replace the ordinary tool baseline
   setLeadEnvironment();
   const cwd = mkdtempSync(join(tmpdir(), "herdsman-flexible-profile-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
-  mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+  mkdirSync(join(cwd, ".pi", "pi-herdsman", "role-profiles"), {
+    recursive: true,
+  });
   writeFileSync(
-    join(cwd, ".pi", "agents", "flexible-lead.md"),
+    join(cwd, ".pi", "pi-herdsman", "role-profiles", "flexible-lead.md"),
     "---\nname: flexible-lead\ntools: [read]\n---\nrestricted flexible\n",
   );
   const baseline = ["read", "bash", "edit", "write"];
@@ -1625,9 +1628,11 @@ test("live Flexible tool changes are inherited while exclusions stay saved", asy
   setLeadEnvironment();
   const cwd = mkdtempSync(join(tmpdir(), "herdsman-inherited-tools-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
-  mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+  mkdirSync(join(cwd, ".pi", "pi-herdsman", "role-profiles"), {
+    recursive: true,
+  });
   writeFileSync(
-    join(cwd, ".pi", "agents", "flexible-lead.md"),
+    join(cwd, ".pi", "pi-herdsman", "role-profiles", "flexible-lead.md"),
     "---\nname: flexible-lead\nexcludeTools: [bash]\n---\nflexible\n",
   );
   const entries: any[] = [];
@@ -1688,9 +1693,11 @@ test("failed inherited-tool persistence enforces policy and retries", async (t) 
   setLeadEnvironment();
   const cwd = mkdtempSync(join(tmpdir(), "herdsman-inherited-tools-failure-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
-  mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+  mkdirSync(join(cwd, ".pi", "pi-herdsman", "role-profiles"), {
+    recursive: true,
+  });
   writeFileSync(
-    join(cwd, ".pi", "agents", "flexible-lead.md"),
+    join(cwd, ".pi", "pi-herdsman", "role-profiles", "flexible-lead.md"),
     "---\nname: flexible-lead\nexcludeTools: [bash]\n---\nflexible\n",
   );
   const entries: any[] = [];
@@ -1769,8 +1776,16 @@ test("failed inherited capture still enforces invalid-profile fail-closed tools"
   setLeadEnvironment();
   const cwd = mkdtempSync(join(tmpdir(), "herdsman-invalid-inherited-tools-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
-  mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
-  const definition = join(cwd, ".pi", "agents", "flexible-lead.md");
+  mkdirSync(join(cwd, ".pi", "pi-herdsman", "role-profiles"), {
+    recursive: true,
+  });
+  const definition = join(
+    cwd,
+    ".pi",
+    "pi-herdsman",
+    "role-profiles",
+    "flexible-lead.md",
+  );
   writeFileSync(definition, "---\nname: flexible-lead\n---\nflexible\n");
   const entries: any[] = [];
   const pi = fakeChiefPi({
@@ -1913,7 +1928,13 @@ test("session startup restores execution from the selected branch only", async (
 
 test("Manager transitions and mode changes preserve the ordinary Lead baseline", async () => {
   setLeadEnvironment();
-  const managerOverride = join(PI_AGENTS_DIR, "manager.md");
+  const managerOverride = join(
+    PI_AGENT_ROOT,
+    "pi-herdsman",
+    "role-profiles",
+    "manager.md",
+  );
+  mkdirSync(dirname(managerOverride), { recursive: true });
   process.env.HERDR_PANE_ID = "manager-baseline-pane";
   process.env.HERDR_TAB_ID = "manager-baseline-tab";
   process.env.HERDR_SOCKET_PATH = join(
@@ -3449,7 +3470,13 @@ function fakeChiefPi(options: Parameters<typeof fakePi>[0] = {}) {
 
 test("root Lead explicitly enters Manager; a competing root session stays Lead", async (t) => {
   setLeadEnvironment();
-  const managerOverride = join(PI_AGENTS_DIR, "manager.md");
+  const managerOverride = join(
+    PI_AGENT_ROOT,
+    "pi-herdsman",
+    "role-profiles",
+    "manager.md",
+  );
+  mkdirSync(dirname(managerOverride), { recursive: true });
   const outsideDefinition = join(PI_AGENTS_DIR, "generalist.md");
   const previousManagerOverride = realFs.existsSync(managerOverride)
     ? readFileSync(managerOverride, "utf8")
@@ -8203,6 +8230,8 @@ async function managerDelegateAssignmentTest(
   t: TestContext,
   projectTrusted: boolean,
   lockOrder?: "manager-first" | "lead-first",
+  targetDecision: boolean | null = projectTrusted,
+  ancestorDecision: boolean | null = null,
 ) {
   setLeadEnvironment();
   process.env.HERDR_PANE_ID = "root-pane";
@@ -8221,7 +8250,12 @@ async function managerDelegateAssignmentTest(
   const childWorkspace = `child-${randomUUID()}`;
   const childCwd = realFs.mkdtempSync(join(PI_AGENT_ROOT, "manager-child-"));
   t.after(() => rmSync(childCwd, { recursive: true, force: true }));
-  const managedLeadDir = join(childCwd, ".pi", "agents");
+  new ProjectTrustStore(PI_AGENT_ROOT).set(PI_AGENT_ROOT, ancestorDecision);
+  t.after(() => new ProjectTrustStore(PI_AGENT_ROOT).set(PI_AGENT_ROOT, null));
+  new ProjectTrustStore(PI_AGENT_ROOT).set(childCwd, targetDecision);
+  const targetTrusted = (targetDecision ?? ancestorDecision) === true;
+  t.after(() => new ProjectTrustStore(PI_AGENT_ROOT).set(childCwd, null));
+  const managedLeadDir = join(childCwd, ".pi", "pi-herdsman", "role-profiles");
   realFs.mkdirSync(managedLeadDir, { recursive: true });
   realFs.writeFileSync(
     join(managedLeadDir, "managed-lead.md"),
@@ -8514,13 +8548,13 @@ async function managerDelegateAssignmentTest(
       assert.equal(args.includes("--no-extensions"), true);
       const thinkingIndex = args.indexOf("--thinking");
       assert.notEqual(thinkingIndex, -1);
-      assert.equal(args[thinkingIndex + 1] === "low", projectTrusted);
-      assert.equal(args.includes("--approve"), projectTrusted);
-      assert.equal(args.includes("--no-approve"), !projectTrusted);
+      assert.equal(args[thinkingIndex + 1] === "low", targetTrusted);
+      assert.equal(args.includes("--approve"), targetTrusted);
+      assert.equal(args.includes("--no-approve"), !targetTrusted);
       const promptIndex = args.indexOf("--append-system-prompt");
       assert.notEqual(promptIndex, -1);
       const childPrompt = readFileSync(args[promptIndex + 1]!, "utf8");
-      if (projectTrusted) {
+      if (targetTrusted) {
         assert.match(childPrompt, /TARGET_WORKTREE_MANAGED_LEAD/);
       } else {
         assert.doesNotMatch(childPrompt, /TARGET_WORKTREE_MANAGED_LEAD/);
@@ -9690,6 +9724,13 @@ async function managerDelegateAssignmentTest(
 for (const projectTrusted of [true, false])
   test(`Manager delegate persists an exact worktree Lead assignment (${projectTrusted ? "trusted" : "untrusted"})`, (t) =>
     managerDelegateAssignmentTest(t, projectTrusted));
+
+test("Manager trust cannot authorize an absent or denied target decision", async (t) => {
+  await managerDelegateAssignmentTest(t, true, undefined, null);
+  await managerDelegateAssignmentTest(t, true, undefined, false, true);
+});
+test("saved target ancestor trust authorizes the target independently of Manager trust", (t) =>
+  managerDelegateAssignmentTest(t, false, undefined, null, true));
 
 test("Manager session binding holds the assignment lock before Lead publication", (t) =>
   managerDelegateAssignmentTest(t, false, "manager-first"));
@@ -13626,7 +13667,13 @@ test("/agents placement subtree writes flat config outside project settings", as
 
 test("Chief profile drives the turn-start tools, prompt, and tool-call guard", async (t) => {
   setLeadEnvironment();
-  const overridePath = join(PI_AGENTS_DIR, "chief.md");
+  const overridePath = join(
+    PI_AGENT_ROOT,
+    "pi-herdsman",
+    "role-profiles",
+    "chief.md",
+  );
+  mkdirSync(dirname(overridePath), { recursive: true });
   const previousOverride = realFs.existsSync(overridePath)
     ? readFileSync(overridePath, "utf8")
     : undefined;
@@ -13746,7 +13793,13 @@ test("root assignment rejects a role generation changed during preflight", async
       "HERDR_SOCKET_PATH",
     ].map((key) => [key, process.env[key]]),
   );
-  const chiefPath = join(PI_AGENTS_DIR, "chief.md");
+  const chiefPath = join(
+    PI_AGENT_ROOT,
+    "pi-herdsman",
+    "role-profiles",
+    "chief.md",
+  );
+  mkdirSync(dirname(chiefPath), { recursive: true });
   const previousChief = realFs.existsSync(chiefPath)
     ? readFileSync(chiefPath, "utf8")
     : undefined;
@@ -13831,7 +13884,13 @@ test("root assignment rechecks changed authority after Agent startup and rolls b
       "HERDR_SOCKET_PATH",
     ].map((key) => [key, process.env[key]]),
   );
-  const chiefPath = join(PI_AGENTS_DIR, "chief.md");
+  const chiefPath = join(
+    PI_AGENT_ROOT,
+    "pi-herdsman",
+    "role-profiles",
+    "chief.md",
+  );
+  mkdirSync(dirname(chiefPath), { recursive: true });
   const previousChief = realFs.existsSync(chiefPath)
     ? readFileSync(chiefPath, "utf8")
     : undefined;
@@ -15042,7 +15101,13 @@ test("persisted chief resume isolates tools and restores its ordinary baseline",
 
 test("persisted chief collision is suspended and has no lead authority", async () => {
   setLeadEnvironment();
-  const chiefOverride = join(PI_AGENTS_DIR, "chief.md");
+  const chiefOverride = join(
+    PI_AGENT_ROOT,
+    "pi-herdsman",
+    "role-profiles",
+    "chief.md",
+  );
+  mkdirSync(dirname(chiefOverride), { recursive: true });
   const scoutDefinition = join(PI_AGENTS_DIR, "scout.md");
   const outsideDefinition = join(PI_AGENTS_DIR, "generalist.md");
   const previousChiefOverride = realFs.existsSync(chiefOverride)
@@ -17084,7 +17149,13 @@ test("Definitions edits standalone definitions through the shared override write
 
 test("Definitions exposes managed Lead settings without Agent discovery", async () => {
   setLeadEnvironment();
-  const overridePath = join(PI_AGENTS_DIR, "managed-lead.md");
+  const overridePath = join(
+    PI_AGENT_ROOT,
+    "pi-herdsman",
+    "role-profiles",
+    "managed-lead.md",
+  );
+  mkdirSync(dirname(overridePath), { recursive: true });
   const pi = fakePi();
   registerExtension!(pi.pi as never);
   const command = pi.commandOptions.get("agents");

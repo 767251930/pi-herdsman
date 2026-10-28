@@ -34,11 +34,17 @@ this skill does not define a second schema or management API.
      - `../../docs/guides/customizing-agents.md`
 
 2. Choose the configuration layer from the requested scope.
-   - Project policy: `<cwd>/.pi/agents/`.
-   - Global user policy: `$PI_CODING_AGENT_DIR/agents/` when that variable is
-     set, otherwise `~/.pi/agent/agents/`.
+   - Agent project policy: `<cwd>/.pi/agents/`; global policy:
+     `<agentDir>/agents/`.
+   - Role project policy: `<cwd>/.pi/pi-herdsman/role-profiles/`; global
+     policy: `<agentDir>/pi-herdsman/role-profiles/`. Pi's agent directory
+     normally is `~/.pi/agent`. Managed Lead project policy resolves from
+     the trusted delegated worktree.
+   - Reserved role names are invalid in Agent directories; non-role names are
+     invalid in role-profile directories.
    - If scope is genuinely ambiguous and materially changes the result, ask.
-   - Never edit bundled definitions under `dist/agent-definitions/`.
+   - Never edit bundled files under `dist/agent-definitions/` or
+     `dist/role-profiles/`. The Definitions UI writes global overrides only.
 
 3. Make the smallest correct Markdown change.
    - Prefer a partial overlay over copying a complete lower-precedence
@@ -61,8 +67,9 @@ this skill does not define a second schema or management API.
      its restrictions and authority boundaries.
    - Lead, Manager, and Chief runtime profiles are not launch definitions. They
      support only `name`, `description`, `body`, `bodyMode` on overlays,
-     `tools`, and `excludeTools`. Do not configure
-     model, thinking, prompt launch mode, enabled/permission/agent policy,
+     `tools`, and `excludeTools`; Manager and Chief also support `agents` as
+     their direct-delegation allowlist. Do not configure
+     model, thinking, prompt launch mode, enabled or permission policy,
      tools-default switches, skills, extensions, or context inheritance on
      these profiles. Their tool policy affects registered ordinary tools;
      Herdsman-owned tools cannot be activated through a profile and mandatory
@@ -77,7 +84,9 @@ this skill does not define a second schema or management API.
    - After an edit in a Lead session, call `list_agents` again. Treat any
      discovery or validation failure as a failed edit and repair or restore the
      target file. Its returned summary can confirm discoverability and
-     validation, not the complete effective configuration.
+     validation, not the complete effective configuration or role-profile
+     validation. Validate role profiles through the relevant role resolution;
+     Manager and Chief allowlist references must resolve against the Agent roster.
    - If `list_agents` is unavailable, do not claim that the effective Herdsman
      definition set was runtime-validated. The next normal definition discovery
      will validate it.

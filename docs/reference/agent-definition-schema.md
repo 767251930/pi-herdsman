@@ -2,7 +2,8 @@
 
 [Documentation index](../README.md)
 
-This page is the canonical public schema for Markdown agent definitions.
+This page is the canonical public schema for Markdown Agent definitions and
+role profiles.
 
 ## File format
 
@@ -51,6 +52,13 @@ Bundled definitions:
 dist/agent-definitions/
 ```
 
+Bundled role profiles are in `dist/role-profiles/`. Global role profiles are
+in `<agentDir>/pi-herdsman/role-profiles/`, and trusted project role profiles
+are in `<cwd>/.pi/pi-herdsman/role-profiles/`. Pi's agent directory defaults
+to `~/.pi/agent`. The same precedence and overlay rules apply independently
+to each category. Reserved role names are rejected in Agent directories;
+non-role names are rejected in role-profile directories.
+
 Global definitions by default:
 
 ```text
@@ -64,7 +72,10 @@ are loaded from `<cwd>/.pi/agents/` when Pi considers the project trusted.
 Precedence is `bundled < project < global`.
 
 All effective Agent definitions are sorted and validated together, including
-every `agents` reference.
+every `agents` reference. Manager and Chief `agents` allowlists are validated
+against the effective Agent roster when their policy is evaluated; invalid
+references are not silently discarded. Agent discovery does not validate the
+complete role-profile configuration.
 
 ### Reserved role definitions
 

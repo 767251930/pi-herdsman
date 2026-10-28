@@ -1,0 +1,24 @@
+# Separate Agent and role-profile namespaces
+
+## Status
+
+Accepted
+
+## Decision
+
+Delegable Agent definitions and reserved role profiles use separate bundled,
+global, and trusted-project directories. They retain the shared Markdown
+definition engine, layering, and provenance. Category validation keeps reserved
+role names out of Agent directories and other names out of role-profile
+directories. Chief remains global-only.
+
+This narrows ADR 0015's rejection of a separate directory: a distinct namespace
+does not require a separate schema or composition engine. Its managed-Lead
+launch-policy decision remains in force. ADR 0018's execution-profile and
+runtime authority boundaries are unchanged.
+
+## Rationale and consequences
+
+Separate namespaces make delegation and role configuration distinct without
+duplicating the definition mechanism. Existing role overrides in Agent
+directories are not recognized as role profiles; there is no legacy fallback.

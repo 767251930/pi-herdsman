@@ -2151,8 +2151,11 @@ test("stale peer publication cannot replace a same-session lifecycle generation"
 
 test("active chief describes authoritative remote ask projection", async () => {
   setLeadEnvironment();
+  realFs.mkdirSync(join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles"), {
+    recursive: true,
+  });
   writeFileSync(
-    join(PI_AGENTS_DIR, "chief.md"),
+    join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles", "chief.md"),
     "---\nname: chief\nbodyMode: replace\n---\nCustom Chief strategy",
   );
   process.env.HERDR_PANE_ID = "chief-pane";
@@ -4029,7 +4032,7 @@ test("persisted Chief keeps verified authority and mandatory tools when definiti
       entries.some(
         (entry: any) => entry.customType === "pi_herdsman_definition_error",
       ),
-      true,
+      false,
     );
     const prompt = await pi.events.get("before_agent_start")![0](
       { systemPrompt: "base", systemPromptOptions: { contextFiles: [] } },
@@ -4061,7 +4064,15 @@ test("chief guidance carries the lead coordination contract", () => {
 
 test("replaced Lead strategy keeps its protected charter and coordination tools", async () => {
   setLeadEnvironment();
-  const overlay = join(PI_AGENTS_DIR, "orchestrator-lead.md");
+  realFs.mkdirSync(join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles"), {
+    recursive: true,
+  });
+  const overlay = join(
+    PI_AGENT_ROOT,
+    "pi-herdsman",
+    "role-profiles",
+    "orchestrator-lead.md",
+  );
   process.env.HERDR_SOCKET_PATH = join(
     tmpdir(),
     `lead-contract-${randomUUID()}.sock`,
@@ -4725,8 +4736,11 @@ test("delegating agents receive only their allowed definition roster", async () 
 
 test("replaced Manager body keeps its protected prompt contract and tools", async () => {
   setLeadEnvironment();
+  realFs.mkdirSync(join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles"), {
+    recursive: true,
+  });
   writeFileSync(
-    join(PI_AGENTS_DIR, "manager.md"),
+    join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles", "manager.md"),
     "---\nname: manager\nbodyMode: replace\n---\nCustom Manager strategy",
   );
   process.env.HERDR_PANE_ID = "manager-pane";

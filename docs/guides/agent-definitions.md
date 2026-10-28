@@ -50,6 +50,14 @@ writes global overrides, never project files.
 When Pi uses a custom agent directory, the global definitions live under that
 agent directory's `agents/` subdirectory.
 
+Role profiles use separate directories: `dist/role-profiles/` for bundled
+profiles, `<cwd>/.pi/pi-herdsman/role-profiles/` for trusted project overlays,
+and `<agentDir>/pi-herdsman/role-profiles/` for global overlays. `<agentDir>`
+is Pi's agent directory (normally `~/.pi/agent`). The same precedence applies.
+Reserved role names are invalid in Agent directories, and other names are
+invalid in role-profile directories. Chief is global-only; a project Chief
+profile is an error.
+
 A project or global definition whose `name` matches a lower-precedence
 definition overlays it. An unmatched definition is standalone.
 
@@ -61,6 +69,8 @@ controller, not source paths or complete frontmatter. They support runtime
 selection and validation, not configuration management. Identify definitions
 by frontmatter `name`, inspect contributing files, and resolve effective
 overlays when changing them; never infer identity from filenames.
+`list_agents` validates Agent discovery, not the complete role-profile
+configuration.
 
 `flexible-lead`, `orchestrator-lead`, `managed-lead`, `manager`, and `chief`
 are reserved role definitions. They use the layered definition engine but are

@@ -118,6 +118,7 @@ const {
   buildContextEntries: nativeBuildContextEntries,
   buildSessionProjection: nativeBuildSessionProjection,
   CURRENT_SESSION_VERSION: nativeCurrentSessionVersion,
+  ProjectTrustStore: NativeProjectTrustStore,
   parseFrontmatter: nativeParseFrontmatter,
   parseSessionEntries: nativeParseSessionEntries,
   truncateTail: nativeTruncateTail,
@@ -316,6 +317,7 @@ mock.module("@earendil-works/pi-coding-agent", {
     buildSessionProjection: nativeBuildSessionProjection,
     CURRENT_SESSION_VERSION: nativeCurrentSessionVersion,
     getAgentDir: () => PI_AGENT_ROOT,
+    ProjectTrustStore: NativeProjectTrustStore,
     parseFrontmatter: nativeParseFrontmatter,
     parseSessionEntries: nativeParseSessionEntries,
     loadProjectContextFiles: ({ cwd }: { cwd: string }) => {

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+* **config:** Role profiles now use `pi-herdsman/role-profiles/` under the Pi
+  agent directory and trusted project `.pi/`, separate from Agent definitions.
+  Reserved role names in `agents/` are rejected; those paths are not supported
+  as role-profile overrides.
+
 ## [0.35.0](https://github.com/boadij/pi-herdsman/compare/v0.34.1...v0.35.0) (2026-10-28)
 
 

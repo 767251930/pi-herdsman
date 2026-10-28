@@ -4,7 +4,11 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { getSelectListTheme } from "@earendil-works/pi-coding-agent";
+import {
+  getSelectListTheme,
+  getAgentDir,
+  ProjectTrustStore,
+} from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { visibleWidth, type SelectItem } from "@earendil-works/pi-tui";
 import type {
@@ -130,9 +134,11 @@ import {
   configuredToolPolicy,
   configuredModel,
   discoverRoleDefinition,
+  discoverRoleDefinitions,
+  discoverAgentDefinitions,
+  validateAgentDefinitionReferences,
   isReservedRoleDefinition,
   isRuntimeRoleDefinition,
-  RESERVED_ROLE_DEFINITION_NAMES,
   matchesToolPattern,
   expandAgentBodyFiles,
   FLEXIBLE_LEAD_DEFINITION_NAME,
@@ -1788,26 +1794,17 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
     async openDefinitionsMenu(ctx: ExtensionCommandContext): Promise<void> {
       let selectedSection = "agents";
       const selectedDefinitions: Record<string, string | undefined> = {};
-      const loadDefinitions = async () => {
-        const { definitions, roleDefinitions } =
-          await host.contextAgentDefinitions(ctx);
-        return {
-          definitions,
-          roleDefinitions: RESERVED_ROLE_DEFINITION_NAMES.map((name) => {
-            const definition = roleDefinitions.find(
-              (candidate) => candidate.name === name,
+      const loadDefinitions = async (section: string) =>
+        section === "agents"
+          ? (await host.contextAgentDefinitions(ctx)).definitions
+          : discoverRoleDefinitions(
+              ctx.isProjectTrusted() ? { projectRoot: ctx.cwd } : {},
             );
-            if (!definition)
-              throw new Error(`role definition ${name} not found`);
-            return definition;
-          }),
-        };
-      };
       const resolveDefinition = async (name: string) => {
-        const loaded = await loadDefinitions();
-        return [...loaded.roleDefinitions, ...loaded.definitions].find(
-          (candidate) => candidate.name === name,
+        const loaded = await loadDefinitions(
+          isReservedRoleDefinition(name) ? "roles" : "agents",
         );
+        return loaded.find((candidate) => candidate.name === name);
       };
       while (true) {
         const section = await host.selectMenu(
@@ -1829,11 +1826,8 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
         );
         if (section !== "agents" && section !== "roles") return;
         selectedSection = section;
-        const sectionDefinitions =
-          section === "agents" ? "definitions" : "roleDefinitions";
         definitionList: while (true) {
-          const loaded = await loadDefinitions();
-          const availableDefinitions = loaded[sectionDefinitions];
+          const availableDefinitions = await loadDefinitions(section);
           if (!availableDefinitions.length) {
             ctx.ui.notify("No Agent definitions are available.");
             break definitionList;
@@ -3022,8 +3016,24 @@ export function registerLeadRuntime(
         options.leadRuntime!.leadContext!,
         role,
       );
-      if (profile?.valid)
-        return new Set(profile.definition.frontmatter.agents ?? []);
+      if (profile?.valid) {
+        try {
+          validateAgentDefinitionReferences(
+            profile.definition,
+            discoverAgentDefinitions(
+              options.leadRuntime!.leadContext!.isProjectTrusted()
+                ? { projectRoot: options.leadRuntime!.leadContext!.cwd }
+                : {},
+            ),
+          );
+          return new Set(profile.definition.frontmatter.agents ?? []);
+        } catch (error) {
+          options.sessionStartOptions.appendDefinitionError(
+            options.leadRuntime!.leadContext!,
+            error,
+          );
+        }
+      }
     }
     return new Set<string>();
   };
@@ -4831,8 +4841,23 @@ export function registerLeadRuntime(
     roleTransitions,
     normalizeBaseTools: leadToolState.normalizeBaseTools,
     prepareLeadExecution,
-    discoverSessionDefinitions: (ctx: ExtensionContext) =>
-      options.commandHost.contextAgentDefinitions(ctx),
+    discoverSessionDefinitions: async (ctx: ExtensionContext) => {
+      const roleDefinitions = discoverRoleDefinitions(
+        ctx.isProjectTrusted() ? { projectRoot: ctx.cwd } : {},
+      );
+      let definitions: AgentDefinition[] = [];
+      try {
+        definitions = (await options.commandHost.contextAgentDefinitions(ctx))
+          .definitions;
+      } catch (error) {
+        options.sessionStartOptions.appendDefinitionError(ctx, error);
+      }
+      return {
+        definitions,
+        roleDefinitions,
+        projectTrusted: ctx.isProjectTrusted(),
+      };
+    },
     initializeSessionKind,
     activeTools: () =>
       leadExecutionPending ? startupTools : pi.getActiveTools(),
@@ -10127,7 +10152,8 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
             }));
         if (!piAlreadyRunning) {
           await assertUnoccupied(workspaceId!);
-          const projectTrusted = ctx.isProjectTrusted();
+          const projectTrusted =
+            new ProjectTrustStore(getAgentDir()).get(cwd!) === true;
           const definition = discoverRoleDefinition(
             MANAGED_LEAD_DEFINITION_NAME,
             projectTrusted ? { projectRoot: cwd! } : {},
