@@ -1,3 +1,4 @@
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
@@ -8,7 +9,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { createServer, type Socket } from "node:net";
 import { test, type TestContext } from "node:test";
@@ -3643,6 +3644,10 @@ async function runManagerStartupScenario(
     `git-worktree-survivor-${randomUUID()}`,
   );
   const childPath = existingGitWorktree;
+  new ProjectTrustStore(PI_AGENT_ROOT).set(
+    join(realFs.realpathSync(tmpdir()), basename(childPath)),
+    projectTrusted,
+  );
   const reconciliationBranch = "smoke/orphan";
   const attachmentPath = join(tmpdir(), `assignment-${randomUUID()}.md`);
   const mutationSourcePath = join(tmpdir(), `mutation-${randomUUID()}.md`);
@@ -6918,6 +6923,10 @@ async function runManagerStartupScenario(
       );
     }
   } finally {
+    new ProjectTrustStore(PI_AGENT_ROOT).set(
+      join(realFs.realpathSync(tmpdir()), basename(childPath)),
+      null,
+    );
     contentionHolder?.stdin?.end("release");
     for (const state of ownedTree) {
       resetAgentMailbox(agentMailboxPath(state.workspaceId, state.agentLabel));
@@ -7176,9 +7185,9 @@ test("project agent discovery is gated by Pi project trust", async () => {
     let categorySelection = 0;
     context.ui.select = async (title: string, options: string[]) => {
       selections.push(options);
-      if (title === "Definitions")
+      if (title === "Agents & Roles")
         return ++categorySelection % 2 === 1
-          ? options.find((option) => option === "Agent definitions")
+          ? options.find((option) => option === "Agents")
           : undefined;
       return undefined;
     };
@@ -7639,10 +7648,10 @@ test("project-only Definitions edits create a global override", async () => {
   let selection = 0;
   let categorySelected = false;
   context.ui.select = async (title: string, options: string[]) => {
-    if (title === "Definitions") {
+    if (title === "Agents & Roles") {
       if (categorySelected) return undefined;
       categorySelected = true;
-      return options.find((option) => option === "Agent definitions");
+      return options.find((option) => option === "Agents");
     }
     switch (selection++) {
       case 0:

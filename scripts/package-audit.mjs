@@ -34,9 +34,25 @@ const expectedRoot = new Set([
   "LICENSE",
   "skills/agent-definitions/SKILL.md",
 ]);
-const expectedDefinitions = readdirSync(
-  resolve(root, "extension/agent-definitions"),
-).filter((name) => name.endsWith(".md"));
+const roles = new Set([
+  "chief.md",
+  "manager.md",
+  "managed-lead.md",
+  "flexible-lead.md",
+  "orchestrator-lead.md",
+]);
+const expectedDefinitions = ["agents", "roles"].flatMap((directory) =>
+  readdirSync(resolve(root, "extension", directory))
+    .filter((name) => name.endsWith(".md"))
+    .map((name) => {
+      if (roles.has(name) !== (directory === "roles"))
+        throw new Error(`misplaced bundled definition: ${directory}/${name}`);
+      return `dist/${directory}/${name}`;
+    }),
+);
+for (const role of roles)
+  if (!expectedDefinitions.includes(`dist/roles/${role}`))
+    throw new Error(`missing bundled role profile: ${role}`);
 const expectedDist = new Set([
   "dist/index.js",
   "dist/index.js.map",
@@ -44,7 +60,7 @@ const expectedDist = new Set([
   "dist/peer-bridge.js.map",
   "dist/integrations/pi-codex-context-sharing.js",
   "dist/integrations/pi-codex-context-sharing.js.map",
-  ...expectedDefinitions.map((name) => `dist/agent-definitions/${name}`),
+  ...expectedDefinitions,
 ]);
 for (const path of expectedRoot)
   if (!files.some((entry) => normalize(entry.path) === path)) {

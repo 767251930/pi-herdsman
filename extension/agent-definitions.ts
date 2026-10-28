@@ -72,9 +72,9 @@ const BODY_FILE_REFERENCE =
   sep === "\\"
     ? /^[ \t]*@((?:[\\/]|~[\\/]|\.{1,2}[\\/]|[A-Za-z]:[\\/]|\\\\).+?)[ \t]*$/gmu
     : /^[ \t]*@((?:\/|~\/|\.\.?\/).+?)[ \t]*$/gmu;
-const BUILTIN_AGENT_DIR = fileURLToPath(
-  new URL("./agent-definitions", import.meta.url),
-);
+const BUILTIN_AGENT_DIR = fileURLToPath(new URL("./agents", import.meta.url));
+
+const BUILTIN_ROLE_DIR = fileURLToPath(new URL("./roles", import.meta.url));
 
 export const FLEXIBLE_LEAD_DEFINITION_NAME = "flexible-lead";
 export const ORCHESTRATOR_LEAD_DEFINITION_NAME = "orchestrator-lead";
@@ -431,21 +431,28 @@ function validateEffectiveAgentReferences(
         throw new Error(
           `agent ${definition.name} references missing agent definition ${reference}`,
         );
-  const byName = new Map(
-    definitions.map((definition) => [definition.name, definition]),
-  );
   for (const definition of definitions)
     if (SUPERVISOR_AGENT_FIELDS.has(definition.name))
-      for (const reference of definition.frontmatter.agents ?? []) {
-        if (isReservedRoleDefinition(reference))
-          throw new Error(
-            `agent ${definition.name} references reserved agent definition ${reference}`,
-          );
-        if (!byName.has(reference))
-          throw new Error(
-            `agent ${definition.name} references missing agent definition ${reference}`,
-          );
-      }
+      validateSupervisorAgentDefinitionReferences(definition, definitions);
+}
+
+export function validateSupervisorAgentDefinitionReferences(
+  definition: AgentDefinition,
+  definitions: readonly AgentDefinition[],
+): void {
+  const byName = new Map(
+    definitions.map((candidate) => [candidate.name, candidate]),
+  );
+  for (const reference of definition.frontmatter.agents ?? []) {
+    if (isReservedRoleDefinition(reference))
+      throw new Error(
+        `agent ${definition.name} references reserved agent definition ${reference}`,
+      );
+    if (!byName.has(reference))
+      throw new Error(
+        `agent ${definition.name} references missing agent definition ${reference}`,
+      );
+  }
 }
 
 function validateManagedLeadLayer(definition: AgentDefinition): void {
@@ -475,14 +482,25 @@ function validateRuntimeRoleLayer(definition: AgentDefinition): void {
 
 function discoverEffectiveDefinitions(
   options: DiscoverAgentDefinitionsOptions = {},
+  category: "agent" | "role" = "agent",
 ): AgentDefinition[] {
-  const bundled = readAgentDefinitions(BUILTIN_AGENT_DIR);
+  const role = category === "role";
+  const bundled = readAgentDefinitions(
+    role ? BUILTIN_ROLE_DIR : BUILTIN_AGENT_DIR,
+  );
+  const directory = role ? ["pi-herdsman", "roles"] : ["agents"];
   const project = options.projectRoot
     ? readOptionalAgentDefinitions(
-        join(options.projectRoot, CONFIG_DIR_NAME, "agents"),
+        join(options.projectRoot, CONFIG_DIR_NAME, ...directory),
       )
     : [];
-  const user = readOptionalAgentDefinitions(join(getAgentDir(), "agents"));
+  const user = readOptionalAgentDefinitions(join(getAgentDir(), ...directory));
+  for (const definition of [...bundled, ...project, ...user]) {
+    if (isReservedRoleDefinition(definition.name) !== role)
+      throw new Error(
+        `${definition.path}: ${role ? "non-role name in pi-herdsman/roles directory" : "reserved role name in agents directory; use pi-herdsman/roles"}`,
+      );
+  }
   const definitions = new Map(
     bundled.map((definition) => [definition.name, definition]),
   );
@@ -507,7 +525,7 @@ function discoverEffectiveDefinitions(
   const effective = [...definitions.values()].sort((left, right) =>
     left.name.localeCompare(right.name),
   );
-  validateEffectiveAgentReferences(effective);
+  if (!role) validateEffectiveAgentReferences(effective);
   return effective;
 }
 
@@ -531,17 +549,16 @@ function withDefaultEnabled(definition: AgentDefinition): AgentDefinition {
 
 export async function contextAgentDefinitions(ctx: ExtensionContext) {
   const projectTrusted = ctx.isProjectTrusted();
-  const effective = discoverEffectiveDefinitions(
-    projectTrusted ? { projectRoot: ctx.cwd } : {},
-  );
+  const options = projectTrusted ? { projectRoot: ctx.cwd } : {};
+  const effective = discoverAgentDefinitions(options);
   return {
     projectTrusted,
     definitions: effective
       .filter(({ name }) => !isReservedRoleDefinition(name))
       .map(withDefaultEnabled),
-    roleDefinitions: effective.filter(({ name }) =>
-      isReservedRoleDefinition(name),
-    ),
+    get roleDefinitions() {
+      return discoverRoleDefinitions(options);
+    },
   };
 }
 
@@ -556,17 +573,25 @@ export function discoverRoleDefinition(
   name: RoleDefinitionName,
   options: DiscoverAgentDefinitionsOptions = {},
 ): AgentDefinition {
-  const definition = discoverEffectiveDefinitions(options).find(
+  const definition = discoverEffectiveDefinitions(options, "role").find(
     (candidate) => candidate.name === name,
   );
   if (!definition) throw new Error(`role definition ${name} not found`);
+  if (
+    SUPERVISOR_AGENT_FIELDS.has(name) &&
+    definition.frontmatter.agents?.length
+  )
+    validateEffectiveAgentReferences([
+      ...discoverAgentDefinitions(options),
+      definition,
+    ]);
   return definition;
 }
 
 export function discoverRoleDefinitions(
   options: DiscoverAgentDefinitionsOptions = {},
 ): AgentDefinition[] {
-  const definitions = discoverEffectiveDefinitions(options);
+  const definitions = discoverEffectiveDefinitions(options, "role");
   return [...RESERVED_ROLE_DEFINITION_NAMES].map((name) => {
     const definition = definitions.find((candidate) => candidate.name === name);
     if (!definition) throw new Error(`role definition ${name} not found`);
@@ -691,7 +716,13 @@ export function updateAgentOverride(
 ): { path: string; changed: boolean; content: string } {
   const path =
     definition.overrideSource ??
-    join(getAgentDir(), "agents", `${encodeURIComponent(definition.name)}.md`);
+    join(
+      getAgentDir(),
+      ...(isReservedRoleDefinition(definition.name)
+        ? ["pi-herdsman", "roles"]
+        : ["agents"]),
+      `${encodeURIComponent(definition.name)}.md`,
+    );
   const exists = statSync(path, { throwIfNoEntry: false });
   if (value === undefined && !exists) {
     return { path, changed: false, content: "" };

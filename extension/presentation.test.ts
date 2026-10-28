@@ -5141,13 +5141,13 @@ test("agent definition overview uses a compact human hierarchy", (t) => {
       [
         {
           name: "bundled",
-          extensionSource: "/extension/agent-definitions/bundled.md",
+          extensionSource: "/extension/agents/bundled.md",
           description: "Bundled agent",
           tools: ["exec"],
         },
         {
           name: "overridden",
-          extensionSource: "/extension/agent-definitions/overridden.md",
+          extensionSource: "/extension/agents/overridden.md",
           projectSource,
           overrideSource,
           model: "provider/model",
