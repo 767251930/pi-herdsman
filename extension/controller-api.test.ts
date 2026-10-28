@@ -9,7 +9,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, join, resolve, toNamespacedPath } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { createServer, type Socket } from "node:net";
 import { test, type TestContext } from "node:test";
@@ -3607,6 +3607,7 @@ async function runManagerStartupScenario(
     | "reconcile-detached-unrelated"
     | "reconcile-session-unreadable"
     | "reconcile-conflicting-provenance"
+    | "reconcile-aliased-provenance"
     | "reconcile-assignment-lock"
     | "verified-absence-resume"
     | "delegate-reconciles-absent-assignment"
@@ -4602,8 +4603,25 @@ async function runManagerStartupScenario(
     const activeBranch: any[] = pi.entries;
     const ctx = fakeContext(pi.entries, activeBranch) as any;
     gitCwd = ctx.cwd;
-    if (["reconcile-present", "reconcile-detached"].includes(mode))
+    if (
+      [
+        "reconcile-present",
+        "reconcile-detached",
+        "reconcile-aliased-provenance",
+      ].includes(mode)
+    )
       realFs.mkdirSync(existingGitWorktree, { recursive: true });
+    const checkoutAlias =
+      process.platform === "win32"
+        ? toNamespacedPath(existingGitWorktree)
+        : `${existingGitWorktree}-alias`;
+    if (
+      mode === "reconcile-aliased-provenance" &&
+      process.platform !== "win32"
+    ) {
+      realFs.symlinkSync(existingGitWorktree, checkoutAlias, "dir");
+      t?.after(() => realFs.rmSync(checkoutAlias, { force: true }));
+    }
     ctx.isIdle = () => recipientIdle;
     if (["occupied", "multiple"].includes(mode))
       writeLeadCoordinationState(supervisionRuntime(), {
@@ -4632,6 +4650,7 @@ async function runManagerStartupScenario(
           "reconcile-detached-unrelated",
           "reconcile-session-unreadable",
           "reconcile-conflicting-provenance",
+          "reconcile-aliased-provenance",
         ].includes(mode)
           ? { piSessionFile: `/tmp/${reconciliationId}.jsonl` }
           : {}),
@@ -4639,6 +4658,7 @@ async function runManagerStartupScenario(
           "reconcile-present",
           "reconcile-locked",
           "reconcile-prunable-absent",
+          "reconcile-aliased-provenance",
         ].includes(mode)
           ? { checkoutPath: existingGitWorktree }
           : mode === "reconcile-conflicting-provenance"
@@ -4649,12 +4669,16 @@ async function runManagerStartupScenario(
         realFs.mkdirSync(existingGitWorktree, { recursive: true });
       } else if (
         mode === "reconcile-detached-unrelated" ||
-        mode === "reconcile-conflicting-provenance"
+        mode === "reconcile-conflicting-provenance" ||
+        mode === "reconcile-aliased-provenance"
       ) {
         nativeSessions.set(reconciliationId, {
           id: reconciliationId,
           path: `/tmp/${reconciliationId}.jsonl`,
-          cwd: "/removed/original-checkout",
+          cwd:
+            mode === "reconcile-aliased-provenance"
+              ? checkoutAlias
+              : "/removed/original-checkout",
           entries: [],
         });
       }
@@ -4686,6 +4710,20 @@ async function runManagerStartupScenario(
         .find((tool) => tool.name === "list_staff")!
         .execute("list", {}, undefined, undefined, ctx);
       let assignments = listProjectAssignments(supervisionRuntime(), repoKey);
+      if (
+        mode === "reconcile-aliased-provenance" ||
+        mode === "reconcile-conflicting-provenance"
+      )
+        assert.equal(
+          pi.entries.some(
+            (entry: any) =>
+              entry.customType === "pi_herdsman_state_error" &&
+              JSON.stringify(entry.data).includes(
+                "conflicting checkout provenance",
+              ),
+          ),
+          mode === "reconcile-conflicting-provenance",
+        );
       if (releaseAssignmentLock) {
         assert.deepEqual(
           assignments.map(({ id }) => id),
@@ -7170,10 +7208,11 @@ for (const mode of [
   "reconcile-detached-unrelated",
   "reconcile-session-unreadable",
   "reconcile-conflicting-provenance",
+  "reconcile-aliased-provenance",
   "reconcile-assignment-lock",
 ] as const)
-  test(`Manager startup reconciles orphan assignments safely (${mode})`, () =>
-    runManagerStartupScenario(mode));
+  test(`Manager startup reconciles orphan assignments safely (${mode})`, (t) =>
+    runManagerStartupScenario(mode, false, t));
 
 test("project agent discovery is gated by Pi project trust", async () => {
   setLeadEnvironment();
