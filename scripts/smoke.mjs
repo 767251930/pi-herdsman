@@ -4128,12 +4128,7 @@ async function runTerminalFailureSmoke(ctx) {
   const attemptsPath = join(evidenceDir, "smoke-faux-attempts.jsonl");
   const settledPath = join(evidenceDir, "smoke-faux-settled.jsonl");
   const provenancePath = join(evidenceDir, "smoke-faux-provenance.jsonl");
-  const definitionDir = join(
-    ctx.rootCwd,
-    ".pi",
-    "pi-herdsman",
-    "role-profiles",
-  );
+  const definitionDir = join(ctx.rootCwd, ".pi", "pi-herdsman", "roles");
   await mkdir(definitionDir, { recursive: true });
   await writeFile(
     join(definitionDir, "managed-lead.md"),
@@ -4155,7 +4150,7 @@ async function runTerminalFailureSmoke(ctx) {
       2,
     ) + "\n",
   );
-  await run("git", ["add", ".pi/pi-herdsman/role-profiles/managed-lead.md"], {
+  await run("git", ["add", ".pi/pi-herdsman/roles/managed-lead.md"], {
     cwd: ctx.rootCwd,
   });
   await run(
@@ -4809,7 +4804,7 @@ async function runManagerHandoffSmoke(ctx) {
   const marker = `MANAGER_HANDOFF_PENDING_${randomUUID()}`;
   ctx.managerRecovery = { branch };
   ctx.owned.managerBranch = branch;
-  await run("git", ["add", ".pi/pi-herdsman/role-profiles/managed-lead.md"], {
+  await run("git", ["add", ".pi/pi-herdsman/roles/managed-lead.md"], {
     cwd: ctx.rootCwd,
   });
   await run(
@@ -5365,7 +5360,7 @@ async function runManagerMergeSmoke(ctx) {
     )?.[1];
   };
 
-  await run("git", ["add", ".pi/pi-herdsman/role-profiles/managed-lead.md"], {
+  await run("git", ["add", ".pi/pi-herdsman/roles/managed-lead.md"], {
     cwd: ctx.rootCwd,
   });
   await run(
@@ -10756,11 +10751,7 @@ async function prepareSupervisorAgent(ctx) {
     join(definitions, "smoke-agent.md"),
     `---\nname: smoke-agent\nmodel: smoke-faux/supervisor-agent\nextensions: [${JSON.stringify(ctx.simulatedProviderExtension)}]\n---\nReturn the requested completion marker.\n`,
   );
-  const globalRoleProfiles = join(
-    ctx.paths.piAgent,
-    "pi-herdsman",
-    "role-profiles",
-  );
+  const globalRoleProfiles = join(ctx.paths.piAgent, "pi-herdsman", "roles");
   await mkdir(globalRoleProfiles, { recursive: true });
   await writeFile(
     join(globalRoleProfiles, "chief.md"),
@@ -12664,32 +12655,20 @@ async function main() {
       );
     }
     if (scenario === "manager-handoff") {
-      await mkdir(join(ctx.rootCwd, ".pi", "pi-herdsman", "role-profiles"), {
+      await mkdir(join(ctx.rootCwd, ".pi", "pi-herdsman", "roles"), {
         recursive: true,
       });
       await writeFile(
-        join(
-          ctx.rootCwd,
-          ".pi",
-          "pi-herdsman",
-          "role-profiles",
-          "managed-lead.md",
-        ),
+        join(ctx.rootCwd, ".pi", "pi-herdsman", "roles", "managed-lead.md"),
         `---\nname: managed-lead\nmodel: smoke-faux/manager-handoff-lead\nextensions: [${JSON.stringify(ctx.simulatedProviderExtension)}]\n---\n`,
       );
     }
     if (scenario === "manager-merge") {
-      await mkdir(join(ctx.rootCwd, ".pi", "pi-herdsman", "role-profiles"), {
+      await mkdir(join(ctx.rootCwd, ".pi", "pi-herdsman", "roles"), {
         recursive: true,
       });
       await writeFile(
-        join(
-          ctx.rootCwd,
-          ".pi",
-          "pi-herdsman",
-          "role-profiles",
-          "managed-lead.md",
-        ),
+        join(ctx.rootCwd, ".pi", "pi-herdsman", "roles", "managed-lead.md"),
         `---\nname: managed-lead\nmodel: smoke-faux/manager-merge-lead\ntools: [bash]\nextensions: [${JSON.stringify(ctx.simulatedProviderExtension)}]\n---\n`,
       );
       await mkdir(join(paths.piAgent, "pi-herdsman"), { recursive: true });

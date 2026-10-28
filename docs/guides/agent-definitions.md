@@ -14,7 +14,7 @@ see the [agent-definition schema](../reference/agent-definition-schema.md).
 Bundled definitions live in:
 
 ```text
-dist/agent-definitions/
+dist/agents/
 ```
 
 Global definitions live by default in:
@@ -50,9 +50,9 @@ writes global overrides, never project files.
 When Pi uses a custom agent directory, the global definitions live under that
 agent directory's `agents/` subdirectory.
 
-Role profiles use separate directories: `dist/role-profiles/` for bundled
-profiles, `<cwd>/.pi/pi-herdsman/role-profiles/` for trusted project overlays,
-and `<agentDir>/pi-herdsman/role-profiles/` for global overlays. `<agentDir>`
+Role profiles use separate directories: `dist/roles/` for bundled
+profiles, `<cwd>/.pi/pi-herdsman/roles/` for trusted project overlays,
+and `<agentDir>/pi-herdsman/roles/` for global overlays. `<agentDir>`
 is Pi's agent directory (normally `~/.pi/agent`). The same precedence applies.
 Reserved role names are invalid in Agent directories, and other names are
 invalid in role-profile directories. Chief is global-only; a project Chief
@@ -77,8 +77,8 @@ are reserved role definitions. They use the layered definition engine but are
 not Agents available through discovery or delegation. The first two configure
 ordinary Lead runtime instructions and ordinary tools; `managed-lead` configures
 launch policy for Manager-assigned project Leads; `manager` and `chief`
-customize supervisory role instructions and ordinary tools. They appear under the separate `Role profiles` destination in canonical role
-order; ordinary definitions appear under `Agent definitions`. Runtime profiles offer Details only;
+customize supervisory role instructions and ordinary tools. They appear under `Roles` in canonical role
+order; ordinary definitions appear under `Agents`. Runtime profiles offer Details only;
 `managed-lead` offers Model, Thinking, and Details. See
 [customizing role profiles](customizing-agents.md#manager-and-chief-profiles).
 
@@ -312,8 +312,8 @@ For model-assisted definition management, ask Pi directly or explicitly invoke
 project/global Markdown definitions and existing Herdsman validation rather than
 a separate configuration interface.
 
-The human `Definitions` menu separates ordinary definitions under `Agent
-definitions` from reserved profiles under `Role profiles` (in canonical role
+The human `Agents & Roles` menu separates ordinary definitions under `Agents`
+from reserved profiles under `Roles` (in canonical role
 order). Runtime profiles provide Details only. Each row identifies its contributing source or
 sources as `bundled`, `project`, and/or `global`. Model, thinking, and enabled
 settings can be changed through the menu, but edits always write global

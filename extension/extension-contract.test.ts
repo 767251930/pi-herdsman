@@ -2151,11 +2151,11 @@ test("stale peer publication cannot replace a same-session lifecycle generation"
 
 test("active chief describes authoritative remote ask projection", async () => {
   setLeadEnvironment();
-  realFs.mkdirSync(join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles"), {
+  realFs.mkdirSync(join(PI_AGENT_ROOT, "pi-herdsman", "roles"), {
     recursive: true,
   });
   writeFileSync(
-    join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles", "chief.md"),
+    join(PI_AGENT_ROOT, "pi-herdsman", "roles", "chief.md"),
     "---\nname: chief\nbodyMode: replace\n---\nCustom Chief strategy",
   );
   process.env.HERDR_PANE_ID = "chief-pane";
@@ -4001,7 +4001,7 @@ test("malformed definitions do not abort ordinary lead startup", async () => {
 
 test("role discovery failure preserves the valid Lead Agent roster", async () => {
   setLeadEnvironment();
-  const roleDirectory = join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles");
+  const roleDirectory = join(PI_AGENT_ROOT, "pi-herdsman", "roles");
   realFs.mkdirSync(roleDirectory, { recursive: true });
   const malformedRole = join(roleDirectory, "malformed-session-role.md");
   writeFileSync(
@@ -4118,13 +4118,13 @@ test("chief guidance carries the lead coordination contract", () => {
 
 test("replaced Lead strategy keeps its protected charter and coordination tools", async () => {
   setLeadEnvironment();
-  realFs.mkdirSync(join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles"), {
+  realFs.mkdirSync(join(PI_AGENT_ROOT, "pi-herdsman", "roles"), {
     recursive: true,
   });
   const overlay = join(
     PI_AGENT_ROOT,
     "pi-herdsman",
-    "role-profiles",
+    "roles",
     "orchestrator-lead.md",
   );
   process.env.HERDR_SOCKET_PATH = join(
@@ -4790,7 +4790,7 @@ test("delegating agents receive only their allowed definition roster", async () 
 
 test("Manager disabled allowlist targets do not block other Agent delegation", async () => {
   setLeadEnvironment();
-  const roleDirectory = join(PI_AGENT_ROOT, "pi-herdsman", "role-profiles");
+  const roleDirectory = join(PI_AGENT_ROOT, "pi-herdsman", "roles");
   realFs.mkdirSync(roleDirectory, { recursive: true });
   const managerProfile = join(roleDirectory, "manager.md");
   const priorManagerProfile = realFs.existsSync(managerProfile)

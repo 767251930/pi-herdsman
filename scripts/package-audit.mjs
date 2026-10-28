@@ -41,18 +41,17 @@ const roles = new Set([
   "flexible-lead.md",
   "orchestrator-lead.md",
 ]);
-const expectedDefinitions = ["agent-definitions", "role-profiles"].flatMap(
-  (directory) =>
-    readdirSync(resolve(root, "extension", directory))
-      .filter((name) => name.endsWith(".md"))
-      .map((name) => {
-        if (roles.has(name) !== (directory === "role-profiles"))
-          throw new Error(`misplaced bundled definition: ${directory}/${name}`);
-        return `dist/${directory}/${name}`;
-      }),
+const expectedDefinitions = ["agents", "roles"].flatMap((directory) =>
+  readdirSync(resolve(root, "extension", directory))
+    .filter((name) => name.endsWith(".md"))
+    .map((name) => {
+      if (roles.has(name) !== (directory === "roles"))
+        throw new Error(`misplaced bundled definition: ${directory}/${name}`);
+      return `dist/${directory}/${name}`;
+    }),
 );
 for (const role of roles)
-  if (!expectedDefinitions.includes(`dist/role-profiles/${role}`))
+  if (!expectedDefinitions.includes(`dist/roles/${role}`))
     throw new Error(`missing bundled role profile: ${role}`);
 const expectedDist = new Set([
   "dist/index.js",

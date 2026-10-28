@@ -36,15 +36,15 @@ this skill does not define a second schema or management API.
 2. Choose the configuration layer from the requested scope.
    - Agent project policy: `<cwd>/.pi/agents/`; global policy:
      `<agentDir>/agents/`.
-   - Role project policy: `<cwd>/.pi/pi-herdsman/role-profiles/`; global
-     policy: `<agentDir>/pi-herdsman/role-profiles/`. Pi's agent directory
+   - Role project policy: `<cwd>/.pi/pi-herdsman/roles/`; global
+     policy: `<agentDir>/pi-herdsman/roles/`. Pi's agent directory
      normally is `~/.pi/agent`. Managed Lead project policy resolves from
      the trusted delegated worktree.
    - Reserved role names are invalid in Agent directories; non-role names are
      invalid in role-profile directories.
    - If scope is genuinely ambiguous and materially changes the result, ask.
-   - Never edit bundled files under `dist/agent-definitions/` or
-     `dist/role-profiles/`. The Definitions UI writes global overrides only.
+   - Never edit bundled files under `dist/agents/` or
+     `dist/roles/`. The Definitions UI writes global overrides only.
 
 3. Make the smallest correct Markdown change.
    - Prefer a partial overlay over copying a complete lower-precedence

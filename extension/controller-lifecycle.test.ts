@@ -9026,7 +9026,7 @@ test("historical session with its inherited label rejects an active managed repr
   const chiefDefinitionPath = join(
     PI_AGENT_ROOT,
     "pi-herdsman",
-    "role-profiles",
+    "roles",
     "chief.md",
   );
   realFs.mkdirSync(dirname(chiefDefinitionPath), { recursive: true });

@@ -72,13 +72,9 @@ const BODY_FILE_REFERENCE =
   sep === "\\"
     ? /^[ \t]*@((?:[\\/]|~[\\/]|\.{1,2}[\\/]|[A-Za-z]:[\\/]|\\\\).+?)[ \t]*$/gmu
     : /^[ \t]*@((?:\/|~\/|\.\.?\/).+?)[ \t]*$/gmu;
-const BUILTIN_AGENT_DIR = fileURLToPath(
-  new URL("./agent-definitions", import.meta.url),
-);
+const BUILTIN_AGENT_DIR = fileURLToPath(new URL("./agents", import.meta.url));
 
-const BUILTIN_ROLE_DIR = fileURLToPath(
-  new URL("./role-profiles", import.meta.url),
-);
+const BUILTIN_ROLE_DIR = fileURLToPath(new URL("./roles", import.meta.url));
 
 export const FLEXIBLE_LEAD_DEFINITION_NAME = "flexible-lead";
 export const ORCHESTRATOR_LEAD_DEFINITION_NAME = "orchestrator-lead";
@@ -492,27 +488,17 @@ function discoverEffectiveDefinitions(
   const bundled = readAgentDefinitions(
     role ? BUILTIN_ROLE_DIR : BUILTIN_AGENT_DIR,
   );
+  const directory = role ? ["pi-herdsman", "roles"] : ["agents"];
   const project = options.projectRoot
     ? readOptionalAgentDefinitions(
-        role
-          ? join(
-              options.projectRoot,
-              CONFIG_DIR_NAME,
-              "pi-herdsman",
-              "role-profiles",
-            )
-          : join(options.projectRoot, CONFIG_DIR_NAME, "agents"),
+        join(options.projectRoot, CONFIG_DIR_NAME, ...directory),
       )
     : [];
-  const user = readOptionalAgentDefinitions(
-    role
-      ? join(getAgentDir(), "pi-herdsman", "role-profiles")
-      : join(getAgentDir(), "agents"),
-  );
+  const user = readOptionalAgentDefinitions(join(getAgentDir(), ...directory));
   for (const definition of [...bundled, ...project, ...user]) {
     if (isReservedRoleDefinition(definition.name) !== role)
       throw new Error(
-        `${definition.path}: ${role ? "non-role name in role-profiles directory" : "reserved role name in agents directory; use pi-herdsman/role-profiles"}`,
+        `${definition.path}: ${role ? "non-role name in pi-herdsman/roles directory" : "reserved role name in agents directory; use pi-herdsman/roles"}`,
       );
   }
   const definitions = new Map(
@@ -733,7 +719,7 @@ export function updateAgentOverride(
     join(
       getAgentDir(),
       ...(isReservedRoleDefinition(definition.name)
-        ? ["pi-herdsman", "role-profiles"]
+        ? ["pi-herdsman", "roles"]
         : ["agents"]),
       `${encodeURIComponent(definition.name)}.md`,
     );

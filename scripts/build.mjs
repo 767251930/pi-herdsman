@@ -29,7 +29,7 @@ await build({
     "typebox",
   ],
 });
-for (const directory of ["agent-definitions", "role-profiles"])
+for (const directory of ["agents", "roles"])
   cpSync(resolve(root, "extension", directory), resolve(dist, directory), {
     recursive: true,
   });

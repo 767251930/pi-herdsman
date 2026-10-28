@@ -7185,9 +7185,9 @@ test("project agent discovery is gated by Pi project trust", async () => {
     let categorySelection = 0;
     context.ui.select = async (title: string, options: string[]) => {
       selections.push(options);
-      if (title === "Definitions")
+      if (title === "Agents & Roles")
         return ++categorySelection % 2 === 1
-          ? options.find((option) => option === "Agent definitions")
+          ? options.find((option) => option === "Agents")
           : undefined;
       return undefined;
     };
@@ -7648,10 +7648,10 @@ test("project-only Definitions edits create a global override", async () => {
   let selection = 0;
   let categorySelected = false;
   context.ui.select = async (title: string, options: string[]) => {
-    if (title === "Definitions") {
+    if (title === "Agents & Roles") {
       if (categorySelected) return undefined;
       categorySelected = true;
-      return options.find((option) => option === "Agent definitions");
+      return options.find((option) => option === "Agents");
     }
     switch (selection++) {
       case 0:

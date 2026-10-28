@@ -49,12 +49,12 @@ definition and return a partial roster.
 Bundled definitions:
 
 ```text
-dist/agent-definitions/
+dist/agents/
 ```
 
-Bundled role profiles are in `dist/role-profiles/`. Global role profiles are
-in `<agentDir>/pi-herdsman/role-profiles/`, and trusted project role profiles
-are in `<cwd>/.pi/pi-herdsman/role-profiles/`. Pi's agent directory defaults
+Bundled role profiles are in `dist/roles/`. Global role profiles are
+in `<agentDir>/pi-herdsman/roles/`, and trusted project role profiles
+are in `<cwd>/.pi/pi-herdsman/roles/`. Pi's agent directory defaults
 to `~/.pi/agent`. The same precedence and overlay rules apply independently
 to each category. Reserved role names are rejected in Agent directories;
 non-role names are rejected in role-profile directories.
@@ -83,8 +83,8 @@ complete role-profile configuration.
 are reserved role definitions, not Agents. They are excluded from the Agent
 roster and cannot be selected by `delegate_agent`, referenced as delegation
 targets from `agents`, or disabled. Manager and Chief may themselves declare
-`agents` to allowlist ordinary Agent targets. The Definitions UI lists reserved roles under `Role profiles`, separately from
-ordinary `Agent definitions`. Runtime profiles
+`agents` to allowlist ordinary Agent targets. The `Agents & Roles` menu lists reserved roles under `Roles`, separately from
+ordinary `Agents`. Runtime profiles
 provide `Details` only; `managed-lead` additionally provides `Model` and
 `Thinking`.
 

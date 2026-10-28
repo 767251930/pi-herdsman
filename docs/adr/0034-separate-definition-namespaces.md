@@ -12,6 +12,12 @@ definition engine, layering, and provenance. Category validation keeps reserved
 role names out of Agent directories and other names out of role-profile
 directories. Chief remains global-only.
 
+Bundled Agents and Roles live in `extension/agents/` and `extension/roles/`
+in source, and `dist/agents/` and `dist/roles/` in the package. Global
+Agents use `<agentDir>/agents/`; global Roles use
+`<agentDir>/pi-herdsman/roles/`. Trusted projects use `.pi/agents/` and
+`.pi/pi-herdsman/roles/`, respectively.
+
 This narrows ADR 0015's rejection of a separate directory: a distinct namespace
 does not require a separate schema or composition engine. Its managed-Lead
 launch-policy decision remains in force. ADR 0018's execution-profile and

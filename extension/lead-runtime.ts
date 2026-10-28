@@ -1809,17 +1809,17 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
       while (true) {
         const section = await host.selectMenu(
           ctx,
-          "Definitions",
+          "Agents & Roles",
           [
             {
               value: "agents",
-              label: "Agent definitions",
+              label: "Agents",
               help: "Definitions available for Agent delegation.",
             },
             {
               value: "roles",
-              label: "Role profiles",
-              help: "Reserved Lead, Manager, and Chief definitions.",
+              label: "Roles",
+              help: "Reserved Lead, Manager, and Chief profiles.",
             },
           ],
           selectedSection,
@@ -1829,7 +1829,9 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
         definitionList: while (true) {
           const availableDefinitions = await loadDefinitions(section);
           if (!availableDefinitions.length) {
-            ctx.ui.notify("No Agent definitions are available.");
+            ctx.ui.notify(
+              `No ${section === "agents" ? "Agent definitions" : "Roles"} are available.`,
+            );
             break definitionList;
           }
           const options = availableDefinitions.map((definition) => {
@@ -1863,7 +1865,7 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
           });
           const selected = await host.selectMenu(
             ctx,
-            section === "agents" ? "Agent definitions" : "Role profiles",
+            section === "agents" ? "Agents" : "Roles",
             options,
             selectedDefinitions[section],
           );
