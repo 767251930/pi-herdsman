@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.36.0](https://github.com/boadij/pi-herdsman/compare/v0.35.0...v0.36.0) (2026-10-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* **coordination:** address assigned Leads by branch ([#658](https://github.com/boadij/pi-herdsman/issues/658))
+
+### Features
+
+* **container:** enable persistent native Pi extension updates ([#659](https://github.com/boadij/pi-herdsman/issues/659)) ([f5e8f75](https://github.com/boadij/pi-herdsman/commit/f5e8f753d78f72c28acd84b188a477b44d60bb6e))
+* **coordination:** address assigned Leads by branch ([#658](https://github.com/boadij/pi-herdsman/issues/658)) ([3fedaac](https://github.com/boadij/pi-herdsman/commit/3fedaacab0853c637ac941fdb46ce7c6014bd557))
+
 ## [0.35.0](https://github.com/boadij/pi-herdsman/compare/v0.34.1...v0.35.0) (2026-10-28)
 
 
