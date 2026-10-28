@@ -4081,6 +4081,43 @@ async function coreObservationProvenance(ctx) {
   return { provenance, sessionIds };
 }
 
+async function prepareTrustedFixtureWorktree(ctx, branch) {
+  await nestedCommand(ctx, [
+    "worktree",
+    "create",
+    "--cwd",
+    ctx.rootCwd,
+    "--branch",
+    branch,
+    "--base",
+    "HEAD",
+    "--no-focus",
+  ]);
+  const topology = await nestedCommand(ctx, [
+    "worktree",
+    "list",
+    "--workspace",
+    ctx.rootWorkspaceId,
+  ]);
+  const worktree = captureTerminalFailureWorktree(
+    ctx,
+    topology.worktrees ?? [],
+    branch,
+  );
+  assert.ok(worktree, "fixture worktree was not created");
+  ctx.owned.managerWorktreeRetirementRequested = true;
+  const trustStore = new ProjectTrustStore(ctx.paths.piAgent);
+  trustStore.set(worktree.path, true);
+  assert.equal(trustStore.get(worktree.path), true);
+  assert.equal(trustStore.get(ctx.rootCwd), null);
+  assert.equal(
+    trustStore.getEntry(worktree.path)?.path,
+    await realpath(worktree.path),
+    "isolated trust entry must name the exact delegated worktree",
+  );
+  return worktree;
+}
+
 async function runTerminalFailureSmoke(ctx) {
   const branch = `herdsman/smoke-terminal-failure-${randomUUID()}`;
   const task =
@@ -4144,39 +4181,7 @@ async function runTerminalFailureSmoke(ctx) {
     providerPath,
   };
   ctx.managerRecovery = { branch };
-  await nestedCommand(ctx, [
-    "worktree",
-    "create",
-    "--cwd",
-    ctx.rootCwd,
-    "--branch",
-    branch,
-    "--base",
-    "HEAD",
-    "--no-focus",
-  ]);
-  const fixtureWorktrees = await nestedCommand(ctx, [
-    "worktree",
-    "list",
-    "--workspace",
-    ctx.rootWorkspaceId,
-  ]);
-  const fixtureWorktree = captureTerminalFailureWorktree(
-    ctx,
-    fixtureWorktrees.worktrees ?? [],
-    branch,
-  );
-  assert.ok(fixtureWorktree, "fixture worktree was not created");
-  ctx.owned.managerWorktreeRetirementRequested = true;
-  const trustStore = new ProjectTrustStore(ctx.paths.piAgent);
-  trustStore.set(fixtureWorktree.path, true);
-  assert.equal(trustStore.get(fixtureWorktree.path), true);
-  assert.equal(trustStore.get(ctx.rootCwd), null);
-  assert.equal(
-    trustStore.getEntry(fixtureWorktree.path)?.path,
-    await realpath(fixtureWorktree.path),
-    "isolated trust entry must name the exact delegated worktree",
-  );
+  await prepareTrustedFixtureWorktree(ctx, branch);
   const root = async () => rootSessionSnapshot(ctx);
   const agents = async () =>
     (await nestedCommand(ctx, ["agent", "list"])).agents ?? [];
@@ -4804,7 +4809,9 @@ async function runManagerHandoffSmoke(ctx) {
   const marker = `MANAGER_HANDOFF_PENDING_${randomUUID()}`;
   ctx.managerRecovery = { branch };
   ctx.owned.managerBranch = branch;
-  await run("git", ["add", ".pi/agents/managed-lead.md"], { cwd: ctx.rootCwd });
+  await run("git", ["add", ".pi/pi-herdsman/role-profiles/managed-lead.md"], {
+    cwd: ctx.rootCwd,
+  });
   await run(
     "git",
     [
@@ -4820,6 +4827,7 @@ async function runManagerHandoffSmoke(ctx) {
     ],
     { cwd: ctx.rootCwd },
   );
+  await prepareTrustedFixtureWorktree(ctx, branch);
   const root = async () => rootSessionSnapshot(ctx);
   await waitForEvidence(
     ctx,
@@ -5357,7 +5365,9 @@ async function runManagerMergeSmoke(ctx) {
     )?.[1];
   };
 
-  await run("git", ["add", ".pi/agents/managed-lead.md"], { cwd: ctx.rootCwd });
+  await run("git", ["add", ".pi/pi-herdsman/role-profiles/managed-lead.md"], {
+    cwd: ctx.rootCwd,
+  });
   await run(
     "git",
     [
@@ -5373,6 +5383,7 @@ async function runManagerMergeSmoke(ctx) {
     ],
     { cwd: ctx.rootCwd },
   );
+  await prepareTrustedFixtureWorktree(ctx, branch);
   await waitForEvidence(
     ctx,
     "manager-merge-root-agent",
@@ -12653,16 +12664,32 @@ async function main() {
       );
     }
     if (scenario === "manager-handoff") {
-      await mkdir(join(ctx.rootCwd, ".pi", "agents"), { recursive: true });
+      await mkdir(join(ctx.rootCwd, ".pi", "pi-herdsman", "role-profiles"), {
+        recursive: true,
+      });
       await writeFile(
-        join(ctx.rootCwd, ".pi", "agents", "managed-lead.md"),
+        join(
+          ctx.rootCwd,
+          ".pi",
+          "pi-herdsman",
+          "role-profiles",
+          "managed-lead.md",
+        ),
         `---\nname: managed-lead\nmodel: smoke-faux/manager-handoff-lead\nextensions: [${JSON.stringify(ctx.simulatedProviderExtension)}]\n---\n`,
       );
     }
     if (scenario === "manager-merge") {
-      await mkdir(join(ctx.rootCwd, ".pi", "agents"), { recursive: true });
+      await mkdir(join(ctx.rootCwd, ".pi", "pi-herdsman", "role-profiles"), {
+        recursive: true,
+      });
       await writeFile(
-        join(ctx.rootCwd, ".pi", "agents", "managed-lead.md"),
+        join(
+          ctx.rootCwd,
+          ".pi",
+          "pi-herdsman",
+          "role-profiles",
+          "managed-lead.md",
+        ),
         `---\nname: managed-lead\nmodel: smoke-faux/manager-merge-lead\ntools: [bash]\nextensions: [${JSON.stringify(ctx.simulatedProviderExtension)}]\n---\n`,
       );
       await mkdir(join(paths.piAgent, "pi-herdsman"), { recursive: true });
