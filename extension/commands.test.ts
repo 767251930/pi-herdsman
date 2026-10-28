@@ -9059,6 +9059,21 @@ async function managerDelegateAssignmentTest(
     const staffMessage = pi.tools.find(
       (tool) => tool.name === "message_staff",
     )!;
+    for (const selector of [
+      {},
+      { session: childSession },
+      { session: childSession, branch: assignment.branch },
+    ])
+      await assert.rejects(
+        staffMessage.execute(
+          "selector",
+          { ...selector, message: "must not publish" },
+          undefined,
+          undefined,
+          ctx,
+        ),
+        /exactly one|require branch targeting/,
+      );
     let changedSource = false;
     mutateRetainedSource = () => {
       if (changedSource) return;
@@ -9078,7 +9093,7 @@ async function managerDelegateAssignmentTest(
     const retainedOutcome = await staffMessage.execute(
       "retain-review",
       {
-        session: childSession,
+        branch: assignment.branch,
         message: "Address the external review",
         files: [reviewFile],
         retain: true,
@@ -10499,7 +10514,7 @@ test("Manager supervises project Leads while Chief keeps only unclaimed Leads in
   }
 });
 
-test("ordinary Lead uplink reaches its Manager despite incomplete workspace topology", async (t) => {
+test("ordinary Lead uplink reaches its Manager while assigned branch targeting fails closed on incomplete topology", async (t) => {
   setLeadEnvironment();
   const socketPath = join(tmpdir(), `manager-lead-inbox-${randomUUID()}.sock`);
   const repoA = realFs.mkdtempSync(
@@ -11012,25 +11027,34 @@ test("ordinary Lead uplink reaches its Manager despite incomplete workspace topo
         "assigned",
         "project assignment authority remains available despite multiple Managers",
       );
-      await manager.tools
-        .find((tool) => tool.name === "message_staff")!
-        .execute(
-          "message",
-          { session: leadSession, message: "Assigned Lead remains actionable" },
-          undefined,
-          undefined,
-          managerCtx,
-        );
-      useLeadIdentity();
-      await t.waitFor(() =>
-        assert.ok(
-          lead!.sentMessageCalls.some(
-            ({ message }: any) =>
-              message?.customType === "pi-herdsman-manager_message" &&
-              message?.details?.toSessionId === leadSession &&
-              message?.details?.branch === assignedBranch,
+      assert.equal(
+        assignedReports.details.reports.find(
+          (report: any) => report.session === leadSession,
+        )?.branch,
+        assignedBranch,
+      );
+      const queuedBeforeIncompleteBranchTarget = listCoordinationMessagePaths(
+        supervisionRuntime(),
+        leadSession,
+      );
+      await assert.rejects(
+        manager.tools
+          .find((tool) => tool.name === "message_staff")!
+          .execute(
+            "message",
+            {
+              branch: assignedBranch,
+              message: "Assigned Lead remains actionable",
+            },
+            undefined,
+            undefined,
+            managerCtx,
           ),
-        ),
+        /Assigned work is not uniquely active/,
+      );
+      assert.deepEqual(
+        listCoordinationMessagePaths(supervisionRuntime(), leadSession),
+        queuedBeforeIncompleteBranchTarget,
       );
     } finally {
       removeProjectAssignment(supervisionRuntime(), "/tmp", assignedBranch);
