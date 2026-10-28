@@ -174,7 +174,13 @@ import {
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, realpathSync, statSync, unlinkSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import {
+  dirname,
+  isAbsolute,
+  join,
+  resolve,
+  toNamespacedPath,
+} from "node:path";
 import { persistedTranscriptReady as controllerPersistedTranscriptReady } from "./agent-controller.ts";
 import {
   listSavedPeerMachines,
@@ -16312,6 +16318,10 @@ export function createLeadRoleTransitions(
           !!recorded &&
           !!session &&
           recorded !== session &&
+          !(
+            process.platform === "win32" &&
+            toNamespacedPath(recorded) === toNamespacedPath(session)
+          ) &&
           !sameDirectory(recorded, session),
       };
     };
